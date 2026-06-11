@@ -1,0 +1,31 @@
+name: vitriflow
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - pip
+  - numpy
+  - scipy
+  - pyyaml
+  - pydantic>=2,<3
+  - ase>=3.22
+  - networkx>=3
+  - matplotlib
+  - mp-api
+  - packmol
+
+  # mpi
+  # lammps installed mpi
+  - mpi=1.0.1=openmpi
+  - openmpi
+
+  # engines
+  # lammps kim comment
+  - lammps
+  - openkim-models
+  # kim api lammps
+  # listing explicitly harmless
+  - kim-api
+
+  - pip:
+      - -e .
