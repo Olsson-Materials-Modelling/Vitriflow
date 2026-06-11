@@ -1,0 +1,309 @@
+# Exhaustive MPI autotune + production example for amorphous Al2O3.
+#
+# Potential choice:
+#   Matsui-type Coulomb-Buckingham parameters, as re-tabulated for amorphous Al2O3
+#   in J. Zhang et al., J. Non-Cryst. Solids 628 (2024) 122840, Table 1.
+#
+# Practical note:
+#   The cited literature uses Buckingham short-range cutoffs in the ~8–12 Å range.
+#   This test uses 10 Å together with PPPM long-range electrostatics, which keeps the
+#   Packmol-generated test cell moderate in size while staying within that literature band.
+#   If you want a stricter reproduction of a 12 Å setup, increase n_formula_units.
+
+potential:
+  kind: lammps
+  user_units: metal
+  interactions: ["Al", "O"]
+  commands:
+    - pair_style buck/coul/long 12.0
+    - pair_coeff 1 1 31571310.74 0.068 14.05114560
+    - pair_coeff 1 2 28477.25737 0.172 34.57833522
+    - pair_coeff 2 2 6462.75033 0.276 85.09350771
+    - kspace_style pppm 1.0e-5
+
+  core_repulsion:
+    enabled: true
+    style: zbl
+    dt_candidates: [0.001,0.0005, 0.00025, 0.000125]
+    r_out_factor: 0.55
+    r_out_min: 0.6
+    r_out_max: 1.6
+    r_in_factor: 0.80
+    max_attempts: 6
+    grow_factor: 1.25
+    test_equil_steps: 2000
+    test_run_steps: 5000
+
+md:
+  timestep: 0.0005
+  atom_style: charge
+  ensemble: npt
+  temperature: 300.0
+  pressure: 0.0
+  thermo_every: 100
+  dump_every: 1000
+  stage_continuity: continuous
+  force_isotropic: false
+  neighbor_skin: 1.5
+  neighbor_skin_autotune: true
+  neighbor_skin_step: 0.5
+  neighbor_skin_max: 5.0
+  thermostat:
+    style: nose-hoover
+    tdamp: 0.1
+  barostat:
+    pdamp: 1.0
+    mode: iso
+
+structure:
+  charges:
+    Al: 1.4175
+    O: -0.9450
+  generate:
+    method: packmol
+    formula: Al2O3
+    # 180 formula units = 900 atoms; at 3.5 g/cm^3 this gives L ≈ 20.57 Å,
+    # which is just above 2 * 10 Å and therefore compatible with the 10 Å
+    # short-range Buckingham cutoff used here.
+    n_formula_units: 60
+    packmol_cmd: packmol
+    packing_density_g_cm3: 3.5
+    packing_min_distance_A: 1.6
+    seed: 12345
+
+autotune:
+  preflight:
+    enabled: true
+    ensembles: ["npt"]
+
+  tm_scan:
+    t_min: 2500.0
+    t_max: 5500.0
+    dT: 500.0
+    equil_steps: 10000
+    sample_steps: 30000
+    msd_every: 200
+    replicates_per_temp: 10
+    sample_in_nvt: true
+    highT_mode: liquid
+    liquid_D_frac: 0.20
+    liquid_top_k: 3
+    liquid_min_consecutive: 2
+
+  highT:
+    margin: 500.0
+    replicates: 10
+    chunk_steps: 50000
+    min_total_steps: 150000
+    rms_multiple: 3.0
+    stationarity_tol: 0.03
+
+  quench:
+    t_final: 300.0
+    relax_steps: 100000
+    rates_K_per_ps: [100.0, 50, 25.0, 10.0, 1.0]
+    replicates_per_rate: 10
+
+  size:
+    enabled: false
+
+  metrics:
+    enabled: true
+    time_average_frames: 8
+    time_average_stride: 500
+    collect_during_production_stages: true
+    stage_timeseries_frame_stride: 1
+    stage_timeseries_max_frames: 128
+    stage_timeseries_make_plot: true
+    quench_tail_min_frames: 64
+    quench_tail_focus_fraction: 0.80
+    quench_tail_fallback_fraction: 0.40
+
+    elastic:
+      enabled: true
+      run_on_relax: true
+      run_on_highT_when_force_isotropic: true
+      strict_when_force_isotropic: true
+      collect_during_production_stages: true
+      stage_timeseries_frame_stride: 1
+      stage_timeseries_max_frames: 32
+      stage_timeseries_make_plot: true
+      quench_tail_min_frames: 32
+      quench_tail_focus_fraction: 0.80
+      quench_tail_fallback_fraction: 0.40
+      diffusion_freeze_threshold_A2_per_ps: 0.10
+      born_delta: 1.0e-5
+      make_plot: true
+      isotropy_warn_threshold: 0.15
+      coupling_warn_threshold: 0.10
+      hotspot_warn_multiple_of_median: 5.0
+
+    pairs:
+      - pair: ["Al", "O"]
+      - pair: ["O", "O"]
+      - pair: ["Al", "Al"]
+
+    coordinations:
+      - central: "Al"
+        neighbor: "O"
+      - central: "O"
+        neighbor: "Al"
+
+    coordination_sweep:
+      enabled: true
+      dr: 0.02
+      n_below: 0
+      n_above: 12
+      strained_delta: 0.10
+
+    angles:
+      - triplet: ["O", "Al", "O"]
+      - triplet: ["Al", "O", "Al"]
+
+    rings:
+      enabled: true
+      mode: projected
+      algorithm: primitive
+      nodes: ["Al"]
+      bridge: "O"
+      bond_pairs:
+        - pair: ["Al", "O"]
+      max_cycle_size: 10
+      max_paths_per_edge: 8
+
+    gr:
+      - pair: null
+        r_max: 10.0
+        nbins: 500
+      - pair: ["Al", "O"]
+        r_max: 10.0
+        nbins: 500
+      - pair: ["O", "O"]
+        r_max: 10.0
+        nbins: 500
+      - pair: ["Al", "Al"]
+        r_max: 10.0
+        nbins: 500
+
+    sq:
+      - pair: null
+        q_max: 20.0
+        nq: 400
+        r_max: 10.0
+        nbins: 800
+      - pair: ["Al", "O"]
+        q_max: 20.0
+        nq: 400
+        r_max: 10.0
+        nbins: 800
+      - pair: ["O", "O"]
+        q_max: 20.0
+        nq: 400
+        r_max: 10.0
+        nbins: 800
+      - pair: ["Al", "Al"]
+        q_max: 20.0
+        nq: 400
+        r_max: 10.0
+        nbins: 800
+
+    voids:
+      enabled: true
+      n_samples: 8192
+      n_samples_timeseries: 2048
+      sampler: sobol
+      seed: 0
+      k_nearest: 16
+      default_radius: 0.0
+      r_max: 4.0
+      cdf_points: 200
+      probe_radii: [0.5, 1.0, 1.5]
+    amorphous:
+      enabled: true
+      enforce_during_rate_scan: true
+      enforce_during_production: true
+      min_pass_fraction: 0.67
+      q_max: 16.0
+      nq: 256
+      r_max: 8.0
+      nbins: 400
+      window: lorch
+      smooth: 7
+      peak_search: [0.5, 10.0]
+      peak_prominence_min: 0.12
+      peak_height_min: 1.03
+      max_bragg_sharpness: 18.0
+      l_values: [4, 6]
+      solid_like_l: 6
+      solid_like_bond_threshold: 0.5
+      ordered_min_neighbors: 4
+      ordered_min_fraction: 0.6
+      max_crystalline_fraction: 0.18
+      max_largest_cluster_fraction: 0.12
+      reference:
+        enabled: true
+        required: true
+        mp_api_key_env: MP_API_KEY
+        stable_only: true
+        energy_above_hull_max: 0.05
+        max_candidates: 4
+        use_conventional_cell: true
+        min_supercell_length_A: 12.0
+        min_supercell_atoms: 128
+      reference_peak_match_tol: 0.2
+      max_reference_peak_overlap: 0.6
+
+
+        
+  production:
+    enabled: true
+    min_boxes: 20
+    max_boxes: 20
+    batch_boxes: 20
+    dump_trajectory: true
+    dump_every_steps: 1000
+    check_convergence: true
+    consecutive_converged_checks: 1
+    bondlen_cdf_points: 200
+    angle_cdf_points: 180
+    store_distributions: true
+    exclude_coordination_defects: false
+
+  convergence:
+    mode: both
+    density_rel_tol: 0.01
+    density_abs_tol: 1.0e-3
+    coord_rel_tol: 0.0
+    coord_abs_tol: 0.15
+    bondlen_rel_tol: 0.0
+    bondlen_abs_tol: 0.03
+    angle_rel_tol: 0.0
+    angle_abs_tol: 4.0
+    ring_rel_tol: 0.0
+    ring_abs_tol: 0.10
+    ring_size_rel_tol: 0.0
+    ring_size_abs_tol: 0.75
+    gr_peak_r_rel_tol: 0.0
+    gr_peak_r_abs_tol: 0.03
+    gr_peak_height_rel_tol: 0.05
+    gr_peak_height_abs_tol: 0.20
+    gr_peak_fwhm_rel_tol: 0.05
+    gr_peak_fwhm_abs_tol: 0.03
+    bondlen_cdf_rel_tol: 0.0
+    bondlen_cdf_abs_tol: 0.02
+    angle_cdf_rel_tol: 0.0
+    angle_cdf_abs_tol: 0.02
+    coord_cdf_rel_tol: 0.0
+    coord_cdf_abs_tol: 0.02
+    gr_curve_rel_tol: 0.05
+    gr_curve_abs_tol: 0.05
+    sq_curve_rel_tol: 0.05
+    sq_curve_abs_tol: 0.05
+    void_cdf_rel_tol: 0.0
+    void_cdf_abs_tol: 0.02
+    zscore: 1.96
+
+lammps:
+  lammps_cmd: lmp
+  mpi_cmd: mpirun
+  nprocs: 8

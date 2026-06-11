@@ -1,0 +1,77 @@
+# Standalone VitriFlow analysis config for final Si3N4 structures generated
+# outside VitriFlow/MQFlow.
+#
+# Example:
+#   vitriflow analyze-output \
+#     -c analysis_sin_final_structures.yaml \
+#     -i final_structures_lammps/ \
+#     -o analysis_sin_final_structures
+
+analysis:
+  # Required for LAMMPS data/dump files whose atoms are numbered by type.
+  # Type 1 -> Si, type 2 -> N in this example.
+  type_to_species: [Si, N]
+
+  # Used only for reading LAMMPS-style files and for provenance. Static final
+  # structures normally use one frame per box.
+  atom_style: atomic
+  timestep: 1.0
+
+  metrics:
+    enabled: true
+    time_average_frames: 1
+    type_to_species: [Si, N]
+
+    pairs:
+      - {pair: [Si, N]}
+      - {pair: [Si, Si]}
+      - {pair: [N, N]}
+
+    coordinations:
+      - {central: Si, neighbor: N, expected: 4, defect_frac_tol: 0.02}
+      - {central: N, neighbor: Si, expected: 3, defect_frac_tol: 0.02}
+
+    angles:
+      - {triplet: [N, Si, N]}
+      - {triplet: [Si, N, Si]}
+
+    gr:
+      - {pair: null, r_max: 10.0, nbins: 500}
+      - {pair: [Si, N], r_max: 10.0, nbins: 500}
+      - {pair: [Si, Si], r_max: 10.0, nbins: 500}
+      - {pair: [N, N], r_max: 10.0, nbins: 500}
+
+    rings:
+      enabled: true
+      mode: bond_graph
+      nodes: [Si, N]
+      bond_pairs:
+        - {pair: [Si, N]}
+      max_cycle_size: 12
+
+    voids:
+      enabled: true
+      n_samples: 8192
+      r_max: 5.0
+      cdf_points: 200
+
+  production:
+    enabled: true
+    min_boxes: 1
+    batch_boxes: 1
+    check_convergence: true
+    store_distributions: true
+    exclude_coordination_defects: false
+
+  convergence:
+    mode: both
+    density_rel_tol: 0.01
+    density_abs_tol: 0.001
+    coord_abs_tol: 0.05
+    bondlen_abs_tol: 0.02
+    angle_abs_tol: 2.0
+    ring_abs_tol: 0.05
+    bondlen_cdf_abs_tol: 0.02
+    angle_cdf_abs_tol: 0.02
+    coord_cdf_abs_tol: 0.02
+    void_cdf_abs_tol: 0.02

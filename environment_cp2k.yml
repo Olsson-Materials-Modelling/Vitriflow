@@ -1,0 +1,10 @@
+name: vitriflow-cp2k
+channels:
+  - conda-forge
+dependencies:
+  # currently against mpi
+  # environment env lammps
+  - cp2k=2024.2=openblas_openmpi_*
+  - mpi=1.0.1=openmpi
+  - "openmpi>=4.1.6,<5.0a0"
+  - libblas=*=*openblas

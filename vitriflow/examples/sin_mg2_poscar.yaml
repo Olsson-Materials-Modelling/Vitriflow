@@ -1,0 +1,121 @@
+# silicon potential tabulated
+# poscar lammps expanded
+# density scaled isotropically
+
+potential:
+  kind: mg2_sin
+  user_units: metal
+  interactions: ["Si", "N"]
+  # literature parameters override
+  # d0 e v
+  # alpha inv
+  # r0
+  # si e va
+  # rho si
+  # nn e va
+  # rho nn
+  # c6 nn va6
+  # b6 nn inv
+  # x1
+  # x0
+
+md:
+  timestep: 0.001
+  atom_style: atomic
+  ensemble: npt
+  temperature: 300.0
+  pressure: 0.0
+  thermo_every: 200
+  dump_every: 2000
+  # quench relax production
+  stage_continuity: continuous
+  neighbor_skin: 2.5
+  neighbor_skin_autotune: true
+  neighbor_skin_step: 0.5
+  neighbor_skin_max: 5.0
+  thermostat:
+    style: nose-hoover
+    tdamp: 0.1
+
+structure:
+  generate:
+    method: poscar
+    poscar_path: POSCAR
+    formula: Si3N4
+    min_atoms: 192
+    # target density cm3
+
+autotune:
+  preflight:
+    enabled: true
+    # preflight ensemble recommended
+    # ensembles npt nvt
+
+  tm_scan:
+    t_min: 800.0
+    t_max: 5000.0
+    dT: 300.0
+    equil_steps: 5000
+    sample_steps: 20000
+    msd_every: 200
+
+  highT:
+    margin: 400.0
+    chunk_steps: 50000
+    min_total_steps: 100000
+    rms_multiple: 3.0
+    stationarity_tol: 0.03
+
+  quench:
+    t_final: 300.0
+    relax_steps: 100000
+    rates_K_per_ps: [100.0, 31.6, 10.0, 3.16, 1.0, 0.316, 0.1]
+
+  # finite scans disabled
+  # effects repeat box
+  size:
+    enabled: false
+
+  metrics:
+    enabled: true
+    time_average_frames: 6
+    time_average_stride: 500
+    pairs:
+      - {pair: [Si, N]}
+      - {pair: [Si, Si]}
+      - {pair: [N, N]}
+    coordinations:
+      - {central: Si, neighbor: N, expected: 4, defect_frac_tol: 0.02}
+      - {central: N, neighbor: Si, expected: 3, defect_frac_tol: 0.02}
+    angles:
+      - {triplet: [N, Si, N]}
+      - {triplet: [Si, N, Si]}
+    gr:
+      - {pair: null, r_max: 10.0, nbins: 500}
+      - {pair: [Si, N], r_max: 10.0, nbins: 500}
+      - {pair: [Si, Si], r_max: 10.0, nbins: 500}
+      - {pair: [N, N], r_max: 10.0, nbins: 500}
+    rings:
+      enabled: true
+      # bond bipartite network
+      # projected coordinated artificial
+      mode: bond_graph
+      nodes: ["Si", "N"]
+      bond_pairs:
+        - {pair: ["Si", "N"]}
+      max_cycle_size: 12
+
+  production:
+    enabled: true
+    min_boxes: 20
+    batch_boxes: 5
+    max_boxes: 60
+    check_convergence: true
+    consecutive_converged_checks: 2
+    store_distributions: true
+    # structure contains coordination
+    exclude_coordination_defects: true
+    dump_trajectory: false
+
+lammps:
+  lammps_cmd: lmp
