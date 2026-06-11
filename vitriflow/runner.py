@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .config import LammpsConfig, Cp2kConfig
 from .utils import ensure_dir, run_cmd, ExternalCommandError, CommandFailureContext, _tail_lines
@@ -91,19 +91,36 @@ class Cp2kRunner:
 
     def __init__(self, cfg: Cp2kConfig):
         self.cfg = cfg
-        self._cached_data_dir: Optional[Path] = None
+        # Keyed by the inputs that drive detection so the cache auto-invalidates
+        # when config or env change between calls. A bare "first call wins"
+        # cache silently staged the wrong basis/potential files when one runner
+        # was reused across workdirs that needed different data dirs.
+        self._cached_data_dir: Optional[tuple[tuple[Any, ...], Optional[Path]]] = None
+
+    def _detection_cache_key(self) -> tuple[Any, ...]:
+        import os
+        cfg_dd = getattr(self.cfg, "data_dir", None)
+        env_dd = os.environ.get("CP2K_DATA_DIR", "").strip()
+        if isinstance(self.cfg.cp2k_cmd, list):
+            cmd_token = tuple(str(x) for x in self.cfg.cp2k_cmd)
+        else:
+            cmd_token = (str(self.cfg.cp2k_cmd),)
+        prefix = tuple(str(x) for x in (getattr(self.cfg, "exec_prefix", None) or []))
+        mpi = str(getattr(self.cfg, "mpi_cmd", "") or "")
+        return (str(cfg_dd) if cfg_dd else "", env_dd, cmd_token, prefix, mpi)
 
     def _detect_data_dir(self, workdir: Path) -> Optional[Path]:
         """Detect data dir."""
 
-        if self._cached_data_dir is not None:
-            return self._cached_data_dir
+        key = self._detection_cache_key()
+        if self._cached_data_dir is not None and self._cached_data_dir[0] == key:
+            return self._cached_data_dir[1]
 
         # override
         if getattr(self.cfg, "data_dir", None):
             p = Path(str(self.cfg.data_dir)).expanduser()
             if p.is_dir():
-                self._cached_data_dir = p
+                self._cached_data_dir = (key, p)
                 return p
 
         import os
@@ -111,9 +128,8 @@ class Cp2kRunner:
         if env_dd:
             p = Path(env_dd).expanduser()
             if p.is_dir():
-                # cache infer executable
-                # override stale env
-                pass
+                self._cached_data_dir = (key, p)
+                return p
 
         # lightweight command version
         import re
@@ -146,22 +162,23 @@ class Cp2kRunner:
             if m:
                 p = Path(m.group(1)).expanduser()
                 if p.is_dir():
-                    self._cached_data_dir = p
+                    self._cached_data_dir = (key, p)
                     return p
             # fallback
             m2 = re.search(r"Data directory path\s+([^\s]+)", txt)
             if m2:
                 p = Path(m2.group(1)).expanduser()
                 if p.is_dir():
-                    self._cached_data_dir = p
+                    self._cached_data_dir = (key, p)
                     return p
 
         # reach here existed
         if env_dd:
             p = Path(env_dd).expanduser()
             if p.is_dir():
-                self._cached_data_dir = p
+                self._cached_data_dir = (key, p)
                 return p
+        self._cached_data_dir = (key, None)
         return None
 
     def _ensure_data_files_present(self, workdir: Path) -> Optional[Path]:

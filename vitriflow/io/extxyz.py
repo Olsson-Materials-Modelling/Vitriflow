@@ -441,8 +441,10 @@ def iter_extxyz_frames(path: Path, *, type_to_species: Optional[Sequence[str]] =
                     if "type" in sl:
                         try:
                             types[i] = int(float(toks[sl["type"].start]))
-                        except Exception:
-                            types[i] = 0
+                        except Exception as _e:
+                            raise ValueError(
+                                f"EXTXYZ type column is not a valid integer at atom {i} in {p}"
+                            ) from _e
                     else:
                         types[i] = _type_from_symbol(
                             sym,

@@ -243,6 +243,43 @@ def production_plan_from_dict(data: Mapping[str, Any], *, base_dir: Optional[Pat
     )
 
 
+def run_production_ensemble(**kwargs: Any) -> dict[str, Any]:
+    """TRANSITIONAL SHIM — architectural finding remains OPEN.
+
+    CLAUDE.md states that run/autotune/run-schedule control flow must be
+    separate and that shared production logic belongs in `production_common`.
+    Today the implementation (`_ProductionEnsembleRunner` and
+    `_run_production_ensemble`) still lives in `autotune.py`; this function
+    only redirects `run.py` away from importing autotune internals directly.
+
+    DO NOT describe this as an architecture fix. It is a name-aliasing shim:
+    `run.py` calls `production_common.run_production_ensemble(...)` instead
+    of `autotune._run_production_ensemble(...)`, but the call still lands in
+    autotune via the lazy import below. The cross-runner dependency persists
+    and a real fix requires physically migrating the runner class to this
+    module (or to a dedicated `production_runner` module).
+
+    Why we kept the shim instead of resolving the finding:
+      * 0.4.29.4 is a regression-protection release; moving ~1300 LOC of
+        ensemble runner is not surgical.
+      * Renaming the call site now means the eventual migration only edits
+        this one file, not every caller.
+      * The `_run_production_ensemble` reference is still discoverable to
+        anyone grepping autotune, which is the honest state of affairs.
+
+    The targeted test in `tests/test_production_runner_shim_is_transitional.py`
+    pins this status so a future PR cannot silently rebrand the shim as a
+    completed fix.
+    """
+
+    # Lazy import: required because autotune already imports from
+    # production_common at module top, so a top-level import here would
+    # cycle. NOT a design feature -- another reason to migrate the impl.
+    from .autotune import _run_production_ensemble
+
+    return _run_production_ensemble(**kwargs)
+
+
 def production_plan_from_source(source: Optional[Mapping[str, Any]], *, base_dir: Optional[Path] = None) -> Optional[ProductionPlan]:
     if source is None:
         return None
@@ -924,7 +961,10 @@ def _tol_for_metric(name: str, conv) -> tuple[float, float]:
         return conv.gr_peak_height_rel_tol, conv.gr_peak_height_abs_tol
     if name.startswith("gr_") and name.endswith("_peak_fwhm"):
         return conv.gr_peak_fwhm_rel_tol, conv.gr_peak_fwhm_abs_tol
-    return 0.0, 0.0
+    raise ValueError(
+        f"No convergence tolerance defined for metric {name!r}; "
+        "add a case to _tol_for_metric in autotune.py and production_common.py"
+    )
 
 
 def _alpha_from_z(z: float) -> float:

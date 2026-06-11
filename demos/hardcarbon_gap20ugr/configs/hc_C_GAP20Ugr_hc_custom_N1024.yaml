@@ -1,0 +1,205 @@
+# Generic custom-stage schedule demonstrator for pure-C HC skeletons.
+# This file is for: vitriflow run-schedule / vitriflow run-custom
+# It is not an autotune input. Normal `vitriflow run` and `vitriflow autotune` are unchanged.
+# Nose-Hoover is the intentional robust default; other supported styles
+# may be selected with md.thermostat.style / md.barostat.style.
+#
+# Physical schedule at dt = 1 fs:
+#   9000 K randomisation hold:       10 ps   =  10000 steps
+#   9000 -> 3500 K prequench:         6 ps   =   6000 steps
+#   3500 K graphitisation hold:     400 ps   = 400000 steps
+#   3500 -> 300 K final quench:      20 ps   =  20000 steps
+#   300 K final NVT relaxation:      20 ps   =  20000 steps
+engine: lammps
+random_seed: 24681357
+
+lammps:
+  lammps_cmd: lmp_quip
+  mpi_cmd: mpirun
+  nprocs: 16
+  timeout_sec: null
+
+potential:
+  kind: lammps
+  user_units: metal
+  interactions: [C]
+  files:
+    - ../potentials/Carbon_GAP_20U+gr.xml
+    - ../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8891
+    - ../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8892
+    - ../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8893
+  commands:
+    - pair_style quip
+    - 'pair_coeff * * Carbon_GAP_20U+gr.xml "Potential xml_label=GAP_2022_11_4_0_14_40_15_889" 6'
+
+md:
+  timestep: 0.001
+  atom_style: atomic
+  ensemble: nvt
+  temperature: 300.0
+  pressure: 0.0
+  thermo_every: 500
+  dump_every: 5000
+  stage_continuity: continuous
+  force_isotropic: false
+  neighbor_skin: 2.5
+  neighbor_skin_autotune: true
+  neighbor_skin_step: 0.5
+  neighbor_skin_max: 5.0
+  thermostat:
+    style: nose-hoover
+    tdamp: 0.1
+  barostat:
+    style: nose-hoover
+    pdamp: 1.0
+    mode: iso
+
+structure:
+  generate:
+    method: packmol
+    formula: C
+    n_formula_units: 1024
+    packmol_cmd: packmol
+    packing_density_g_cm3: 1.3
+    packing_min_distance_A: 1.2
+    fallback_to_random: false
+    seed: 1001
+
+custom_schedule:
+  description: hardcarbon_gap20ugr_literature_inspired_schedule
+  enforce_temperature_continuity: true
+  stages:
+    - name: randomisation
+      temperature_K: 9000.0
+      time_ps: 10.0
+      velocity_mode: create
+    - name: prequench
+      temperature_start_K: 9000.0
+      temperature_stop_K: 3500.0
+      time_ps: 6.0
+      velocity_mode: preserve
+    - name: graphitisation
+      temperature_K: 3500.0
+      time_ps: 400.0
+      role: melt
+      velocity_mode: preserve
+    - name: final_quench
+      temperature_start_K: 3500.0
+      temperature_stop_K: 300.0
+      time_ps: 20.0
+      role: quench
+      velocity_mode: preserve
+    - name: relaxation
+      temperature_K: 300.0
+      time_ps: 20.0
+      role: relax
+      velocity_mode: preserve
+  analysis_roles:
+    melt: graphitisation
+    quench: final_quench
+    relax: relaxation
+autotune:
+  preflight:
+    enabled: false
+
+  metrics:
+    enabled: true
+    type_to_species: [C]
+    time_average_frames: 8
+    time_average_stride: 500
+    collect_during_production_stages: false
+    stage_timeseries_make_plot: false
+    quench_tail_min_frames: 24
+    quench_tail_focus_fraction: 0.75
+    quench_tail_fallback_fraction: 0.4
+    elastic:
+      enabled: false
+    pairs:
+      - {pair: [C, C], cutoff: 1.85}
+    coordinations:
+      - central: C
+        neighbor: C
+        cutoff: 1.85
+        allowed: [2, 3, 4]
+        defect_frac_tol: 1.0
+    coordination_sweep:
+      enabled: true
+      dr: 0.02
+      n_below: 4
+      n_above: 10
+      strained_delta: 0.10
+    angles:
+      - {triplet: [C, C, C]}
+    rings:
+      enabled: true
+      mode: bond_graph
+      algorithm: primitive
+      nodes: [C]
+      bond_pairs:
+        - {pair: [C, C], cutoff: 1.85}
+      max_cycle_size: 12
+      max_paths_per_edge: 16
+    gr:
+      - {pair: null, r_max: 8.0, nbins: 500}
+      - {pair: [C, C], r_max: 8.0, nbins: 500}
+    sq:
+      - {pair: null, q_max: 20.0, nq: 400, r_max: 8.0, nbins: 800, window: lorch}
+      - {pair: [C, C], q_max: 20.0, nq: 400, r_max: 8.0, nbins: 800, window: lorch}
+    voids:
+      enabled: true
+      n_samples: 32768
+      n_samples_timeseries: 4096
+      sampler: sobol
+      seed: 0
+      k_nearest: 16
+      default_radius: 1.7
+      radii:
+        C: 1.7
+      r_max: 5.0
+      cdf_points: 250
+      probe_radii: [0.5, 1.0, 1.5]
+    amorphous:
+      enabled: false
+
+  production:
+    enabled: true
+    min_boxes: 20
+    max_boxes: 80
+    batch_boxes: 4
+    warmup_start_temperature: 9000.0
+    warmup_duration_ps: 10.0
+    dump_trajectory: true
+    dump_every_steps: 10000
+    check_convergence: true
+    consecutive_converged_checks: 2
+    store_distributions: true
+    exclude_coordination_defects: false
+
+  convergence:
+    mode: both
+    familywise: none
+    density_rel_tol: 0.01
+    density_abs_tol: 0.001
+    coord_rel_tol: 0.0
+    coord_abs_tol: 0.04
+    bondlen_cdf_rel_tol: 0.0
+    bondlen_cdf_abs_tol: 0.02
+    angle_cdf_rel_tol: 0.0
+    angle_cdf_abs_tol: 0.02
+    coord_cdf_rel_tol: 0.0
+    coord_cdf_abs_tol: 0.02
+    ring_rel_tol: 0.0
+    ring_abs_tol: 0.06
+    ring_size_rel_tol: 0.0
+    ring_size_abs_tol: 0.5
+    gr_curve_rel_tol: 0.05
+    gr_curve_abs_tol: 0.05
+    sq_curve_rel_tol: 0.05
+    sq_curve_abs_tol: 0.05
+    void_cdf_rel_tol: 0.0
+    void_cdf_abs_tol: 0.03
+    zscore: 1.96
+    bounded_ci_method: t
+    stability_split: half
+    stability_distance: wasserstein
+    stability_bootstrap: 200

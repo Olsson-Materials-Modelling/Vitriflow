@@ -624,20 +624,67 @@ class StructureConfig(BaseModel):
 Ensemble = Literal["npt", "nvt"]
 
 
+ThermostatStyle = Literal["nose-hoover", "csvr", "langevin", "berendsen"]
+BarostatStyle = Literal["nose-hoover", "berendsen"]
+
+
 class ThermostatConfig(BaseModel):
-    # lammps currently hoover
-    # nose hoover csvr
-    style: Literal["nose-hoover", "csvr"] = "nose-hoover"
-    tdamp: float = 100.0  # time depends lammps
+    # Nose-Hoover is the default robust standard for LAMMPS schedules.
+    # LAMMPS also supports explicit CSVR, Langevin, and Berendsen thermostat fixes.
+    # CP2K currently supports Nose-Hoover and CSVR through the CP2K driver.
+    style: ThermostatStyle = "nose-hoover"
+    tdamp: float = 100.0  # time depends on engine units
+
+    @field_validator("style", mode="before")
+    @classmethod
+    def _style_normalise(cls, v):
+        s = str(v).strip().lower().replace("_", "-")
+        aliases = {
+            "nose": "nose-hoover",
+            "nosehoover": "nose-hoover",
+            "nose-hoover-chain": "nose-hoover",
+            "nh": "nose-hoover",
+            "bussi": "csvr",
+            "bussi-csvr": "csvr",
+            "velocity-rescale": "csvr",
+            "stochastic-rescale": "csvr",
+        }
+        return aliases.get(s, s)
+
+    @field_validator("tdamp")
+    @classmethod
+    def _tdamp_positive(cls, v: float) -> float:
+        v = float(v)
+        if not math.isfinite(v) or v <= 0.0:
+            raise ValueError("thermostat.tdamp must be finite and > 0")
+        return v
 
 
 class BarostatConfig(BaseModel):
-    # currently pressure lammps
-    # schema
-    # yamls specify
-    style: Literal["nose-hoover"] = "nose-hoover"
-    pdamp: float = 1000.0  # time
+    # Nose-Hoover is the default robust standard for pressure-coupled LAMMPS schedules.
+    # Berendsen is available for users who explicitly request weak pressure coupling.
+    style: BarostatStyle = "nose-hoover"
+    pdamp: float = 1000.0  # time depends on engine units
     mode: Literal["iso"] = "iso"
+
+    @field_validator("style", mode="before")
+    @classmethod
+    def _style_normalise(cls, v):
+        s = str(v).strip().lower().replace("_", "-")
+        aliases = {
+            "nose": "nose-hoover",
+            "nosehoover": "nose-hoover",
+            "nh": "nose-hoover",
+        }
+        return aliases.get(s, s)
+
+    @field_validator("pdamp")
+    @classmethod
+    def _pdamp_positive(cls, v: float) -> float:
+        v = float(v)
+        if not math.isfinite(v) or v <= 0.0:
+            raise ValueError("barostat.pdamp must be finite and > 0")
+        return v
 
 
 class MDConfig(BaseModel):
@@ -1791,10 +1838,6 @@ class RunConfig(BaseModel):
         if eng == "lammps":
             if self.kim is None:
                 raise ValueError("engine='lammps' requires a 'kim:' or 'potential:' block")
-            # lammps backend currently
-            # csvr thermostatting driver
-            if str(self.md.thermostat.style).strip().lower() == "csvr":
-                raise ValueError("thermostat.style='csvr' is supported only for engine='cp2k'")
         elif eng == "cp2k":
             if self.cp2k is None:
                 raise ValueError("engine='cp2k' requires a 'cp2k:' block")
@@ -1806,6 +1849,12 @@ class RunConfig(BaseModel):
                 raise ValueError("CP2K driver currently supports md.ensemble in {'nvt','npt'} only")
             if bool(getattr(self.md, "force_isotropic", False)):
                 raise ValueError("md.force_isotropic is supported only for engine='lammps'")
+            th_style = str(getattr(self.md.thermostat, "style", "nose-hoover")).strip().lower()
+            if th_style not in {"nose-hoover", "csvr"}:
+                raise ValueError(f"thermostat.style={th_style!r} is supported only for engine='lammps'")
+            bar_style = str(getattr(self.md.barostat, "style", "nose-hoover")).strip().lower()
+            if bar_style != "nose-hoover":
+                raise ValueError("CP2K driver currently supports only barostat.style='nose-hoover'")
             elastic_cfg = getattr(getattr(self.autotune, "metrics", None), "elastic", None)
             elastic_enabled = getattr(elastic_cfg, "enabled", "auto") if elastic_cfg is not None else "auto"
             if elastic_enabled is True:
@@ -1850,103 +1899,86 @@ class RunConfig(BaseModel):
     def from_yaml(cls, path: Path) -> "RunConfig":
         data = yaml.safe_load(path.read_text())
 
-        # relative path
-        # specify structure lammps
-        # specify structure lammps
-        # yaml directory preferred
-        # relative project 4x4x4
-        # relative path
-        # relative path
-        # duplicated inside folder
-        # candidate resolutions exists
         base = path.parent
+
+        # Errors expected during pre-validation rewrites: malformed nesting,
+        # bad path strings, filesystem failures. Any other exception bubbles up
+        # so genuine bugs are not silenced. The previous bare `except Exception`
+        # masked unrelated failures and made debugging YAML parsing intractable.
+        _PATH_REWRITE_EXC = (AttributeError, TypeError, ValueError, OSError)
+
+        def _strip_overlap(base_dir: Path, rel: Path) -> Path:
+            bparts = base_dir.parts
+            rparts = rel.parts
+            kmax = min(len(bparts), len(rparts))
+            for k in range(kmax, 0, -1):
+                if tuple(rparts[:k]) == tuple(bparts[-k:]):
+                    tail = rparts[k:]
+                    return Path(*tail) if len(tail) > 0 else Path(".")
+            return rel
+
+        def _resolve_with_overlap(raw_path: str) -> str:
+            p = Path(raw_path)
+            if p.is_absolute():
+                return str(p.resolve(strict=False))
+            p2 = _strip_overlap(base, p)
+            candidates: list[Path] = []
+            candidates.append((base / p2))
+            if p2 != p:
+                candidates.append((base / p))
+            for parent in base.parents:
+                candidates.append(parent / p2)
+                if p2 != p:
+                    candidates.append(parent / p)
+            candidates.append(Path.cwd() / p2)
+            if p2 != p:
+                candidates.append(Path.cwd() / p)
+            for c in candidates:
+                if c.exists():
+                    return str(c.resolve(strict=False))
+            return str((base / p2).resolve(strict=False))
+
         try:
             s = data.get("structure", {})
-            if "lammps_data" in s and s["lammps_data"] is not None:
-                raw = str(s["lammps_data"])
-                p = Path(raw)
-                if not p.is_absolute():
-                    # overlapping duplicates yaml
-                    def _strip_overlap(base_dir: Path, rel: Path) -> Path:
-                        bparts = base_dir.parts
-                        rparts = rel.parts
-                        kmax = min(len(bparts), len(rparts))
-                        for k in range(kmax, 0, -1):
-                            if tuple(rparts[:k]) == tuple(bparts[-k:]):
-                                tail = rparts[k:]
-                                return Path(*tail) if len(tail) > 0 else Path(".")
-                        return rel
-
-                    p2 = _strip_overlap(base, p)
-                    # candidate order yaml
-                    candidates: list[Path] = []
-                    candidates.append((base / p2))
-                    if p2 != p:
-                        candidates.append((base / p))
-                    for parent in base.parents:
-                        candidates.append(parent / p2)
-                        if p2 != p:
-                            candidates.append(parent / p)
-                    candidates.append(Path.cwd() / p2)
-                    if p2 != p:
-                        candidates.append(Path.cwd() / p)
-
-                    chosen: Optional[Path] = None
-                    for c in candidates:
-                        if c.exists():
-                            chosen = c
-                            break
-                    if chosen is None:
-                        # relative path
-                        chosen = base / p2
-                    s["lammps_data"] = str(chosen.resolve(strict=False))
-        except Exception:
-            # yaml parsing heuristics
+            if isinstance(s, dict) and "lammps_data" in s and s["lammps_data"] is not None:
+                s["lammps_data"] = _resolve_with_overlap(str(s["lammps_data"]))
+        except _PATH_REWRITE_EXC:
             pass
 
-        # structure generate present
         try:
             s = data.get("structure", {})
             g = s.get("generate", {}) if isinstance(s, dict) else {}
             if isinstance(g, dict) and g.get("poscar_path", None) is not None:
-                raw = str(g.get("poscar_path"))
-                p = Path(raw)
-                if not p.is_absolute():
-                    def _strip_overlap(base_dir: Path, rel: Path) -> Path:
-                        bparts = base_dir.parts
-                        rparts = rel.parts
-                        kmax = min(len(bparts), len(rparts))
-                        for k in range(kmax, 0, -1):
-                            if tuple(rparts[:k]) == tuple(bparts[-k:]):
-                                tail = rparts[k:]
-                                return Path(*tail) if len(tail) > 0 else Path(".")
-                        return rel
-
-                    p2 = _strip_overlap(base, p)
-                    candidates: list[Path] = []
-                    candidates.append((base / p2))
-                    if p2 != p:
-                        candidates.append((base / p))
-                    for parent in base.parents:
-                        candidates.append(parent / p2)
-                        if p2 != p:
-                            candidates.append(parent / p)
-                    candidates.append(Path.cwd() / p2)
-                    if p2 != p:
-                        candidates.append(Path.cwd() / p)
-
-                    chosen: Optional[Path] = None
-                    for c in candidates:
-                        if c.exists():
-                            chosen = c
-                            break
-                    if chosen is None:
-                        chosen = base / p2
-                    g["poscar_path"] = str(chosen.resolve(strict=False))
-        except Exception:
+                g["poscar_path"] = _resolve_with_overlap(str(g.get("poscar_path")))
+        except _PATH_REWRITE_EXC:
             pass
 
-        # potential kim auxiliary
+        # potential.files: reject null entries up front (BEFORE the path
+        # rewriting try/except below). YAML constructs like `files: [null]`,
+        # `files: [~]`, or a stray trailing `-` parse as None and used to be
+        # silently dropped here, leaving the user with a config that did not
+        # match their YAML. Raise instead so the typo is fixed at the source.
+        # This raise must escape the broad `except _PATH_REWRITE_EXC` swallow
+        # below; that's why the check sits OUTSIDE the try block.
+        if isinstance(data, dict):
+            _pot_key = "potential" if "potential" in data else ("kim" if "kim" in data else None)
+            if _pot_key is not None:
+                _pot_block = data.get(_pot_key)
+                if isinstance(_pot_block, dict):
+                    _files_block = _pot_block.get("files")
+                    if isinstance(_files_block, (list, tuple)):
+                        for _idx, _entry in enumerate(_files_block):
+                            if _entry is None:
+                                raise ValueError(
+                                    f"{_pot_key}.files entry at index {_idx} is null. "
+                                    "Remove the entry or provide a path; null is not "
+                                    "silently dropped (this would make the loaded config "
+                                    "diverge from the YAML you wrote)."
+                                )
+
+        # potential.files now uses the same overlap-stripping heuristic as
+        # structure.lammps_data and structure.generate.poscar_path so YAML-relative
+        # potential file lists behave consistently across fields.
         try:
             key = "potential" if isinstance(data, dict) and "potential" in data else "kim"
             pot = data.get(key, {}) if isinstance(data, dict) else {}
@@ -1955,19 +1987,11 @@ class RunConfig(BaseModel):
                 if isinstance(files, (list, tuple)):
                     out_files: list[str] = []
                     for rawf in files:
-                        pf = Path(str(rawf))
-                        if not pf.is_absolute():
-                            # prefer yaml relative
-                            pf2 = base / pf
-                            if pf2.exists():
-                                out_files.append(str(pf2.resolve(strict=False)))
-                            else:
-                                # fall back relative
-                                out_files.append(str((Path.cwd() / pf).resolve(strict=False)))
-                        else:
-                            out_files.append(str(pf.resolve(strict=False)))
+                        # None entries were rejected upfront; reaching this
+                        # branch with a None would be a programming error.
+                        out_files.append(_resolve_with_overlap(str(rawf)))
                     pot["files"] = out_files
-        except Exception:
+        except _PATH_REWRITE_EXC:
             pass
 
         return cls.model_validate(data)

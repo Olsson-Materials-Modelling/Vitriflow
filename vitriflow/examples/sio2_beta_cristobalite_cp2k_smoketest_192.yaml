@@ -1,0 +1,112 @@
+# Placeholder CP2K smoke-test example; replace with beta-cristobalite source before production.
+engine: cp2k
+cp2k:
+  mpi_cmd: mpiexec
+  nprocs: 16
+  cp2k_cmd: cp2k.psmp
+  exec_prefix:
+  - conda
+  - run
+  - -n
+  - vitriflow-cp2k
+  - --no-capture-output
+  basis_set_file_name: BASIS_MOLOPT
+  potential_file_name: GTH_POTENTIALS
+  xc_functional: PBE
+  cutoff_Ry: 300.0
+  rel_cutoff_Ry: 50.0
+  ngrids: 4
+  eps_scf: 1.0e-06
+  max_scf: 30
+  scf_guess: ATOMIC
+  use_ot: true
+  ot_minimizer: DIIS
+  ot_preconditioner: FULL_SINGLE_INVERSE
+  ramp_max_deltaT_K: 100.0
+  ramp_max_segments: 20
+  kind_settings:
+    Si:
+      basis_set: DZVP-MOLOPT-SR-GTH
+      potential: GTH-PBE-q4
+structure:
+  generate:
+    method: builtin
+    builtin_name: si_diamond
+    formula: Si
+    n_formula_units: 64
+md:
+  ensemble: npt
+  timestep: 0.5
+  atom_style: atomic
+  temperature: 300.0
+  pressure: 1.0
+  thermo_every: 5
+  dump_every: 20
+  stage_continuity: continuous
+  thermostat:
+    style: csvr
+    tdamp: 50.0
+  barostat:
+    pdamp: 5000.0
+    mode: iso
+random_seed: 11
+autotune:
+  metrics:
+    enabled: false
+    type_to_species:
+    - Si
+  preflight:
+    enabled: true
+    ensembles:
+    - npt
+    dt_candidates:
+    - 0.5
+    tdamp_factors:
+    - 50.0
+    - 100.0
+    pdamp_factors:
+    - 10000.0
+    tail_window: 10
+    temp_rel_tol: 0.5
+    equil_steps: 10
+    run_steps: 30
+    confirm_equil_steps: 10
+    confirm_run_steps: 50
+    confirm_topk: 1
+  tm_scan:
+    t_min: 300.0
+    t_max: 900.0
+    dT: 300.0
+    ensemble: npt
+    replicates_per_temp: 1
+    equil_steps: 10
+    sample_steps: 30
+    msd_every: 5
+    gr:
+      enabled: false
+  highT:
+    margin: 200.0
+    replicates: 1
+    chunk_steps: 30
+    max_chunks: 1
+    min_total_steps: 30
+    rms_multiple: 0.1
+    stationarity_tol: 0.5
+  quench:
+    t_final: 300.0
+    relax_steps: 50
+    enforce_rate_bounds: false
+    rates_K_per_ps:
+    - 100000.0
+    - 50000.0
+    replicates_per_rate: 1
+  size:
+    enabled: false
+    replicas:
+    - - 1
+      - 1
+      - 1
+    replicates_per_size: 1
+    max_atoms: 1000
+  production:
+    enabled: false

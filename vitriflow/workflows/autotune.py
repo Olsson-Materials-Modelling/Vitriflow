@@ -453,7 +453,10 @@ def _tol_for_metric(name: str, conv) -> tuple[float, float]:
         return conv.gr_peak_height_rel_tol, conv.gr_peak_height_abs_tol
     if name.startswith("gr_") and name.endswith("_peak_fwhm"):
         return conv.gr_peak_fwhm_rel_tol, conv.gr_peak_fwhm_abs_tol
-    return 0.0, 0.0
+    raise ValueError(
+        f"No convergence tolerance defined for metric {name!r}; "
+        "add a case to _tol_for_metric in autotune.py and production_common.py"
+    )
 
 def _multimetric_decision(
     x: list[float],

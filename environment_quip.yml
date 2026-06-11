@@ -1,0 +1,56 @@
+name: vitriflow-quip
+channels:
+  - conda-forge
+channel_priority: strict
+dependencies:
+  # Runtime for VitriFlow. Python 3.11 is conservative for ASE/pydantic/LAMMPS-tooling compatibility.
+  - python=3.11
+  - pip
+  - numpy>=1.24
+  - scipy>=1.10
+  - pyyaml>=6.0
+  - pydantic>=2.5,<3
+  - ase>=3.22
+  - networkx>=3
+  - matplotlib>=3.8
+  - mp-api>=0.45
+  - packmol
+
+  # MPI stack used both to build and run the custom LAMMPS/ML-QUIP executable.
+  # Keeping MPI inside the conda env improves reproducibility and avoids mixing ABI-incompatible stacks.
+  - mpi=1.0.1=openmpi
+  - openmpi
+  - mpi4py
+
+  # BLAS/LAPACK for QUIP/GAP. Do not use LAMMPS internal linalg for ML-QUIP here:
+  # QUIP needs LAPACK symbols such as dsysv_ and dgeev_.
+  - "libblas=*=*openblas"
+  - "libcblas=*=*openblas"
+  - "liblapack=*=*openblas"
+  - "liblapacke=*=*openblas"
+  - libopenblas
+
+  # Build stack for LAMMPS + ML-QUIP. The conda-forge lammps binary is intentionally
+  # not installed here, because it can shadow the custom lmp_quip executable and is
+  # not guaranteed to include pair_style quip.
+  - cmake>=3.24
+  - ninja
+  - make
+  - git
+  - curl
+  - wget
+  - pkg-config
+  - c-compiler
+  - cxx-compiler
+  - fortran-compiler
+  - libgcc-ng
+  - libstdcxx-ng
+  - libgfortran-ng
+  - ca-certificates
+  - openssl
+
+  # Optional but useful for freezing exact platform-specific package resolutions.
+  - conda-lock
+
+  - pip:
+      - -e .

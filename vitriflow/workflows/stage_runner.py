@@ -235,6 +235,31 @@ def _localized_output_name(output_data: Optional[Union[str, Path]]) -> str:
     return Path(output_data).name
 
 
+def _validate_cp2k_species_coverage(
+    symbols: Sequence[str],
+    type_to_species: Sequence[str],
+) -> None:
+    """Hard preflight: every chemical symbol must map to a LAMMPS type.
+
+    Run *before* CP2K execution and outside any best-effort artifact path.
+    A misconfigured ``type_to_species`` (e.g. a 2-element list against an
+    input that has 3 distinct species) used to slip through to the
+    engine-neutral materializer where unknown symbols silently became LAMMPS
+    ``type=0`` -- an invalid value that downstream tools accept but
+    misinterpret. Failing here means the user fixes the YAML before any
+    expensive engine run, not after the fact.
+    """
+
+    known = {str(x) for x in type_to_species}
+    unknown = sorted({str(s) for s in symbols if str(s) not in known})
+    if unknown:
+        raise ValueError(
+            f"CP2K stage species {unknown!r} are not covered by "
+            f"type_to_species={list(type_to_species)!r}. Update the YAML so the "
+            "LAMMPS type ordering covers every species in the input structure."
+        )
+
+
 def _resolved_velocity_mode(stage: StageSpec, *, input_data: Optional[Path]) -> str:
     vel_mode = str(getattr(stage, "velocity_mode", "create")).strip().lower()
     if input_data is not None and vel_mode == "preserve" and not datafile_has_velocities(input_data):
@@ -984,30 +1009,33 @@ def _materialize_cp2k_engine_neutral_outputs(
     """Materialize cp2k engine."""
 
     import numpy as np
+    from ..analysis.dump import DumpFrame
 
     traj_path = Path(stage_dir) / "traj.extxyz"
     final_extxyz = Path(stage_dir) / "final.extxyz"
     traj_extxyz: Optional[Path] = None
     traj_written = False
 
+    # Build the LAMMPS type vector OUTSIDE the best-effort try/except. The CP2K
+    # preflight (`_validate_cp2k_species_coverage`) is responsible for catching
+    # mismatched type_to_species *before* the engine runs; if a symbol still
+    # slips through here it is a contract violation and must raise, not be
+    # silently logged as a best-effort artifact warning.
+    sym_to_type = {str(sym): i + 1 for i, sym in enumerate(list(type_to_species))}
+    ids = np.arange(1, int(len(symbols)) + 1, dtype=int)
+    types = np.asarray([sym_to_type[str(sym)] for sym in symbols], dtype=int)
+
+    def _mk_frame(idx: int) -> DumpFrame:
+        return DumpFrame(
+            timestep=int(steps_all[idx]),
+            ids=np.asarray(ids, dtype=int),
+            types=np.asarray(types, dtype=int),
+            positions=np.asarray(pos_all[idx], dtype=float),
+            cell=np.asarray(cells_all[idx], dtype=float),
+            origin=np.zeros((3,), dtype=float),
+        )
+
     try:
-        from ..analysis.dump import DumpFrame
-
-        # symbols species ordering
-        sym_to_type = {str(sym): i + 1 for i, sym in enumerate(list(type_to_species))}
-        ids = np.arange(1, int(len(symbols)) + 1, dtype=int)
-        types = np.asarray([sym_to_type.get(str(sym), 0) for sym in symbols], dtype=int)
-
-        def _mk_frame(idx: int) -> DumpFrame:
-            return DumpFrame(
-                timestep=int(steps_all[idx]),
-                ids=np.asarray(ids, dtype=int),
-                types=np.asarray(types, dtype=int),
-                positions=np.asarray(pos_all[idx], dtype=float),
-                cell=np.asarray(cells_all[idx], dtype=float),
-                origin=np.zeros((3,), dtype=float),
-            )
-
         last_frame = _mk_frame(len(steps_all) - 1)
 
         if bool(write_dump) and selected_out:
@@ -1132,6 +1160,9 @@ def _run_stage_local_cp2k(
         rx, ry, rz = stage.replicate
         atoms = atoms.repeat((int(rx), int(ry), int(rz)))
         atoms.pbc = True
+
+    # Hard preflight before any CP2K invocation. See _validate_cp2k_species_coverage.
+    _validate_cp2k_species_coverage(atoms.get_chemical_symbols(), type_to_species)
 
     dt_fs = float(md_cfg.timestep)
     tdamp_fs = float(md_cfg.thermostat.tdamp)

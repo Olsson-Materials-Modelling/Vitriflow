@@ -164,6 +164,13 @@ def read_frames_auto(
 
     p = Path(path)
     suf = p.suffix.lower()
+    if suf == ".restart":
+        # Avoid handing arbitrary engine restart/input files to ASE's generic
+        # reader.  Some restart-like text files trigger extremely expensive
+        # format probing.  Use explicit trajectory/data/EXTXYZ files for
+        # automatic frame loading; restart files can still be carried as final
+        # source metadata by output-analysis discovery.
+        raise ValueError("automatic frame loading from .restart files is disabled; convert to extxyz, xyz, dump or LAMMPS data")
     if suf == ".extxyz":
         return read_extxyz_frames(p, last_n=last_n, type_to_species=type_to_species)
     if suf == ".xyz":
@@ -197,6 +204,8 @@ def read_last_frames_auto(
 
     p = Path(path)
     suf = p.suffix.lower()
+    if suf == ".restart":
+        raise ValueError("automatic frame loading from .restart files is disabled; convert to extxyz, xyz, dump or LAMMPS data")
     if suf == ".extxyz":
         return read_extxyz_frames(p, last_n=int(n), type_to_species=type_to_species)
     if suf == ".xyz":

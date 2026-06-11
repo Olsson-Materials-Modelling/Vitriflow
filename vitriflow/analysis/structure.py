@@ -241,14 +241,14 @@ def compute_structure_distributions_timeavg(
         name = f"coord_{cm.central}-{cm.neighbor}"
         coord_defs.append((name, c_types, n_types))
 
-    angle_defs: list[tuple[str, list[int], list[int], list[int]]] = []
+    angle_defs: list[tuple[str, str, str, list[int], list[int], list[int]]] = []
     for am in metrics.angles:
         a_sel, b_sel, c_sel = am.triplet
         a_types = _resolve_selector(a_sel, type_to_species)
         b_types = _resolve_selector(b_sel, type_to_species)
         c_types = _resolve_selector(c_sel, type_to_species)
         name = f"angle_{a_sel}-{b_sel}-{c_sel}"
-        angle_defs.append((name, a_types, b_types, c_types))
+        angle_defs.append((name, a_sel, c_sel, a_types, b_types, c_types))
 
     # accumulate pooled samples
     bond_samples: Dict[str, List[float]] = {name: [] for (name, *_rest) in pair_defs}
@@ -320,12 +320,12 @@ def compute_structure_distributions_timeavg(
                 coord_samples[name].extend(counts)
 
         # angle samples
-        for (name, a_types, b_types, c_types) in angle_defs:
+        for (name, a_sel, c_sel, a_types, b_types, c_types) in angle_defs:
             aset = set(int(x) for x in a_types)
             bset = set(int(x) for x in b_types)
             cset = set(int(x) for x in c_types)
             angles: List[float] = []
-            same_ac = (aset == cset) and (len(aset) > 0) and (len(cset) > 0)
+            same_ac = (aset == cset) and (len(aset) > 0) and (len(cset) > 0) and (a_sel == c_sel)
             for b_idx in range(fr.n_atoms):
                 if int(fr.types[b_idx]) not in bset:
                     continue

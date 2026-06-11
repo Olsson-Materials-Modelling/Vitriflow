@@ -1125,12 +1125,34 @@ def prepare_potential_files(
         write_mg2_sin_table(out, pot)
 
     if isinstance(pot, LammpsPotentialConfig):
+        # Localization is by basename. Distinct sources sharing a basename
+        # would silently overwrite one another; refuse instead so the user
+        # renames or re-organises explicitly.
+        seen_by_name: dict[str, Path] = {}
         for f in pot.files or []:
             src = Path(f)
             if not src.exists():
                 raise FileNotFoundError(f"Potential auxiliary file not found: {src}")
-            dst = stage_dir / src.name
-            if dst.resolve() == src.resolve():
+            name = src.name
+            prior = seen_by_name.get(name)
+            if prior is not None:
+                try:
+                    same = prior.resolve(strict=False) == src.resolve(strict=False)
+                except OSError:
+                    same = False
+                if not same:
+                    raise ValueError(
+                        f"potential.files contains two distinct sources with basename {name!r}: "
+                        f"{prior} and {src}. Localization is by basename, so one would silently "
+                        "overwrite the other. Rename one of them."
+                    )
+            seen_by_name[name] = src
+            dst = stage_dir / name
+            try:
+                same_dst = dst.resolve() == src.resolve()
+            except OSError:
+                same_dst = False
+            if same_dst:
                 continue
             shutil.copy2(src, dst)
 

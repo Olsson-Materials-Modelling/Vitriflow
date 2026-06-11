@@ -84,3 +84,65 @@ Atoms # atomic
     assert "write_data" not in script
     # occurrences between sample
     assert script.count("unfix int") >= 3
+
+
+def test_render_continuous_stages_rejects_later_velocity_create(tmp_path: Path):
+    from vitriflow.config import KimConfig, MDConfig
+    from vitriflow.lammps_input import StageSpec, render_continuous_stages
+
+    data = tmp_path / "input.data"
+    data.write_text(
+        """
+LAMMPS data file via vitriflow test
+
+1 atoms
+1 atom types
+
+0.0 1.0 xlo xhi
+0.0 1.0 ylo yhi
+0.0 1.0 zlo zhi
+
+Masses
+
+1 28.0855
+
+Atoms # atomic
+
+1 1 0.0 0.0 0.0
+""".lstrip()
+    )
+    pot = KimConfig(model="TEST_MODEL", interactions=["Si"])
+    md = MDConfig(ensemble="nvt")
+    first = StageSpec(
+        name="first",
+        input_data=data,
+        output_data=tmp_path / "first.data",
+        temperature_start=1000.0,
+        temperature_stop=1000.0,
+        pressure=0.0,
+        equil_steps=0,
+        run_steps=1,
+        seed=1,
+        velocity_mode="create",
+    )
+    second = StageSpec(
+        name="second",
+        input_data=tmp_path / "first.data",
+        output_data=tmp_path / "second.data",
+        temperature_start=1000.0,
+        temperature_stop=300.0,
+        pressure=0.0,
+        equil_steps=0,
+        run_steps=1,
+        seed=2,
+        velocity_mode="create",
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="velocity creation on the first stage"):
+        render_continuous_stages(
+            pot,
+            md,
+            [first, second],
+            stage_dir_prefixes={"first": "../first", "second": "../second"},
+        )

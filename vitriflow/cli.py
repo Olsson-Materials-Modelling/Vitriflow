@@ -114,6 +114,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    p_sched = sub.add_parser(
+        "run-schedule",
+        aliases=["run-custom", "run-custom-schedule", "run-custom-stages", "run-cs", "run-hardcarbon", "run-hc"],
+        help="Run a user-defined fixed stage schedule without changing run/autotune.",
+    )
+    p_sched.add_argument("-c", "--config", type=Path, required=True, help="YAML configuration file with a custom_schedule block.")
+    p_sched.add_argument("-o", "--outdir", type=Path, required=True, help="Output directory.")
+    p_sched.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Resume from an existing run_results.json in the output directory (default: auto-detect).",
+    )
+
     p_auto = sub.add_parser("autotune", help="Auto-tune melting temperature, high-T time, cooling rate, and box size.")
     p_auto.add_argument("-c", "--config", type=Path, required=True, help="YAML configuration file.")
     p_auto.add_argument("-o", "--outdir", type=Path, required=True, help="Output directory.")
@@ -441,6 +455,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         cfg = RunConfig.from_yaml(args.config)
         res = autotune(cfg, args.outdir, resume=args.resume)
         print(json.dumps(res.get("recommendation", {}), indent=2))
+        return
+
+    if args.cmd in {"run-schedule", "run-custom", "run-custom-schedule", "run-custom-stages", "run-cs", "run-hardcarbon", "run-hc"}:
+        # Import lazily so custom schedules cannot affect standard run/autotune startup.
+        from .workflows.custom_schedule import run_custom_schedule
+
+        cfg = RunConfig.from_yaml(args.config)
+        res = run_custom_schedule(cfg, args.outdir, config_path=args.config, resume=args.resume)
+        print(json.dumps(res, indent=2))
         return
 
     if args.cmd == "run":

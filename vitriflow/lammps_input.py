@@ -104,22 +104,115 @@ def _mass_lines_from_interactions(
             lines.append(f"mass {t} {m:.6f}")
     return "\n".join(lines)
 
+def _style_name(value: object) -> str:
+    return str(value).strip().lower().replace("_", "-")
+
+
+def _thermostat_fix_lines(
+    style: str,
+    *,
+    Tstart: float,
+    Tstop: float,
+    tdamp: float,
+    seed: int,
+) -> list[str]:
+    """LAMMPS thermostat fixes that do not perform time integration."""
+
+    if style == "csvr":
+        return [f"fix th all temp/csvr {Tstart} {Tstop} {tdamp} {int(seed)}"]
+    if style == "langevin":
+        return [f"fix th all langevin {Tstart} {Tstop} {tdamp} {int(seed)}"]
+    if style == "berendsen":
+        return [f"fix th all temp/berendsen {Tstart} {Tstop} {tdamp}"]
+    raise ValueError(f"Unsupported LAMMPS thermostat style: {style}")
+
+
+def _lammps_integration_block(
+    md: MDConfig,
+    ensemble: str,
+    *,
+    Tstart: float,
+    Tstop: float,
+    pressure: float,
+    seed: int,
+) -> tuple[str, str]:
+    """Return (fix block, cleanup block) for a LAMMPS sampling segment.
+
+    Nose-Hoover remains the compact/default path via fix nvt/npt. Alternative
+    thermostat/barostat choices are represented explicitly with separate
+    time-integration, thermostat, and/or barostat fixes.
+    """
+
+    ens = _style_name(ensemble)
+    if ens not in {"nvt", "npt"}:
+        raise ValueError(f"Unsupported LAMMPS ensemble: {ensemble}")
+
+    th_style = _style_name(getattr(md.thermostat, "style", "nose-hoover"))
+    bar_style = _style_name(getattr(md.barostat, "style", "nose-hoover"))
+    tdamp = float(getattr(md.thermostat, "tdamp", 0.0))
+    pdamp = float(getattr(md.barostat, "pdamp", 0.0))
+    if not math.isfinite(tdamp) or tdamp <= 0.0:
+        raise ValueError("md.thermostat.tdamp must be finite and > 0")
+    if ens == "npt" and (not math.isfinite(pdamp) or pdamp <= 0.0):
+        raise ValueError("md.barostat.pdamp must be finite and > 0 for NPT")
+
+    lines: list[str] = []
+    cleanup: list[str] = []
+
+    if ens == "nvt":
+        if th_style == "nose-hoover":
+            lines.append(f"fix int all nvt temp {Tstart} {Tstop} {tdamp}")
+            cleanup.append("unfix int")
+        else:
+            lines.append("fix int all nve")
+            lines.extend(_thermostat_fix_lines(th_style, Tstart=Tstart, Tstop=Tstop, tdamp=tdamp, seed=seed))
+            cleanup.extend(["unfix th", "unfix int"])
+        return "\n".join(lines), "\n".join(cleanup)
+
+    mode = str(getattr(md.barostat, "mode", "iso")).strip().lower()
+    if th_style == "nose-hoover" and bar_style == "nose-hoover":
+        lines.append(f"fix int all npt temp {Tstart} {Tstop} {tdamp} {mode} {pressure} {pressure} {pdamp}")
+        cleanup.append("unfix int")
+    elif th_style == "nose-hoover" and bar_style == "berendsen":
+        lines.append(f"fix int all nvt temp {Tstart} {Tstop} {tdamp}")
+        lines.append(f"fix bar all press/berendsen {mode} {pressure} {pressure} {pdamp}")
+        cleanup.extend(["unfix bar", "unfix int"])
+    elif th_style != "nose-hoover" and bar_style == "nose-hoover":
+        lines.append(f"fix int all nph {mode} {pressure} {pressure} {pdamp}")
+        lines.extend(_thermostat_fix_lines(th_style, Tstart=Tstart, Tstop=Tstop, tdamp=tdamp, seed=seed))
+        cleanup.extend(["unfix th", "unfix int"])
+    elif th_style != "nose-hoover" and bar_style == "berendsen":
+        lines.append("fix int all nve")
+        lines.extend(_thermostat_fix_lines(th_style, Tstart=Tstart, Tstop=Tstop, tdamp=tdamp, seed=seed))
+        lines.append(f"fix bar all press/berendsen {mode} {pressure} {pressure} {pdamp}")
+        cleanup.extend(["unfix bar", "unfix th", "unfix int"])
+    else:
+        raise ValueError(f"Unsupported LAMMPS barostat style: {bar_style}")
+
+    return "\n".join(lines), "\n".join(cleanup)
+
+
 def render_stage(pot: PotentialConfig, md: MDConfig, stage: StageSpec) -> str:
     """Stage."""
     dump_every = stage.dump_every if stage.dump_every is not None else md.dump_every
 
-    def _fix_line(ensemble: str) -> str:
-        if ensemble == "nvt":
-            return f"fix int all nvt temp {stage.temperature_start} {stage.temperature_stop} {md.thermostat.tdamp}"
-        # npt
-        return (
-            f"fix int all npt temp {stage.temperature_start} {stage.temperature_stop} {md.thermostat.tdamp} "
-            f"{md.barostat.mode} {stage.pressure} {stage.pressure} {md.barostat.pdamp}"
-        )
-
-    fix_line_equil = _fix_line(md.ensemble)
+    fix_line_equil, unfix_line_equil = _lammps_integration_block(
+        md,
+        md.ensemble,
+        Tstart=float(stage.temperature_start),
+        Tstop=float(stage.temperature_start),
+        pressure=float(stage.pressure),
+        seed=int(stage.seed),
+    )
     sample_ens = stage.sample_ensemble if stage.sample_ensemble is not None else md.ensemble
-    fix_line_sample = _fix_line(sample_ens)
+    fix_line_sample, unfix_line_sample = _lammps_integration_block(
+        md,
+        sample_ens,
+        Tstart=float(stage.temperature_start),
+        Tstop=float(stage.temperature_stop),
+        pressure=float(stage.pressure),
+        seed=int(stage.seed),
+    )
 
     rep_line = ""
     if stage.replicate is not None:
@@ -168,12 +261,19 @@ def render_stage(pot: PotentialConfig, md: MDConfig, stage: StageSpec) -> str:
                 stride = max(1, int(dump_every))
             tail_steps = int(frames * stride)
             if stage.run_steps <= tail_steps:
-                # dump throughout interval
+                # Run is shorter than the requested tail window; dump throughout.
+                # `first yes` is added as a robustness measure so step 0 is
+                # always emitted as a frame -- without it, very short runs
+                # whose stride exceeds run_steps could yield zero frames at
+                # all. It is NOT a frame-count guarantee: the actual number
+                # of frames depends on stride_eff and run_steps and may
+                # overshoot the requested {frames} by one (e.g. run_steps=10,
+                # frames=5 -> stride_eff=2 -> frames at 0,2,4,6,8,10 = 6).
                 stride_eff = max(1, int(math.ceil(stage.run_steps / max(1, frames))))
                 dump_lines = f"""
 # trajectory dump disabled
 dump d1 all custom {stride_eff} {stage.name}.lammpstrj id type xu yu zu
- dump_modify d1 sort id
+ dump_modify d1 sort id first yes
 """.rstrip()
                 run_lines = f"run {stage.run_steps}\nundump d1"
             else:
@@ -228,10 +328,10 @@ thermo_modify flush yes
 
 {fix_line_equil}
 run {stage.equil_steps}
+{unfix_line_equil}
 
 # sampling msd
 reset_timestep 0
-unfix int
 {fix_line_sample}
 
 compute msd_all all msd com yes
@@ -244,6 +344,7 @@ fix msd_out all ave/time {stage.msd_every} 1 {stage.msd_every} c_msd_all[4] file
 # cleanup
 unfix msd_out
 uncompute msd_all
+{unfix_line_sample}
 
 write_data {stage.output_data.name} nocoeff
 """
@@ -288,12 +389,16 @@ def _render_dump_and_run(
             stride = max(1, int(dump_every))
         tail_steps = int(frames * stride)
         if stage.run_steps <= tail_steps:
-            # dump throughout interval
+            # See render_stage(): `first yes` is robustness-only -- it
+            # guarantees step 0 is a frame so very short runs are not silently
+            # left with zero dumps. The frame count is NOT pinned to the
+            # requested {frames}; it can overshoot by one when run_steps does
+            # not divide cleanly by stride_eff.
             stride_eff = max(1, int(math.ceil(stage.run_steps / max(1, frames))))
             dump_lines = f"""
 # trajectory dump disabled
 dump d1 all custom {stride_eff} {dump_filename} id type xu yu zu
- dump_modify d1 sort id
+ dump_modify d1 sort id first yes
 """.rstrip()
             run_lines = f"run {stage.run_steps}\nundump d1"
         else:
@@ -335,9 +440,17 @@ def render_continuous_stages(
 
     # guard
     # directories exist
-    for st in stages:
+    for i, st in enumerate(stages):
         if str(st.name) not in stage_dir_prefixes:
             raise ValueError(f"Missing stage_dir_prefix for stage '{st.name}'")
+        vmode = str(getattr(st, "velocity_mode", "create")).strip().lower()
+        if vmode not in {"create", "preserve"}:
+            raise ValueError(f"Unknown velocity_mode for stage '{st.name}': {getattr(st, 'velocity_mode', None)!r}")
+        if i > 0 and vmode == "create":
+            raise ValueError(
+                "Continuous LAMMPS pipelines only support velocity creation on the first stage; "
+                f"stage '{st.name}' requested velocity_mode='create'"
+            )
 
     # potential consistent pipeline
     def _pot_lines_for(s: StageSpec) -> list[str]:
@@ -386,28 +499,23 @@ def render_continuous_stages(
         dump_file = f"{sdir}/{st.name}.lammpstrj"
         dump_lines, run_lines = _render_dump_and_run(st, dump_filename=dump_file)
 
-        # integration sample mirrors
-        def _fix_line(ensemble: str, Tstart: float, Tstop: float, pressure: float) -> str:
-            if ensemble == "nvt":
-                return f"fix int all nvt temp {Tstart} {Tstop} {md.thermostat.tdamp}"
-            # npt
-            return (
-                f"fix int all npt temp {Tstart} {Tstop} {md.thermostat.tdamp} "
-                f"{md.barostat.mode} {pressure} {pressure} {md.barostat.pdamp}"
-            )
-
-        fix_line_equil = _fix_line(
+        # integration sample mirrors the configured thermostat/barostat styles.
+        fix_line_equil, unfix_line_equil = _lammps_integration_block(
+            md,
             md.ensemble,
-            float(st.temperature_start),
-            float(st.temperature_start),
-            float(st.pressure),
+            Tstart=float(st.temperature_start),
+            Tstop=float(st.temperature_start),
+            pressure=float(st.pressure),
+            seed=int(st.seed),
         )
         sample_ens = st.sample_ensemble or md.ensemble
-        fix_line_sample = _fix_line(
+        fix_line_sample, unfix_line_sample = _lammps_integration_block(
+            md,
             sample_ens,
-            float(st.temperature_start),
-            float(st.temperature_stop),
-            float(st.pressure),
+            Tstart=float(st.temperature_start),
+            Tstop=float(st.temperature_stop),
+            pressure=float(st.pressure),
+            seed=int(st.seed),
         )
 
         force_iso_block = _force_isotropic_block(st)
@@ -423,10 +531,10 @@ reset_timestep 0
 
 {fix_line_equil}
 run {st.equil_steps}
+{unfix_line_equil}
 
 # sampling msd
 reset_timestep 0
-unfix int
 {fix_line_sample}
 
 compute msd_all all msd com yes
@@ -442,9 +550,7 @@ write_dump all custom {sdir}/{st.name}.final.lammpstrj id type xu yu zu modify s
 # cleanup
 unfix msd_out
 uncompute msd_all
-
-# integrator fix leak
-unfix int
+{unfix_line_sample}
 """
         stage_blocks.append(block)
 

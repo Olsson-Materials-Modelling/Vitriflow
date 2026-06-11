@@ -51,14 +51,19 @@ def _model_dump_jsonlike(obj: Any) -> dict[str, Any]:
     return {}
 
 
-def _run_production_executor(**kwargs):
-    from .autotune import _run_production_ensemble
-
-    return _run_production_ensemble(**kwargs)
-
-
 def _production_common_module():
     return importlib.import_module("vitriflow.workflows.production_common")
+
+
+def _run_production_executor(**kwargs):
+    # Routes through `production_common.run_production_ensemble`, which is a
+    # TRANSITIONAL SHIM that lazy-imports `autotune._run_production_ensemble`.
+    # This is NOT an architecture fix for CLAUDE.md's run/autotune/run-schedule
+    # separation rule -- the cross-runner dependency still exists, just
+    # renamed. The finding is intentionally left open; see the docstring on
+    # `production_common.run_production_ensemble` for why we kept the shim
+    # rather than physically migrating the runner this release.
+    return _production_common_module().run_production_ensemble(**kwargs)
 
 
 def _strip_distributions(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -409,14 +414,20 @@ def run_meltquench(
         raise RuntimeError("failed to construct a production plan")
 
     engine = str(plan.engine).strip().lower()
-    pot_cfg = config.kim
+    # Resolve pot_cfg from the plan first so a replayed production matches the
+    # original potential regardless of engine. The previous "pot_cfg = config.kim"
+    # reset discarded plan.potential_config for the CP2K path; harmless today
+    # but a silent desync for any future code that reads pot_cfg under CP2K.
+    pot_cfg = (
+        _potential_from_dict(plan.potential_config, config.kim)
+        if plan.potential_config is not None
+        else config.kim
+    )
     runner = None
     if engine == "cp2k":
         if external_mode_norm == "local":
             runner = Cp2kRunner(config.cp2k)  # type: ignore[arg-type]
     else:
-        if plan.potential_config is not None:
-            pot_cfg = _potential_from_dict(plan.potential_config, config.kim)
         if external_mode_norm == "local":
             if pot_cfg is not None:
                 ensure_model_installed(getattr(pot_cfg, "model", ""))
