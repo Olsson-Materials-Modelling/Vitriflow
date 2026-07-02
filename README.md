@@ -1,6 +1,6 @@
-# VitriFlow
+# Vitriflow
 
-VitriFlow automates melt-quench, custom-stage molecular dynamics, and post-run structural analysis for amorphous and disordered materials. It prepares engine inputs, runs ensembles, records provenance, computes structural descriptors, checks convergence, and writes analysis/plotting artifacts.
+Vitriflow automates melt-quench, custom-stage molecular dynamics, and post-run structural analysis for amorphous and disordered materials. It prepares engine inputs, runs ensembles, records provenance, computes structural descriptors, checks convergence, and writes analysis/plotting artifacts.
 
 Current packaged release: `0.4.29.17`  
 Python: `>=3.10`  
@@ -18,8 +18,8 @@ Primary engine: LAMMPS. CP2K and QUIP/GAP support are available for scoped workf
 ## Layout
 
 ```text
-vitriflow/                    Python package and CLI
-vitriflow/examples/           Example YAML configuration files
+Vitriflow/                    Python package and CLI
+Vitriflow/examples/           Example YAML configuration files
 demos/hardcarbon_gap20ugr/    GAP-20U+gr custom-schedule demonstrator
 docs/                         Descriptor provenance and graph-rule notes
 scripts/                      Install, build, validation, and potential helpers
@@ -35,7 +35,7 @@ Create the standard runtime environment:
 
 ```bash
 conda env create -f environment.yml
-conda activate vitriflow
+conda activate Vitriflow
 ```
 
 Update the standard runtime environment:
@@ -43,20 +43,20 @@ Update the standard runtime environment:
 ```bash
 conda env update -f environment.yml --prune
 # or target the environment explicitly:
-conda env update -n vitriflow -f environment.yml --prune
-conda activate vitriflow
+conda env update -n Vitriflow -f environment.yml --prune
+conda activate Vitriflow
 ```
 
 Create or update the QUIP/GAP environment:
 
 ```bash
 conda env create -f environment_quip_openblas.yml
-conda activate vitriflow-quip
+conda activate Vitriflow-quip
 
 # update an existing QUIP/GAP environment
 conda env update -f environment_quip_openblas.yml --prune
 # or target it explicitly:
-conda env update -n vitriflow-quip -f environment_quip_openblas.yml --prune
+conda env update -n Vitriflow-quip -f environment_quip_openblas.yml --prune
 ```
 
 For CP2K support, create the scoped CP2K environment or apply the CP2K dependency layer to an existing target environment. Do not use `--prune` when using `environment_cp2k.yml` as an overlay.
@@ -65,8 +65,8 @@ For CP2K support, create the scoped CP2K environment or apply the CP2K dependenc
 # dedicated CP2K environment
 conda env create -f environment_cp2k.yml
 
-# CP2K overlay for an existing VitriFlow environment
-conda env update -n vitriflow -f environment_cp2k.yml
+# CP2K overlay for an existing Vitriflow environment
+conda env update -n Vitriflow -f environment_cp2k.yml
 ```
 
 Environment files included in the release:
@@ -83,16 +83,16 @@ Environment files included in the release:
 Install from the release wheel after activating the target environment:
 
 ```bash
-python -m pip uninstall -y vitriflow
-python -m pip install --force-reinstall --no-deps dist/vitriflow-<version>-py3-none-any.whl
+python -m pip uninstall -y Vitriflow
+python -m pip install --force-reinstall --no-deps dist/Vitriflow-<version>-py3-none-any.whl
 hash -r
-vitriflow --version
+Vitriflow --version
 ```
 
 For this release:
 
 ```bash
-python -m pip install --force-reinstall --no-deps dist/vitriflow-0.4.29.17-py3-none-any.whl
+python -m pip install --force-reinstall --no-deps dist/Vitriflow-0.4.29.17-py3-none-any.whl
 ```
 
 The bundled helper performs the same install and import check:
@@ -113,7 +113,7 @@ Build or refresh the release wheel inside a conda environment:
 
 ```bash
 conda env create -f environment.yml
-conda activate vitriflow
+conda activate Vitriflow
 conda install -c conda-forge setuptools wheel
 python -m pip wheel . --no-deps --no-build-isolation -w dist
 ```
@@ -121,7 +121,7 @@ python -m pip wheel . --no-deps --no-build-isolation -w dist
 For an existing environment:
 
 ```bash
-conda activate vitriflow
+conda activate Vitriflow
 conda env update -f environment.yml --prune
 conda install -c conda-forge setuptools wheel
 python -m pip wheel . --no-deps --no-build-isolation -w dist
@@ -131,7 +131,7 @@ For QUIP/GAP LAMMPS builds:
 
 ```bash
 conda env create -f environment_quip_openblas.yml
-conda activate vitriflow-quip
+conda activate Vitriflow-quip
 python -m pip install -e .
 bash scripts/build_lammps_quip_openblas.sh
 ```
@@ -139,25 +139,25 @@ bash scripts/build_lammps_quip_openblas.sh
 ## Usage
 
 ```bash
-vitriflow --help
-vitriflow autotune -c config.yaml -o runs/autotune
-vitriflow run -c config.yaml -o runs/production --use-autotune runs/autotune/autotune_results.json
-vitriflow run-schedule -c custom_schedule.yaml -o runs/custom_schedule
-vitriflow analyze-output -c analysis.yaml -i final_structures_or_dataset -o analysis_out
-vitriflow plot-production -i analysis_out/analysis_results.json -o analysis_out/report.pdf
+Vitriflow --help
+Vitriflow autotune -c config.yaml -o runs/autotune
+Vitriflow run -c config.yaml -o runs/production --use-autotune runs/autotune/autotune_results.json
+Vitriflow run-schedule -c custom_schedule.yaml -o runs/custom_schedule
+Vitriflow analyze-output -c analysis.yaml -i final_structures_or_dataset -o analysis_out
+Vitriflow plot-production -i analysis_out/analysis_results.json -o analysis_out/report.pdf
 ```
 
-Example YAML files are in `vitriflow/examples/`. Review engine commands, MPI settings, potential paths, structure sources, and convergence targets before production use.
+Example YAML files are in `Vitriflow/examples/`. Review engine commands, MPI settings, potential paths, structure sources, and convergence targets before production use.
 
 ## Workflows
 
 ### Standard melt-quench
 
-Use `vitriflow autotune` to scan melt temperature, hold time, quench rate, and optional size effects. Use `vitriflow run` for production ensembles from YAML or a saved autotune/production-plan JSON.
+Use `Vitriflow autotune` to scan melt temperature, hold time, quench rate, and optional size effects. Use `Vitriflow run` for production ensembles from YAML or a saved autotune/production-plan JSON.
 
 ### Custom schedules
 
-Use `vitriflow run-schedule` when a fixed sequence should run as one continuous LAMMPS trajectory.
+Use `Vitriflow run-schedule` when a fixed sequence should run as one continuous LAMMPS trajectory.
 
 ```yaml
 custom_schedule:
@@ -178,7 +178,7 @@ Aliases are available for compatibility: `run-custom`, `run-custom-schedule`, `r
 
 ### Standalone analysis
 
-Use `vitriflow analyze-output` for production directories, final-structure folders, ASE databases, `output_dataset.json`, `task_result.json`, or a single ASE-readable structure file.
+Use `Vitriflow analyze-output` for production directories, final-structure folders, ASE databases, `output_dataset.json`, `task_result.json`, or a single ASE-readable structure file.
 
 Recommended large-ensemble settings:
 
@@ -193,7 +193,7 @@ analysis:
 Equivalent CLI overrides:
 
 ```bash
-vitriflow analyze-output -c analysis.yaml -i DATASET -o analysis_out \
+Vitriflow analyze-output -c analysis.yaml -i DATASET -o analysis_out \
   --analysis-workers 16 --analysis-max-in-flight 16
 ```
 
@@ -201,7 +201,7 @@ Key outputs include `analysis_results.json`, `output_dataset.json`, ensemble CDF
 
 ## Engines and demonstrator notes
 
-VitriFlow supports LAMMPS with OpenKIM models or explicit LAMMPS potential commands. CP2K support is included for scoped DFT workflows. QUIP/GAP workflows should use `environment_quip_openblas.yml` and `QUIP_GAP_SETUP.md`.
+Vitriflow supports LAMMPS with OpenKIM models or explicit LAMMPS potential commands. CP2K support is included for scoped DFT workflows. QUIP/GAP workflows should use `environment_quip_openblas.yml` and `QUIP_GAP_SETUP.md`.
 
 The hard-carbon demonstrator is in `demos/hardcarbon_gap20ugr/`. The GAP XML and `sparseX` sidecars are not bundled; place them in the demonstrator `potentials/` directory before running the demo scripts.
 
@@ -211,7 +211,7 @@ For publications, cite the Vitriflow release/version plus the upstream engines, 
 
 ### Vitriflow
 
-PLACE HOLDER
+Vitriflow:calibrated amorphous structure ensembles from melt--quench simulations. 
 
 ### Model building and simulation
 
@@ -236,8 +236,8 @@ PLACE HOLDER
 Run a basic install check:
 
 ```bash
-vitriflow --version
-python -c "import vitriflow; from vitriflow.cli import main; print(vitriflow.__version__)"
+Vitriflow --version
+python -c "import Vitriflow; from Vitriflow.cli import main; print(Vitriflow.__version__)"
 pytest tests/test_release_entrypoints.py
 ```
 
@@ -246,7 +246,7 @@ pytest tests/test_release_entrypoints.py
 | Version | Summary |
 | --- | --- |
 | `0.4.29.17` | Full-ensemble streaming hotfix: compact adaptive RDF/shell derivations, stable `derivation_ref` pointers, CSV field-limit compatibility, and stream-chunk cleanup. |
-| `0.4.29.16` | Large-ensemble analysis scalability: bounded parallel `analyze-output`, streamed sidecars, compact JSON summaries, ensemble graph-rule pass, and `vitriflow --version`. |
+| `0.4.29.16` | Large-ensemble analysis scalability: bounded parallel `analyze-output`, streamed sidecars, compact JSON summaries, ensemble graph-rule pass, and `Vitriflow --version`. |
 | `0.4.29.15` | Release-readiness install and plotting hotfix: safe wheel artifact, install helper, analysis-only ensemble CDFs, robust plotting, and legacy hard-cutoff labeling. |
 | `0.4.29.14` | Analysis-only CDF/plotting hotfix: ensemble CDF sidecars, right-continuous union-support alignment, and explicit descriptor status records. |
 | `0.4.29.13` | Analysis-only compatibility patch: compact structure references, advisory filtering, plotting fallback, and sidecar integrity reporting. |
