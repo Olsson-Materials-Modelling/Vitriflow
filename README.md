@@ -77,6 +77,7 @@ Environment files included in the release:
 | `environment_quip.yml` | QUIP/GAP build and runtime environment. |
 | `environment_quip_openblas.yml` | QUIP/GAP environment pinned to OpenBLAS/LAPACK. |
 | `environment_cp2k.yml` | CP2K add-on dependencies for scoped DFT workflows. |
+| `environment_rhel8_mpi.yml` | Robust build environment of RHEL 8 style systesm. |
 
 ## Install
 
@@ -134,6 +135,33 @@ conda env create -f environment_quip_openblas.yml
 conda activate Vitriflow-quip
 python -m pip install -e .
 bash scripts/build_lammps_quip_openblas.sh
+```
+
+### Older Linux MPI runtime
+ 
+On RHEL/Rocky/Alma/CentOS 8-style systems, the conda environment can build successfully but fail at the first `lmp` call.
+ 
+Typical runtime error:
+ 
+```text
+lmp: /lib64/libm.so.6: version `GLIBC_2.29' not found
+lmp: /lib64/libc.so.6: version `GLIBC_2.34' not found
+```
+ 
+This is a silent conda solve/scoping issue: the selected LAMMPS binary requires newer glibc symbols than the.
+ 
+For these systems, use the RHEL 8 robust MPI environment:
+ 
+```bash
+conda env remove -n vitriflow
+conda env create -f environment_rhel8_mpi.yml
+conda activate vitriflow
+```
+ 
+Verify directly:
+ 
+```bash
+mpirun -np 2 lmp -h
 ```
 
 ## Usage
