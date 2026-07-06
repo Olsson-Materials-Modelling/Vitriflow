@@ -148,7 +148,7 @@ lmp: /lib64/libm.so.6: version `GLIBC_2.29' not found
 lmp: /lib64/libc.so.6: version `GLIBC_2.34' not found
 ```
  
-This is a silent conda solve/scoping issue: the selected LAMMPS binary requires newer glibc symbols than the.
+This is a silent conda solve/scoping issue: the selected LAMMPS binary requires newer glibc symbols than the default system libraries provide.
  
 For these systems, use the RHEL 8 robust MPI environment:
  
