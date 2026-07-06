@@ -1,0 +1,31 @@
+name: vitriflow
+channels:
+  - conda-forge
+
+dependencies:
+  - "python=3.11"
+  - pip
+  - numpy
+  - scipy
+  - pyyaml
+  - "pydantic>=2,<3"
+  - "ase>=3.22"
+  - "networkx>=3"
+  - matplotlib
+  - mp-api
+  - packmol
+
+  # MPI/OpenMPI standard LAMMPS build for Buckingham workflows.
+  # Keep MPI enabled; do not use nompi, and do not pin openmpi to 4.*.
+  - "mpi=*=openmpi"
+  - openmpi
+
+  # Pin away from the floating 2025.07.22 py314 OpenMPI build that produced
+  # GLIBC_2.29 / GLIBC_2.34 requirements on the cluster.
+  # This build glob forces CPU + OpenMPI MPI and excludes nompi/mpich/cuda.
+  - "lammps=2024.06.27=cpu_*_mpi_openmpi_*"
+  - openkim-models
+  - kim-api
+
+  - pip:
+      - -e .
