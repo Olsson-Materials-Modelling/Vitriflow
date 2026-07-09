@@ -1,7 +1,7 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
-
+ 
 [project]
 name = "vitriflow"
 version = "0.4.29.5"
@@ -19,12 +19,12 @@ dependencies = [
   "networkx>=3.0",
   "matplotlib>=3.8",
 ]
-
+ 
 [project.optional-dependencies]
 materials = [
   "mp-api>=0.45",
 ]
-
+ 
 dev = [
   "pytest>=7.0",
   "ruff>=0.4",
@@ -32,12 +32,12 @@ dev = [
   "mypy>=1.8",
   "types-PyYAML>=6.0",
 ]
-
+ 
 [project.scripts]
 vitriflow = "vitriflow.cli:main"
-
+ 
 [tool.setuptools.packages.find]
 include = ["vitriflow*"]
-
+ 
 [tool.setuptools.package-data]
 vitriflow = ["examples/*.yaml", "examples/*.data", "data/cp2k/*"]
