@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vitriflow"
-version = "0.4.27.20"
+version = "0.4.29.5"
 description = "Automated melt-quench molecular dynamics workflows in LAMMPS with OpenKIM potentials"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,6 +35,9 @@ dev = [
 
 [project.scripts]
 vitriflow = "vitriflow.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vitriflow*"]
 
 [tool.setuptools.package-data]
 vitriflow = ["examples/*.yaml", "examples/*.data", "data/cp2k/*"]
