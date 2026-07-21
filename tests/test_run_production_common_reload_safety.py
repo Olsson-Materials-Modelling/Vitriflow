@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("mock_engine_build_identities")
 
 
 def test_run_meltquench_uses_current_production_common_after_stubbed_import(monkeypatch, tmp_path: Path):
@@ -77,7 +82,7 @@ def test_run_meltquench_uses_current_production_common_after_stubbed_import(monk
     monkeypatch.setattr(
         run_mod,
         "resolve_effective_metrics_config",
-        lambda metrics_cfg, structure_data, type_to_species, warn_fn, context: (metrics_cfg, {}, {"source": "test"}),
+        lambda metrics_cfg, structure_data, type_to_species, lammps_units_style, warn_fn, context: (metrics_cfg, {}, {"source": "test"}),
     )
     monkeypatch.setattr(run_mod, "ensure_model_installed", lambda model: None)
     monkeypatch.setattr(
@@ -91,19 +96,52 @@ def test_run_meltquench_uses_current_production_common_after_stubbed_import(monk
             potential_lines=None,
         ),
     )
-    monkeypatch.setattr(
-        run_mod,
-        "_run_production_executor",
-        lambda **kwargs: {
-            "status": "ok",
-            "converged": True,
+    def _fake_executor(**kwargs):
+        boxes = []
+        for box in (1, 2):
+            bdir = Path(kwargs["outdir"]) / "production" / f"box_{box:03d}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / "relax.data").write_text(f"box-{box}\n")
+            (bdir / "structure_snapshot.json").write_text(
+                json.dumps({"schema": "vitriflow.structure_snapshot.v1", "n_atoms": 1})
+            )
+            manifest = {"structure_hash": f"structure-{box}"}
+            (bdir / "structure_manifest.json").write_text(
+                json.dumps({"schema": "vitriflow.structure_manifest.v2", "structures": [manifest]})
+            )
+            boxes.append({
+                "box": box,
+                "metrics": {},
+                "distributions": {},
+                "paths": {
+                    "relax_data": str((bdir / "relax.data").relative_to(kwargs["outdir"])),
+                    "structure_snapshot": str((bdir / "structure_snapshot.json").relative_to(kwargs["outdir"])),
+                    "structure_manifest": str((bdir / "structure_manifest.json").relative_to(kwargs["outdir"])),
+                },
+                "structure_manifest": manifest,
+            })
+        return {
+                "status": "ok",
+                "converged": True,
+                "converged_md": True,
+                "check_convergence": True,
+                "resumable": True,
+                "convergence_streak": 1,
+                "required_convergence_streak": 1,
+                "last_convergence_evaluated_n_boxes_total": 2,
+                "last_convergence_evaluated_n_boxes_accepted": 2,
+            "min_boxes": 2,
+            "n_boxes": 2,
+            "n_boxes_accepted": 2,
+            "n_boxes_rejected": 0,
             "n_boxes_total": 2,
-            "boxes": [{"box": 1, "metrics": {}, "distributions": {}}, {"box": 2, "metrics": {}, "distributions": {}}],
+            "boxes": boxes,
             "rejected_boxes": [],
             "convergence": {"passed": True},
             "cutoffs": [{"pair": [1, 2], "cutoff": 2.5}],
-        },
-    )
+        }
+
+    monkeypatch.setattr(run_mod, "_run_production_executor", _fake_executor)
 
     summary = run_mod.run_meltquench(cfg, tmp_path / "run_out", n_replicates=2)
 

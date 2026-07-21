@@ -1,10 +1,10 @@
 """Resume fingerprint must record the seed-derivation scheme.
 
-Targeted regression for ultrareview finding #2. The custom-schedule runner
+Targeted regression for review finding #2. The custom-schedule runner
 switched per-box seeds from a stateful rng cursor to a deterministic
 SHA-256 derivation. The resume fingerprint now carries:
 
-  * a bumped schema id  (`vitriflow.custom_schedule.resume_fingerprint.v2`)
+  * a bumped schema id  (`vitriflow.custom_schedule.resume_fingerprint.v3`)
   * a `seed_scheme` payload field  (`sha256_box_slot_v1`)
 
 A fingerprint built without those tags must not be accepted as equivalent;
@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+pytestmark = pytest.mark.usefixtures("mock_engine_build_identities")
 
 
 def _write_fingerprint_demo_config(tmp_path: Path, *, xml_text: str = "<GAP></GAP>") -> Path:
@@ -125,11 +127,11 @@ def _fingerprint_from_config_path(cfg_path: Path) -> dict:
     )
 
 
-def test_fingerprint_schema_is_v2():
+def test_fingerprint_schema_is_v3():
     """The schema constant has been bumped past v1."""
     from vitriflow.workflows.custom_schedule import _RESUME_FINGERPRINT_SCHEMA
 
-    assert _RESUME_FINGERPRINT_SCHEMA == "vitriflow.custom_schedule.resume_fingerprint.v2"
+    assert _RESUME_FINGERPRINT_SCHEMA == "vitriflow.custom_schedule.resume_fingerprint.v3"
 
 
 def test_seed_scheme_constant_is_versioned():
@@ -145,10 +147,10 @@ def test_fingerprint_payload_carries_seed_scheme(tmp_path: Path):
 
     payload = fp["payload"]
     assert payload["seed_scheme"] == "sha256_box_slot_v1"
-    # The schema field on both the wrapper and the payload should advertise v2
+    # The schema field on both the wrapper and the payload should advertise v3
     # so anyone inspecting the sidecar can identify the run lineage.
-    assert fp["schema"] == "vitriflow.custom_schedule.resume_fingerprint.v2"
-    assert payload["schema"] == "vitriflow.custom_schedule.resume_fingerprint.v2"
+    assert fp["schema"] == "vitriflow.custom_schedule.resume_fingerprint.v3"
+    assert payload["schema"] == "vitriflow.custom_schedule.resume_fingerprint.v3"
 
 
 def test_resume_rejects_pre_v2_fingerprint_without_seed_scheme(tmp_path: Path):

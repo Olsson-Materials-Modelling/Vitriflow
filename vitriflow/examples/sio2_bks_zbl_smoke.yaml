@@ -1,0 +1,205 @@
+# Deliberately tiny execution smoke test.  Its thermodynamic result is not
+# meaningful: the 24-atom cell, full 10 A Buckingham cutoff, ultrashort stages,
+# one production box (therefore unassessable ensemble convergence) is for
+# CI/runtime only; the output must label that status rather than imply convergence.
+engine: lammps
+
+potential:
+  kind: lammps
+  user_units: metal
+  interactions: [Si, O]
+  commands:
+    # Standard van Beest-Kramer-van Santen charges and Buckingham coefficients.
+    # Retain the standard 10 A real-space/Buckingham cutoff.  LAMMPS builds
+    # periodic ghost images out to the interaction cutoff; it does not require
+    # truncation at half this deliberately tiny smoke-test cell.  The small
+    # cell and ultrashort trajectory still make the result scientifically
+    # meaningless and are only intended to exercise every workflow stage.
+    - pair_style buck/coul/long 10.0
+    - pair_coeff 1 1 0.0 1.0 0.0
+    - pair_coeff 1 2 18003.7572 0.205205 133.5381
+    - pair_coeff 2 2 1388.7730 0.362319 175.0
+    - pair_modify shift yes
+    - kspace_style pppm 1.0e-4
+    - kspace_modify gewald 0.8
+  core_repulsion:
+    enabled: true
+    style: zbl
+    tabulate: true
+    dt_candidates: [0.00025]
+    # These limits bound the global calibration request.  The C2 resolver may
+    # move an individual pair's actual join outward to reach a connected
+    # repulsive BKS branch; results report both requested and resolved radii.
+    r_out_factor: 0.55
+    r_out_min: 0.7
+    r_out_max: 1.2
+    r_in_factor: 0.75
+    max_attempts: 2
+    grow_factor: 1.15
+    test_equil_steps: 0
+    test_run_steps: 5
+    ramp_steps: 1
+    limit_hold_steps: 1
+    table_filename: sio2_bks_core.table
+    # Cubic interpolation in LAMMPS's native RSQ coordinate resolves the steep
+    # ZBL core without a million-knot linear table.  Verification automatically
+    # raises the realized pair_write grid to at least 2*N-1 points so every
+    # knot and every interval midpoint is checked against the analytic force.
+    table_points: 128000
+    table_points_max: 128000
+    table_verify_points: 50001
+    table_r_min: 0.1
+
+structure:
+  charges:
+    Si: 2.4
+    O: -1.2
+  generate:
+    method: builtin
+    builtin_name: beta_cristobalite
+    formula: SiO2
+    repeat: [1, 1, 1]
+
+md:
+  timestep: 0.00025
+  atom_style: charge
+  ensemble: nvt
+  temperature: 300.0
+  pressure: 0.0
+  thermo_every: 1
+  dump_every: 1
+  stage_continuity: continuous
+  neighbor_skin: 1.0
+  neighbor_skin_autotune: true
+  neighbor_skin_step: 0.5
+  neighbor_skin_max: 3.0
+  thermostat:
+    style: nose-hoover
+    tdamp: 0.025
+
+random_seed: 2024310
+
+autotune:
+  preflight:
+    enabled: true
+    ensembles: [nvt]
+    dt_candidates: [0.00025]
+    tdamp_factors: [100.0]
+    pdamp_factors: [1000.0]
+    T_low: 300.0
+    T_high: 600.0
+    equil_steps: 2
+    run_steps: 5
+    tail_window: 3
+    temp_rel_tol: 1.0
+    max_temp_factor: 10.0
+    confirm_equil_steps: 0
+    confirm_run_steps: 5
+    confirm_topk: 1
+    timeout_sec: 120.0
+
+  tm_scan:
+    t_min: 300.0
+    t_max: 500.0
+    # Three points are the mathematical minimum accepted by the Tm estimator.
+    dT: 100.0
+    ensemble: nvt
+    equil_steps: 2
+    sample_steps: 10
+    msd_every: 1
+    replicates_per_temp: 1
+    sample_in_nvt: true
+    highT_mode: onset
+    gr:
+      enabled: false
+
+  highT:
+    # Keep T_high strictly above the 300 K final temperature even when the
+    # meaningless three-point scan selects its lower endpoint.
+    margin: 100.0
+    replicates: 1
+    chunk_steps: 10
+    max_chunks: 1
+    min_total_steps: 10
+    rms_multiple: 0.1
+    stationarity_tol: 1.0
+    enforce_stationarity: false
+
+  quench:
+    t_final: 300.0
+    relax_steps: 10
+    enforce_rate_bounds: false
+    rates_K_per_ps: [1000000.0, 500000.0]
+    replicates_per_rate: 1
+
+  size:
+    enabled: false
+    replicas: [[1, 1, 1]]
+    replicates_per_size: 1
+    max_atoms: 24
+
+  metrics:
+    enabled: true
+    type_to_species: [Si, O]
+    time_average_frames: 1
+    time_average_stride: 1
+    collect_during_production_stages: false
+    stage_timeseries_make_plot: false
+    quench_tail_min_frames: 1
+    elastic:
+      enabled: false
+    pairs:
+      - pair: [Si, O]
+        cutoff: 2.2
+    coordinations:
+      - central: Si
+        neighbor: O
+        cutoff: 2.2
+      - central: O
+        neighbor: Si
+        cutoff: 2.2
+    coordination_sweep:
+      enabled: false
+    angles:
+      - triplet: [O, Si, O]
+      - triplet: [Si, O, Si]
+    rings:
+      enabled: false
+    gr:
+      - pair: [Si, O]
+        r_max: 3.0
+        nbins: 100
+    voids:
+      enabled: true
+      n_samples: 128
+      n_samples_timeseries: 16
+      sampler: random
+      seed: 0
+      k_nearest: 8
+      default_radius: 0.0
+      r_max: 2.0
+      cdf_points: 16
+
+  production:
+    enabled: true
+    min_boxes: 1
+    max_boxes: 1
+    batch_boxes: 1
+    warmup_start_temperature: 300.0
+    warmup_duration_ps: 0.001
+    dump_trajectory: true
+    dump_every_steps: 1
+    check_convergence: false
+    consecutive_converged_checks: 1
+    bondlen_cdf_points: 32
+    angle_cdf_points: 36
+    store_distributions: false
+    embed_structures: false
+    exclude_coordination_defects: false
+
+lammps:
+  lammps_cmd: lmp
+  mpi_cmd: null
+  nprocs: 1
+  timeout_sec: 120.0
+  kill_grace_sec: 5.0

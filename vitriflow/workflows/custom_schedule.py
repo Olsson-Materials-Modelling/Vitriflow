@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Generic fixed custom-stage production workflow.
 
 This module is deliberately separate from the standard ``run`` and
@@ -7,6 +5,8 @@ This module is deliberately separate from the standard ``run`` and
 continuous LAMMPS NVT/NPT stage schedule while reusing VitriFlow's structure
 preparation, metrics, production-convergence and output-analysis machinery.
 """
+
+from __future__ import annotations
 
 import json
 import math
@@ -21,8 +21,37 @@ from typing import Any, Optional
 import yaml
 
 from ..config import MDConfig, RunConfig
+from ..engine_identity import (
+    assert_engine_build_identity_bundle_unchanged,
+    query_engine_build_identities,
+    validate_engine_build_identity_bundle,
+)
+from ..kim import ensure_model_installed, ensure_potential_model_installed
+from ..runtime_identity import runtime_identity
+from .resume_integrity import potential_command_file_paths, production_final_status
+from .workflow_lock import locked_output_workflow, workflow_payload_entries
 
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _require_safe_stage_name(value: Any, *, context: str) -> str:
+    """Return one portable basename that cannot escape its box directory."""
+
+    raw_name = str(value)
+    name = raw_name.strip()
+    if not name:
+        raise ValueError(f"{context} must be non-empty")
+    if (
+        raw_name != name
+        or name in {".", ".."}
+        or Path(name).name != name
+        or _SAFE_NAME_RE.fullmatch(name) is None
+    ):
+        raise ValueError(
+            f"{context}={raw_name!r} is not path-safe; use a single basename made "
+            "from letters, digits, '_', '-' or '.' (not '.' or '..')"
+        )
+    return name
 
 
 @dataclass(frozen=True)
@@ -67,10 +96,28 @@ def _load_raw_yaml(path: Path) -> dict[str, Any]:
 
 
 def _first(src: Mapping[str, Any], names: Sequence[str], default: Any = None) -> Any:
-    for name in names:
-        if name in src:
-            return src[name]
+    present = [str(name) for name in names if name in src]
+    if len(present) > 1:
+        raise ValueError(
+            "custom_schedule defines multiple aliases for the same field: "
+            + ", ".join(present)
+        )
+    if present:
+        return src[present[0]]
     return default
+
+
+def _reject_unknown_keys(
+    src: Mapping[str, Any],
+    *,
+    allowed: set[str],
+    field_name: str,
+) -> None:
+    unknown = sorted(str(key) for key in src if str(key) not in allowed)
+    if unknown:
+        raise ValueError(
+            f"{field_name} contains unknown field(s): " + ", ".join(unknown)
+        )
 
 
 def _finite_float(value: Any, *, field_name: str, positive: bool = False) -> float:
@@ -97,6 +144,85 @@ def _bool_from_any(value: Any, *, field_name: str) -> bool:
     if s in {"false", "f", "no", "n", "off", "0"}:
         return False
     raise ValueError(f"custom_schedule.{field_name} must be boolean-like")
+
+
+def _persisted_production_cutoffs(value: Any) -> dict[tuple[int, int], float]:
+    """Parse a persisted production cutoff map without silently dropping data."""
+
+    if value in (None, ""):
+        return {}
+    entries: list[tuple[Any, Any]] = []
+    if isinstance(value, Mapping):
+        entries = list(value.items())
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for idx, item in enumerate(value):
+            if not isinstance(item, Mapping):
+                raise RuntimeError(
+                    f"production.cutoffs[{idx}] must be a mapping with pair and cutoff"
+                )
+            if "pair" not in item or "cutoff" not in item:
+                raise RuntimeError(
+                    f"production.cutoffs[{idx}] requires both pair and cutoff"
+                )
+            entries.append((item.get("pair"), item.get("cutoff")))
+    else:
+        raise RuntimeError("production.cutoffs must be a list or mapping")
+
+    out: dict[tuple[int, int], float] = {}
+    for idx, (pair_raw, cutoff_raw) in enumerate(entries):
+        if isinstance(pair_raw, str):
+            parts = pair_raw.replace("_", "-").replace(",", "-").split("-")
+            pair_values = [part for part in parts if part != ""]
+        elif isinstance(pair_raw, Sequence) and not isinstance(pair_raw, (str, bytes, bytearray)):
+            pair_values = list(pair_raw)
+        elif isinstance(pair_raw, tuple):
+            pair_values = list(pair_raw)
+        else:
+            raise RuntimeError(f"production.cutoffs[{idx}].pair must contain two type ids")
+        if len(pair_values) != 2:
+            raise RuntimeError(f"production.cutoffs[{idx}].pair must contain exactly two type ids")
+        try:
+            a, b = int(pair_values[0]), int(pair_values[1])
+            cutoff = float(cutoff_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"production.cutoffs[{idx}] contains non-numeric data") from exc
+        if a < 1 or b < 1:
+            raise RuntimeError(f"production.cutoffs[{idx}].pair type ids must be >= 1")
+        if not (math.isfinite(cutoff) and cutoff > 0.0):
+            raise RuntimeError(f"production.cutoffs[{idx}].cutoff must be finite and > 0")
+        key = (min(a, b), max(a, b))
+        if key in out and not math.isclose(out[key], cutoff, rel_tol=1.0e-12, abs_tol=1.0e-12):
+            raise RuntimeError(
+                f"production.cutoffs contains conflicting values for pair {key}: "
+                f"{out[key]:g} and {cutoff:g}"
+            )
+        out[key] = cutoff
+    return out
+
+
+def _restore_custom_resume_cutoffs(
+    previous_results: Mapping[str, Any],
+    *,
+    fixed_cutoffs: Mapping[tuple[int, int], float],
+) -> dict[tuple[int, int], float]:
+    """Restore the exact cutoff map used by completed boxes before resuming."""
+
+    production = previous_results.get("production", {})
+    if not isinstance(production, Mapping):
+        raise RuntimeError("Cannot resume: run_results.json production state is not a mapping")
+    persisted = _persisted_production_cutoffs(production.get("cutoffs", []))
+    fixed = {(min(int(a), int(b)), max(int(a), int(b))): float(v) for (a, b), v in fixed_cutoffs.items()}
+    for pair, value in fixed.items():
+        if pair in persisted and not math.isclose(
+            float(persisted[pair]), value, rel_tol=1.0e-12, abs_tol=1.0e-12
+        ):
+            raise RuntimeError(
+                "Cannot resume with inconsistent explicit cutoff for pair "
+                f"{pair}: persisted={persisted[pair]:g}, current={value:g}"
+            )
+    restored = dict(persisted)
+    restored.update(fixed)
+    return restored
 
 
 def _optional_positive_int(value: Any, *, field_name: str) -> Optional[int]:
@@ -128,16 +254,28 @@ def _optional_nonnegative_int(value: Any, *, field_name: str) -> Optional[int]:
 
 
 def _stage_from_mapping(item: Mapping[str, Any], idx: int) -> CustomStageConfig:
+    _reject_unknown_keys(
+        item,
+        allowed={
+            "name", "stage", "label",
+            "temperature_K", "T_K", "temperature", "T",
+            "temperature_start_K", "start_temperature_K", "T_start_K", "T_start", "temperature_start",
+            "temperature_stop_K", "stop_temperature_K", "T_stop_K", "T_stop", "temperature_stop", "temperature_final_K",
+            "time_ps", "duration_ps", "run_time_ps", "steps", "run_steps",
+            "role", "analysis_role", "velocity_mode", "velocities",
+            "equil_steps", "equilibration_steps", "write_dump",
+            "dump_every_steps", "dump_every", "tail_dump_frames", "tail_dump_stride",
+            "force_isotropic", "sample_ensemble", "sampling_ensemble", "msd_every",
+        },
+        field_name=f"custom_schedule.stages[{idx}]",
+    )
     raw_name = _first(item, ["name", "stage", "label"], None)
     if raw_name is None:
         raise ValueError(f"custom_schedule.stages[{idx}] requires a name")
-    name = str(raw_name).strip()
-    if not name:
-        raise ValueError(f"custom_schedule.stages[{idx}].name must be non-empty")
-    if not _SAFE_NAME_RE.match(name):
-        raise ValueError(
-            f"custom_schedule.stages[{idx}].name={name!r} is not path-safe; use letters, digits, '_', '-' or '.'"
-        )
+    name = _require_safe_stage_name(
+        raw_name,
+        context=f"custom_schedule.stages[{idx}].name",
+    )
 
     hold_T = _first(item, ["temperature_K", "T_K", "temperature", "T"], None)
     t0 = _first(item, ["temperature_start_K", "start_temperature_K", "T_start_K", "T_start", "temperature_start"], hold_T)
@@ -151,6 +289,10 @@ def _stage_from_mapping(item: Mapping[str, Any], idx: int) -> CustomStageConfig:
     time_ps = None if time_raw is None else _finite_float(time_raw, field_name=f"stages[{idx}].time_ps", positive=True)
     if steps is None and time_ps is None:
         raise ValueError(f"custom_schedule.stages[{idx}] requires either time_ps or steps")
+    if steps is not None and time_ps is not None:
+        raise ValueError(
+            f"custom_schedule.stages[{idx}] must specify either time_ps or steps, not both"
+        )
 
     role_raw = _first(item, ["role", "analysis_role"], None)
     role = None if role_raw is None else str(role_raw).strip().lower()
@@ -191,23 +333,48 @@ def _stage_from_mapping(item: Mapping[str, Any], idx: int) -> CustomStageConfig:
 def _hardcarbon_schedule_to_custom(raw_hc: Mapping[str, Any]) -> CustomSchedule:
     """Backward-compatible conversion of the old HC-only schema."""
 
+    _reject_unknown_keys(
+        raw_hc,
+        allowed={
+            "random_temperature_K", "graph_temperature_K", "final_temperature_K",
+            "prequench_start_K", "prequench_stop_K",
+            "random_time_ps", "random_steps", "prequench_time_ps", "prequench_steps",
+            "graph_time_ps", "graph_steps", "final_quench_time_ps", "final_quench_steps",
+            "relax_time_ps", "relax_steps",
+        },
+        field_name="hardcarbon_schedule",
+    )
+
     def f(name: str, default: float) -> float:
         return _finite_float(raw_hc.get(name, default), field_name=f"hardcarbon_schedule.{name}", positive=True)
 
     def steps(name: str) -> Optional[int]:
         return _optional_positive_int(raw_hc.get(name, None), field_name=f"hardcarbon_schedule.{name}")
 
+    def duration(time_name: str, default: float, steps_name: str) -> tuple[Optional[float], Optional[int]]:
+        if time_name in raw_hc and steps_name in raw_hc:
+            raise ValueError(
+                f"hardcarbon_schedule must specify either {time_name} or {steps_name}, not both"
+            )
+        n = steps(steps_name)
+        return (None, n) if n is not None else (f(time_name, default), None)
+
     random_T = f("random_temperature_K", 9000.0)
     graph_T = f("graph_temperature_K", 3500.0)
     final_T = f("final_temperature_K", 300.0)
     pre_start = f("prequench_start_K", random_T)
     pre_stop = f("prequench_stop_K", graph_T)
+    random_duration = duration("random_time_ps", 10.0, "random_steps")
+    prequench_duration = duration("prequench_time_ps", 6.0, "prequench_steps")
+    graph_duration = duration("graph_time_ps", 400.0, "graph_steps")
+    quench_duration = duration("final_quench_time_ps", 20.0, "final_quench_steps")
+    relax_duration = duration("relax_time_ps", 20.0, "relax_steps")
     stages = (
-        CustomStageConfig("randomisation", random_T, random_T, f("random_time_ps", 10.0), steps("random_steps"), role="warmup", velocity_mode="create"),
-        CustomStageConfig("prequench", pre_start, pre_stop, f("prequench_time_ps", 6.0), steps("prequench_steps"), role="prequench", velocity_mode="preserve"),
-        CustomStageConfig("graphitisation", graph_T, graph_T, f("graph_time_ps", 400.0), steps("graph_steps"), role="melt", velocity_mode="preserve"),
-        CustomStageConfig("quench", graph_T, final_T, f("final_quench_time_ps", 20.0), steps("final_quench_steps"), role="quench", velocity_mode="preserve"),
-        CustomStageConfig("relax", final_T, final_T, f("relax_time_ps", 20.0), steps("relax_steps"), role="relax", velocity_mode="preserve"),
+        CustomStageConfig("randomisation", random_T, random_T, *random_duration, role="warmup", velocity_mode="create"),
+        CustomStageConfig("prequench", pre_start, pre_stop, *prequench_duration, role="prequench", velocity_mode="preserve"),
+        CustomStageConfig("graphitisation", graph_T, graph_T, *graph_duration, role="melt", velocity_mode="preserve"),
+        CustomStageConfig("quench", graph_T, final_T, *quench_duration, role="quench", velocity_mode="preserve"),
+        CustomStageConfig("relax", final_T, final_T, *relax_duration, role="relax", velocity_mode="preserve"),
     )
     return CustomSchedule(
         stages=stages,
@@ -228,6 +395,15 @@ def _schedule_from_raw(raw: Mapping[str, Any]) -> CustomSchedule:
         raise ValueError("run-custom requires a custom_schedule.stages list in the YAML")
     if not isinstance(src, Mapping):
         raise ValueError("custom_schedule must be a mapping")
+    _reject_unknown_keys(
+        src,
+        allowed={
+            "stages", "analysis_roles", "analysis_stages", "sampling_hint",
+            "workflow_label", "description", "enforce_temperature_continuity",
+            "require_continuity", "temperature_tolerance_K",
+        },
+        field_name="custom_schedule",
+    )
     stages_raw = src.get("stages", None)
     if not isinstance(stages_raw, Sequence) or isinstance(stages_raw, (str, bytes)) or len(stages_raw) < 1:
         raise ValueError("custom_schedule.stages must be a non-empty list")
@@ -237,24 +413,69 @@ def _schedule_from_raw(raw: Mapping[str, Any]) -> CustomSchedule:
             raise ValueError(f"custom_schedule.stages[{i}] must be a mapping")
         stages.append(_stage_from_mapping(item, i))
 
-    roles_raw = src.get("analysis_roles", src.get("analysis_stages", {}))
+    if "analysis_roles" in src and "analysis_stages" in src:
+        raise ValueError(
+            "Specify only one of custom_schedule.analysis_roles or analysis_stages"
+        )
+    roles_raw = _first(src, ["analysis_roles", "analysis_stages"], {})
     if roles_raw is None:
         roles_raw = {}
     if not isinstance(roles_raw, Mapping):
         raise ValueError("custom_schedule.analysis_roles/analysis_stages must be a mapping when present")
-    roles = {str(k).strip().lower(): str(v).strip() for k, v in roles_raw.items() if str(k).strip() and str(v).strip()}
+    roles: dict[str, str] = {}
+    for raw_key, raw_value in roles_raw.items():
+        key = str(raw_key).strip().lower()
+        value = str(raw_value).strip()
+        if not key or not value:
+            raise ValueError(
+                "custom_schedule.analysis_roles keys and stage names must be non-empty"
+            )
+        if key in roles:
+            raise ValueError(
+                f"custom_schedule.analysis_roles contains duplicate normalized role {key!r}"
+            )
+        roles[key] = value
+    if roles and set(roles) != {"melt", "quench", "relax"}:
+        missing = sorted({"melt", "quench", "relax"} - set(roles))
+        unknown = sorted(set(roles) - {"melt", "quench", "relax"})
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unknown:
+            details.append("unknown " + ", ".join(unknown))
+        raise ValueError(
+            "custom_schedule.analysis_roles must define exactly melt, quench, and relax ("
+            + "; ".join(details)
+            + ")"
+        )
+    if len(set(roles.values())) != len(roles):
+        raise ValueError("custom_schedule.analysis_roles must map each role to a distinct stage")
 
     hint_raw = src.get("sampling_hint", {}) or {}
     if not isinstance(hint_raw, Mapping):
         raise ValueError("custom_schedule.sampling_hint must be a mapping when present")
-    hint = {str(k): _finite_float(v, field_name=f"sampling_hint.{k}", positive=False) for k, v in hint_raw.items()}
+    hint: dict[str, float] = {}
+    for raw_key, raw_value in hint_raw.items():
+        key = str(raw_key).strip()
+        if not key:
+            raise ValueError("custom_schedule.sampling_hint keys must be non-empty")
+        if raw_value is None:
+            raise ValueError(f"custom_schedule.sampling_hint.{key} must not be null")
+        hint[key] = _finite_float(
+            raw_value,
+            field_name=f"sampling_hint.{key}",
+            positive=False,
+        )
     label = str(src.get("workflow_label", "custom_stage_schedule") or "custom_stage_schedule").strip()
     if not label:
         label = "custom_stage_schedule"
 
     return CustomSchedule(
         stages=tuple(stages),
-        enforce_temperature_continuity=_bool_from_any(src.get("enforce_temperature_continuity", src.get("require_continuity", True)), field_name="enforce_temperature_continuity"),
+        enforce_temperature_continuity=_bool_from_any(
+            _first(src, ["enforce_temperature_continuity", "require_continuity"], True),
+            field_name="enforce_temperature_continuity",
+        ),
         temperature_tolerance_K=_finite_float(src.get("temperature_tolerance_K", 1.0e-8), field_name="temperature_tolerance_K", positive=False),
         analysis_roles=roles,
         sampling_hint=hint,
@@ -310,11 +531,19 @@ def _validate_schedule(schedule: CustomSchedule) -> dict[str, str]:
         raise ValueError("custom_schedule.stages must be non-empty")
     seen: set[str] = set()
     for i, st in enumerate(schedule.stages):
+        _require_safe_stage_name(
+            st.name,
+            context=f"custom_schedule.stages[{i}].name",
+        )
         if st.name in seen:
             raise ValueError(f"Duplicate custom_schedule stage name: {st.name!r}")
         seen.add(st.name)
         if st.steps is None and st.time_ps is None:
             raise ValueError(f"custom_schedule.stages[{i}] requires time_ps or steps")
+        if st.steps is not None and st.time_ps is not None:
+            raise ValueError(
+                f"custom_schedule.stages[{i}] must specify either time_ps or steps, not both"
+            )
         if st.steps is not None and int(st.steps) < 1:
             raise ValueError(f"custom_schedule.stages[{i}].steps must be >= 1")
         if st.time_ps is not None and not (math.isfinite(float(st.time_ps)) and float(st.time_ps) > 0.0):
@@ -339,7 +568,13 @@ def _validate_schedule(schedule: CustomSchedule) -> dict[str, str]:
                     f"{a.name}.temperature_stop_K={a.temperature_stop_K} differs from "
                     f"{b.name}.temperature_start_K={b.temperature_start_K}"
                 )
-    return _resolve_analysis_roles(schedule)
+    roles = _resolve_analysis_roles(schedule)
+    quench_stage = next(st for st in schedule.stages if st.name == roles["quench"])
+    if not float(quench_stage.temperature_stop_K) < float(quench_stage.temperature_start_K):
+        raise ValueError(
+            "custom_schedule quench stage must cool: temperature_stop_K must be lower than temperature_start_K"
+        )
+    return roles
 
 
 def _positive_steps_from_ps(time_ps: float, *, md_timestep: float, time_unit_ps: float, field_name: str) -> int:
@@ -443,13 +678,56 @@ def _schedule_report(
 
 
 
-_RESUME_FINGERPRINT_SCHEMA = "vitriflow.custom_schedule.resume_fingerprint.v2"
+_RESUME_FINGERPRINT_SCHEMA = "vitriflow.custom_schedule.resume_fingerprint.v3"
 _RESUME_FINGERPRINT_SIDECAR = "custom_schedule_resume_fingerprint.json"
 
-# Tag identifying the algorithm used to derive per-box seeds. v2 fingerprints
-# carry this so a run started under one scheme cannot be resumed by a runner
-# that draws seeds differently. See _derive_box_seeds in run_custom_schedule.
+# The algorithm identifier is part of the resume fingerprint. Any change to
+# per-box seed derivation must change this value and invalidate older state.
 _SEED_SCHEME = "sha256_box_slot_v1"
+
+
+def _resolve_custom_schedule_resume_mode(
+    *,
+    outdir: Path,
+    results_path: Path,
+    resume: bool | None,
+) -> bool:
+    """Admit only a clean start or an authenticated result-backed resume.
+
+    Partial custom schedules contain valid-looking LAMMPS stage trees but no
+    complete binding to the schedule, potential, seed stream, or convergence
+    state.  They must never be mistaken for a fresh calculation.
+    """
+
+    result = Path(results_path)
+    if result.is_symlink():
+        raise RuntimeError(
+            "Cannot trust run_results.json for run-schedule resume because it "
+            "is a symbolic link"
+        )
+    exists = result.is_file()
+    if resume is True and not exists:
+        raise RuntimeError(
+            "Cannot resume run-schedule: --resume was requested but "
+            "run_results.json is missing"
+        )
+    if resume is False and exists:
+        raise RuntimeError(
+            "Cannot start run-schedule with --no-resume: run_results.json "
+            "already exists; choose a fresh empty output directory"
+        )
+    if exists:
+        return True
+    leftovers = sorted(path.name for path in workflow_payload_entries(outdir))
+    if leftovers:
+        preview = ", ".join(leftovers[:8])
+        suffix = " ..." if len(leftovers) > 8 else ""
+        raise RuntimeError(
+            "Cannot safely start run-schedule without a protected "
+            "run_results.json in a non-empty output directory "
+            f"({preview}{suffix}); choose a fresh empty output directory"
+        )
+    return False
 
 
 def _normalise_for_fingerprint(value: Any) -> Any:
@@ -556,6 +834,9 @@ def _potential_fingerprint_payload(pot_cfg: Any, *, config_path: Optional[Path])
 
     cfg_payload = _normalise_for_fingerprint(pot_cfg)
     file_paths = [Path(x) for x in (getattr(pot_cfg, "files", None) or [])]
+    for path in file_paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Custom-schedule potential input is not a file: {path}")
     if isinstance(cfg_payload, dict) and "files" in cfg_payload:
         cfg_payload = dict(cfg_payload)
         cfg_payload["files"] = [str(Path(x).name) for x in file_paths]
@@ -563,15 +844,40 @@ def _potential_fingerprint_payload(pot_cfg: Any, *, config_path: Optional[Path])
     file_identities = [_file_identity_for_fingerprint(p) for p in file_paths]
     files_by_name = {Path(p).name: Path(p) for p in file_paths}
     commands = [str(x).strip() for x in (getattr(pot_cfg, "commands", None) or []) if str(x).strip()]
+    # Apply the same fail-closed command-file contract as standard/HPC runs.
+    # This catches identifiable missing include/pair_coeff inputs even when a
+    # permissive command parser would otherwise just omit them from provenance.
+    discovered_command_paths = potential_command_file_paths(
+        potential=(cfg_payload if isinstance(cfg_payload, Mapping) else {}),
+        plan={},
+        declared_values=file_paths,
+        base_dir=(Path(config_path).parent if config_path is not None else Path.cwd()),
+    )
     xml_refs: list[dict[str, Any]] = []
+    command_file_refs: list[dict[str, Any]] = []
+    seen_command_files: set[tuple[int, str]] = set()
     seen_xml_files: set[str] = set()
     for idx, line in enumerate(commands):
         labels = re.findall(r"\bxml_label=([^\s\"']+)", str(line))
         for tok in _split_lammps_command_tokens(line):
             clean = str(tok).strip().strip("'\"")
+            local_path = _resolve_command_file_token(
+                clean, files_by_name=files_by_name, config_path=config_path
+            )
+            if local_path.is_file():
+                command_key = (int(idx), str(local_path.resolve(strict=False)))
+                if command_key not in seen_command_files:
+                    seen_command_files.add(command_key)
+                    command_file_refs.append(
+                        {
+                            "command_index": int(idx),
+                            "token": clean,
+                            "file": _file_identity_for_fingerprint(local_path),
+                        }
+                    )
             if ".xml" not in clean.lower():
                 continue
-            p = _resolve_command_file_token(clean, files_by_name=files_by_name, config_path=config_path)
+            p = local_path
             seen_key = f"cmd:{idx}:{Path(clean).name}:{str(p)}"
             if seen_key in seen_xml_files:
                 continue
@@ -591,11 +897,23 @@ def _potential_fingerprint_payload(pot_cfg: Any, *, config_path: Optional[Path])
         if Path(p).suffix.lower() == ".xml":
             xml_files.append(_file_identity_for_fingerprint(p))
 
+    recorded_paths = {
+        str(_resolve_command_file_token(str(ref.get("token", "")), files_by_name=files_by_name, config_path=config_path).resolve(strict=False))
+        for ref in command_file_refs
+    }
+    for path in discovered_command_paths:
+        if str(path.resolve(strict=False)) in recorded_paths:
+            continue
+        command_file_refs.append(
+            {"command_index": None, "token": str(path), "file": _file_identity_for_fingerprint(path)}
+        )
+
     return {
         "kind": str(getattr(pot_cfg, "kind", type(pot_cfg).__name__)),
         "config": cfg_payload,
         "commands": commands,
         "files": file_identities,
+        "command_file_references": command_file_refs,
         "gap_xml_identity": {
             "configured_xml_files": xml_files,
             "command_xml_references": xml_refs,
@@ -608,11 +926,17 @@ def _structure_fingerprint_payload(structure_cfg: Any) -> dict[str, Any]:
     identities: dict[str, Any] = {}
     lammps_data = getattr(structure_cfg, "lammps_data", None)
     if lammps_data is not None:
-        identities["lammps_data"] = _file_identity_for_fingerprint(Path(lammps_data))
+        path = Path(lammps_data)
+        if not path.is_file():
+            raise FileNotFoundError(f"Custom-schedule structure input is not a file: {path}")
+        identities["lammps_data"] = _file_identity_for_fingerprint(path)
     gen = getattr(structure_cfg, "generate", None)
     poscar_path = getattr(gen, "poscar_path", None) if gen is not None else None
     if poscar_path is not None:
-        identities["poscar_path"] = _file_identity_for_fingerprint(Path(poscar_path))
+        path = Path(poscar_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Custom-schedule POSCAR input is not a file: {path}")
+        identities["poscar_path"] = _file_identity_for_fingerprint(path)
     return {"config": payload, "file_identities": identities}
 
 
@@ -627,13 +951,14 @@ def _build_resume_fingerprint(
     md_pressure: float,
     lammps_units: str,
     config_path: Optional[Path],
+    engine_build_identities: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build the deterministic custom-schedule resume/provenance fingerprint."""
 
-    try:
-        from .. import __version__ as vitriflow_version
-    except Exception:
-        vitriflow_version = "unknown"
+    runtime = runtime_identity()
+    checked_engine_build_identities = validate_engine_build_identity_bundle(
+        engine_build_identities
+    )
 
     payload = {
         "schema": _RESUME_FINGERPRINT_SCHEMA,
@@ -641,9 +966,13 @@ def _build_resume_fingerprint(
         "runner": {
             "name": "run_custom_schedule",
             "execution": "continuous_lammps",
-            "vitriflow_version": str(vitriflow_version),
+            "vitriflow_version": str(runtime["vitriflow_version"]),
+            "runtime": runtime,
             "engine": str(config.engine),
             "lammps": _normalise_for_fingerprint(config.lammps),
+            "engine_build_identities": _normalise_for_fingerprint(
+                checked_engine_build_identities
+            ),
         },
         "custom_schedule": _normalise_for_fingerprint(schedule),
         "custom_schedule_derived": {
@@ -659,10 +988,6 @@ def _build_resume_fingerprint(
         "production_acceptance": _normalise_for_fingerprint(config.autotune.production),
         "structure": _structure_fingerprint_payload(config.structure),
         "random_seed": int(config.random_seed),
-        # Identifies which seed-derivation algorithm produced the per-box
-        # seeds in this run. A change here invalidates resume against any
-        # output that was generated under a different scheme; see
-        # _RESUME_FINGERPRINT_SCHEMA bump (v1 -> v2) and _derive_box_seeds.
         "seed_scheme": _SEED_SCHEME,
         "resolved_context": {
             "pressure": float(md_pressure),
@@ -775,12 +1100,23 @@ def _validate_resume_fingerprint_or_raise(
         )
     stored_sha = _fingerprint_sha256(stored)
     current_sha = _fingerprint_sha256(current)
-    if stored_sha is None or current_sha is None:
-        raise RuntimeError("run-schedule resume fingerprint is malformed; use a fresh output directory")
-    if stored_sha == current_sha:
-        return
     stored_payload = stored.get("payload", {}) if isinstance(stored, Mapping) else {}
     current_payload = current.get("payload", {}) if isinstance(current, Mapping) else {}
+    if (
+        stored_sha is None
+        or current_sha is None
+        or not isinstance(stored_payload, Mapping)
+        or not isinstance(current_payload, Mapping)
+    ):
+        raise RuntimeError("run-schedule resume fingerprint is malformed; use a fresh output directory")
+    if stored_sha != _sha256_canonical_json(stored_payload):
+        raise RuntimeError(
+            "run-schedule resume fingerprint payload was modified or corrupted; use a fresh output directory"
+        )
+    if current_sha != _sha256_canonical_json(current_payload):
+        raise RuntimeError("internal error: current run-schedule fingerprint is inconsistent")
+    if stored_sha == current_sha:
+        return
     diffs = _diff_fingerprint_payloads(stored_payload, current_payload, max_diffs=12)
     diff_text = ""
     if diffs:
@@ -802,14 +1138,14 @@ def _final_status(
     max_boxes: Optional[int],
     n_total: int,
 ) -> tuple[str, Optional[str]]:
-    if int(n_accepted) < int(min_boxes):
-        return "incomplete", f"accepted {int(n_accepted)} boxes, below min_boxes={int(min_boxes)}"
-    if bool(check_convergence) and not bool(converged):
-        cap = ""
-        if max_boxes is not None and int(n_total) >= int(max_boxes):
-            cap = f" after reaching max_boxes={int(max_boxes)}"
-        return "not_converged", f"production convergence criteria were not satisfied{cap}"
-    return "ok", None
+    return production_final_status(
+        n_accepted=n_accepted,
+        min_boxes=min_boxes,
+        check_convergence=check_convergence,
+        converged=converged,
+        max_boxes=max_boxes,
+        n_total=n_total,
+    )
 
 def _stage_by_name(schedule: CustomSchedule) -> dict[str, CustomStageConfig]:
     return {s.name: s for s in schedule.stages}
@@ -856,6 +1192,18 @@ def _guard_custom_schedule_supported_equivalence_paths(
         raise ValueError(
             "run-schedule does not yet support autotune.production.dft_opt.enabled=true; "
             "disable DFT refinement for custom schedules or use the standard production workflow"
+        )
+
+    pot_cfg = getattr(config, "kim", None)
+    core_cfg = getattr(pot_cfg, "core_repulsion", None)
+    if bool(getattr(core_cfg, "enabled", False)):
+        raise ValueError(
+            "run-schedule does not silently realize autocore regularization. "
+            "Autocore requires the standard preflight join selection, analytic/table "
+            "equivalence audit, and stability refinement before its generated table "
+            "can be executed. Use autotune (or a protected production plan produced "
+            "by autotune/run), or supply an independently regularized potential with "
+            "core_repulsion.enabled=false."
         )
 
     elastic_cfg = getattr(metrics_cfg, "elastic", None)
@@ -975,6 +1323,7 @@ def _make_production_stage_specs(
     return specs
 
 
+@locked_output_workflow("custom schedule workflow")
 def run_custom_schedule(
     config: RunConfig,
     outdir: Path,
@@ -991,23 +1340,38 @@ def run_custom_schedule(
 
     from ..analysis.motif_summary import summarize_production_crystal_motifs
     from ..runner import LammpsRunner
-    from ..utils import ensure_dir
+    from ..utils import ensure_dir, quarantine_uncommitted_box_directories
     from .metric_requirements import fixed_cutoffs_from_metrics, required_pairs_from_metrics
     from .metrics_policy import resolve_effective_metrics_config
     from .production_common import (
         analyse_production_box,
+        assess_fixed_count_convergence_posthoc,
         build_production_convergence_spec,
         check_production_convergence,
+        graph_analysis_requested,
         metrics_checked_from_conv_spec,
         plan_production_stage_diagnostics,
         resolve_production_relax_dump_settings,
         resolve_production_time_unit_ps,
         validate_production_entry_against_spec,
+        write_graph_analysis_outputs,
     )
     from .progress import CondensedProgressLog, atomic_write_json
     from .stage_runner import run_stages_continuous_lammps, stage_outcome_from_artifacts
     from .step_counts import resolve_lammps_units_style, resolve_md_pressure
+    from .resume_integrity import (
+        attach_production_state_integrity as _attach_production_state_integrity,
+        validate_production_resume_state as _validate_production_resume_state,
+    )
 
+    outdir = Path(outdir)
+    ensure_dir(outdir)
+    results_path = outdir / "run_results.json"
+    should_resume = _resolve_custom_schedule_resume_mode(
+        outdir=outdir,
+        results_path=results_path,
+        resume=resume,
+    )
     _guard_custom_schedule_runner_scope(config)
     runner = LammpsRunner(config.lammps)
     pot_cfg = config.kim
@@ -1021,6 +1385,13 @@ def run_custom_schedule(
         runner=runner,
         force_isotropic=bool(getattr(md_use, "force_isotropic", False)),
     )
+    engine_build_identities = query_engine_build_identities(
+        config,
+        workdir=outdir,
+        primary_engine="lammps",
+        include_cp2k_refinement=False,
+    )
+    validate_engine_build_identity_bundle(engine_build_identities)
 
     raw = _load_raw_yaml(config_path) if config_path is not None else {}
     schedule = _schedule_from_raw(raw)
@@ -1035,6 +1406,7 @@ def run_custom_schedule(
     time_unit_ps = float(time_unit_ps)
     steps = _schedule_steps(schedule, md_use=md_use, time_unit_ps=time_unit_ps)
     sched_report = _schedule_report(schedule, steps, md_use=md_use, time_unit_ps=time_unit_ps, analysis_roles=analysis_roles)
+    fingerprint_sched_report = json.loads(json.dumps(sched_report, allow_nan=False))
     md_pressure = float(resolve_md_pressure(config, md_use=md_use, override=None, default=0.0))
     lammps_units = resolve_lammps_units_style(config, pot_cfg=pot_cfg, default="metal")
     resume_fingerprint = _build_resume_fingerprint(
@@ -1042,35 +1414,62 @@ def run_custom_schedule(
         schedule=schedule,
         analysis_roles=analysis_roles,
         steps=steps,
-        sched_report=sched_report,
+        sched_report=fingerprint_sched_report,
         time_unit_ps=float(time_unit_ps),
         md_pressure=float(md_pressure),
         lammps_units=str(lammps_units),
         config_path=config_path,
+        engine_build_identities=engine_build_identities,
     )
 
-    outdir = Path(outdir)
-    ensure_dir(outdir)
     progress = CondensedProgressLog(outdir / "condensed.log")
     progress.info("custom", "initialising custom fixed-schedule run")
 
-    results_path = outdir / "run_results.json"
     previous_results: Optional[dict[str, Any]] = None
-    if results_path.exists():
+    if should_resume:
         prev = json.loads(results_path.read_text())
         if not isinstance(prev, Mapping):
             raise RuntimeError(f"run_results.json in {outdir} is not a JSON object")
         prod_status_src = prev.get("production", {})
         prod_status = prod_status_src.get("status", "") if isinstance(prod_status_src, Mapping) else ""
         prev_status = str(prev.get("status", prod_status) or "").lower()
-        if resume is None or bool(resume):
-            _validate_resume_fingerprint_or_raise(prev, resume_fingerprint, outdir=outdir)
-            previous_results = dict(prev)
-            if prev_status == "ok":
-                progress.info("custom", "existing run_results.json fingerprint matches and is complete; returning cached result")
-                return dict(prev)
-        elif not bool(resume):
-            raise RuntimeError(f"run_results.json already exists in {outdir}; use --resume or remove the directory")
+        _validate_resume_fingerprint_or_raise(prev, resume_fingerprint, outdir=outdir)
+        if not isinstance(prod_status_src, Mapping):
+            raise RuntimeError("Cannot safely resume run-schedule: missing production state")
+        _validate_production_resume_state(prod_status_src, outdir=outdir)
+        if str(prev.get("status", "")).strip().lower() != str(
+            prod_status_src.get("status", "")
+        ).strip().lower():
+            raise RuntimeError(
+                "Cannot safely resume run-schedule: top-level and production statuses disagree"
+            )
+        if str(prev.get("execution_status", "")).strip().lower() != str(
+            prod_status_src.get("execution_status", "")
+        ).strip().lower():
+            raise RuntimeError(
+                "Cannot safely resume run-schedule: top-level and production execution statuses disagree"
+            )
+        previous_results = dict(prev)
+        if prev_status == "ok":
+            progress.info("custom", "existing run_results.json fingerprint matches and is complete; returning cached result")
+            return dict(prev)
+        if (
+            prev_status in {"incomplete", "not_converged"}
+            and not bool(prod_status_src.get("resumable", True))
+        ):
+            progress.info(
+                "custom",
+                "existing terminal result is valid but intentionally non-resumable; returning cached result",
+            )
+            return dict(prev)
+
+    # KIM installation is meaningful only for an explicitly tagged KIM
+    # potential.  Analytic and hybrid LAMMPS configurations must never acquire
+    # an implicit KIM dependency on either fresh execution or resume.
+    ensure_potential_model_installed(
+        pot_cfg,
+        installer=ensure_model_installed,
+    )
 
     from ..structuregen import prepare_initial_structure
 
@@ -1086,11 +1485,13 @@ def run_custom_schedule(
         config.autotune.metrics,
         structure_data=initial_ref,
         type_to_species=type_to_species,
+        lammps_units_style=lammps_units,
         warn_fn=_warn_metric,
         context="run-schedule production",
     )
     if not bool(metrics_cfg.enabled):
         raise RuntimeError("run-schedule requires autotune.metrics.enabled=true for convergence-aware production")
+    graph_requested = graph_analysis_requested(metrics_cfg)
 
     conv_cfg = config.autotune.convergence
 
@@ -1147,77 +1548,183 @@ def run_custom_schedule(
     conv_spec: Optional[dict[str, Any]] = None
     conv_report: dict[str, Any] = {}
     converged = False
+    converged_now = False
     converged_streak = 0
+    last_convergence_evaluated_n_boxes_total: int | None = None
+    last_convergence_evaluated_n_boxes_accepted: int | None = None
     next_box_id = 0
 
-    if results_path.exists() and (resume is None or bool(resume)):
-        try:
-            prev = previous_results if previous_results is not None else json.loads(results_path.read_text())
-            prod_prev = prev.get("production", {}) if isinstance(prev.get("production", {}), Mapping) else {}
-            boxes = [dict(x) for x in prod_prev.get("boxes", []) if isinstance(x, Mapping)]
-            rejected_boxes = [dict(x) for x in prod_prev.get("rejected_boxes", []) if isinstance(x, Mapping)]
-            if isinstance(prod_prev.get("convergence_spec", None), Mapping):
-                conv_spec = dict(prod_prev.get("convergence_spec", {}))
-            if isinstance(prod_prev.get("convergence", None), Mapping):
-                conv_report = dict(prod_prev.get("convergence", {}))
-            existing_ids = [int(x.get("box", -1)) for x in boxes + rejected_boxes if isinstance(x.get("box", None), int)]
-            next_box_id = (max(existing_ids) + 1) if existing_ids else 0
-            progress.info("custom", f"resuming from {len(boxes)} accepted and {len(rejected_boxes)} rejected boxes")
-        except Exception as exc:
-            progress.warn("custom", f"failed to read previous run_results.json for resume: {type(exc).__name__}: {exc}")
+    if should_resume:
+        if previous_results is None:
+            raise RuntimeError("Cannot safely resume run-schedule: validated previous results are unavailable")
+        prod_prev_raw = previous_results.get("production", {})
+        if not isinstance(prod_prev_raw, Mapping):
+            raise RuntimeError("Cannot safely resume run-schedule: production state is malformed")
+        prod_prev = prod_prev_raw
+        raw_boxes = prod_prev.get("boxes", [])
+        raw_rejected = prod_prev.get("rejected_boxes", [])
+        if not isinstance(raw_boxes, list) or not all(isinstance(x, Mapping) for x in raw_boxes):
+            raise RuntimeError("Cannot safely resume run-schedule: accepted boxes are malformed")
+        if not isinstance(raw_rejected, list) or not all(isinstance(x, Mapping) for x in raw_rejected):
+            raise RuntimeError("Cannot safely resume run-schedule: rejected boxes are malformed")
+        boxes = [dict(x) for x in raw_boxes]
+        rejected_boxes = [dict(x) for x in raw_rejected]
+        if isinstance(prod_prev.get("convergence_spec", None), Mapping):
+            conv_spec = dict(prod_prev.get("convergence_spec", {}))
+        if isinstance(prod_prev.get("convergence", None), Mapping):
+            conv_report = dict(prod_prev.get("convergence", {}))
+        stored_required = int(
+            prod_prev.get("required_convergence_streak", required_streak)
+        )
+        if stored_required != required_streak:
+            raise RuntimeError(
+                "Cannot safely resume run-schedule: required convergence streak changed"
+            )
+        converged_streak = int(prod_prev.get("convergence_streak", 0))
+        converged_now = bool(prod_prev.get("converged_md", False))
+        last_total = prod_prev.get("last_convergence_evaluated_n_boxes_total")
+        last_accepted = prod_prev.get(
+            "last_convergence_evaluated_n_boxes_accepted"
+        )
+        last_convergence_evaluated_n_boxes_total = (
+            None if last_total is None else int(last_total)
+        )
+        last_convergence_evaluated_n_boxes_accepted = (
+            None if last_accepted is None else int(last_accepted)
+        )
+        existing_ids = [int(x.get("box", -1)) for x in boxes + rejected_boxes if isinstance(x.get("box", None), int)]
+        next_box_id = (max(existing_ids) + 1) if existing_ids else 0
+        quarantine_uncommitted_box_directories(
+            prod_dir,
+            committed_box_ids=existing_ids,
+            quarantine_root=(
+                Path(outdir) / "interrupted_attempts" / "custom_production"
+            ).resolve(strict=False),
+        )
+        progress.info("custom", f"resuming from {len(boxes)} accepted and {len(rejected_boxes)} rejected boxes")
 
-    # Per-box seeds are derived deterministically from (seed_base, box_id, slot)
-    # via a SHA-based stream rather than advancing a single rng cursor by box
-    # count. The cursor scheme silently diverges from a fresh run when a prior
-    # run was killed *between* `next_box_id += 1` and seed consumption, because
-    # the resume code restores cursor position from the count of recorded
-    # boxes only. With deterministic derivation, box k's seeds depend on k
-    # alone, so resume reproducibility no longer depends on whether the
-    # previous run was interrupted mid-box.
-    #
-    # The algorithm tag below is mirrored into the resume fingerprint as
-    # `seed_scheme = _SEED_SCHEME`; changing the algorithm requires bumping
-    # _SEED_SCHEME so any pre-existing run_results.json fingerprint mismatches
-    # against the new runner and refuses to resume.
+    if previous_results is not None:
+        # Do this after restoring the box/convergence state but before the
+        # first new box is analysed or an updated checkpoint is written.  A
+        # resumed ensemble must use exactly the same production cutoff map as
+        # its already completed boxes.
+        prod_cutoffs = _restore_custom_resume_cutoffs(
+            previous_results,
+            fixed_cutoffs=fixed_cut,
+        )
+        if prod_cutoffs:
+            progress.info(
+                "custom",
+                f"restored {len(prod_cutoffs)} production cutoff pair(s) for resume",
+            )
+
+    # Derive each box independently. Resume therefore cannot diverge when an
+    # earlier process stops after reserving a box id but before consuming an
+    # RNG cursor.
     assert _SEED_SCHEME == "sha256_box_slot_v1"
     seed_base = int(config.random_seed) + 97531
-    stage_names = [str(st.name) for st in schedule.stages]
+    stage_names = [str(stage.name) for stage in schedule.stages]
 
     def _derive_box_seeds(box_id: int) -> tuple[int, dict[str, int]]:
-        import hashlib
-
         def _seed_for(slot: str) -> int:
-            # Format is part of the sha256_box_slot_v1 contract: any change
-            # here MUST bump _SEED_SCHEME (and the fingerprint schema bump
-            # follows automatically because seed_scheme is in the payload).
             payload = f"{seed_base}:{int(box_id)}:{slot}".encode("utf-8")
-            digest = hashlib.sha256(payload).digest()
-            # Mask to 31 bits so the value is always representable as a signed
-            # int LAMMPS seed and never zero (LAMMPS rejects seed=0 for some fixes).
-            v = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
-            if v < 1:
-                v = 1
-            return v
+            value = int.from_bytes(hashlib.sha256(payload).digest()[:4], "big") & 0x7FFFFFFF
+            return max(1, value)
 
-        pack_seed = _seed_for("packmol")
-        stage_seeds = {name: _seed_for(f"stage:{name}") for name in stage_names}
-        return pack_seed, stage_seeds
+        return (
+            _seed_for("packmol"),
+            {name: _seed_for(f"stage:{name}") for name in stage_names},
+        )
 
     target = max(min_boxes, len(boxes))
     hard_max_boxes = 10000
+    graph_output_paths: dict[str, str] = {}
+    integrity_file_cache: dict[str, tuple[int, int, int, int, int, str]] = {}
 
     def _production_state(status: str, error: Optional[str] = None) -> dict[str, Any]:
-        report_boxes = boxes if store_distributions else _strip_distributions(boxes)
-        report_rej = rejected_boxes if store_distributions else _strip_distributions(rejected_boxes)
+        terminal = str(status) in {"ok", "incomplete", "not_converged"}
+        strip_terminal_distributions = terminal and not store_distributions
+        report_boxes = (
+            _strip_distributions(boxes) if strip_terminal_distributions else boxes
+        )
+        report_rej = (
+            _strip_distributions(rejected_boxes)
+            if strip_terminal_distributions
+            else rejected_boxes
+        )
+        resumable = not (
+            terminal and check_convergence and strip_terminal_distributions
+        )
         motif_summary = summarize_production_crystal_motifs(boxes, rejected_boxes=rejected_boxes)
-        return {
+        if not check_convergence:
+            convergence_inference_status = (
+                "fixed_n_terminal_posthoc_not_sequentially_valid"
+                if bool(conv_report.get("assessment_performed", False))
+                else "fixed_count_unassessed"
+            )
+        elif bool(converged):
+            convergence_inference_status = (
+                "criterion_met_repeated_looks_not_sequentially_valid"
+            )
+        elif conv_report:
+            convergence_inference_status = (
+                "criterion_not_met_or_unassessed_repeated_looks_not_sequentially_valid"
+            )
+        else:
+            convergence_inference_status = "not_yet_assessed"
+        convergence_degree = (
+            dict(conv_report.get("convergence_degree", {}) or {})
+            if isinstance(conv_report, Mapping)
+            else {}
+        )
+        criterion_coverage = {
+            key: dict(convergence_degree.get(key, {}) or {})
+            for key in ("ci", "stability", "criteria_integrity", "overall")
+            if isinstance(convergence_degree.get(key), Mapping)
+        }
+        state = {
             "enabled": True,
             "workflow": "custom_stage_schedule",
             "workflow_label": str(schedule.workflow_label),
+            "engine_build_identities": dict(engine_build_identities),
+            "engine_build_identity_status": "verified",
             "resume_fingerprint_sha256": str(resume_fingerprint.get("sha256", "")),
             "status": str(status),
+            "execution_status": (
+                "completed" if str(status) in {"ok", "incomplete", "not_converged"}
+                else str(status)
+            ),
             "error": None if error is None else str(error),
-            "converged": bool(converged),
+            "converged": (bool(converged) if check_convergence else None),
+            "convergence_status": (
+                "converged"
+                if check_convergence and bool(converged)
+                else (
+                    "not_converged"
+                    if check_convergence
+                    else "fixed_count_unassessed"
+                )
+            ),
+            "convergence_inference_status": str(convergence_inference_status),
+            "achieved_convergence_degree": (
+                dict(conv_report.get("achieved_convergence_degree", {}) or {})
+                if isinstance(conv_report, Mapping)
+                and isinstance(conv_report.get("achieved_convergence_degree"), Mapping)
+                else None
+            ),
+            "posthoc_convergence_criterion_met": (
+                conv_report.get("posthoc_criterion_met")
+                if not check_convergence and isinstance(conv_report, Mapping)
+                else None
+            ),
+            "posthoc_convergence_failed_items": (
+                list(conv_report.get("posthoc_failed_items", []) or [])
+                if not check_convergence and isinstance(conv_report, Mapping)
+                else None
+            ),
+            "convergence_criterion_coverage": (
+                criterion_coverage if criterion_coverage else None
+            ),
             "n_boxes": int(len(boxes)),
             "n_boxes_accepted": int(len(boxes)),
             "n_boxes_rejected": int(len(rejected_boxes)),
@@ -1226,8 +1733,24 @@ def run_custom_schedule(
             "max_boxes": (None if max_boxes is None else int(max_boxes)),
             "batch_boxes": int(batch),
             "check_convergence": bool(check_convergence),
+            "resumable": bool(resumable),
+            "non_resumable_reason": (
+                "adaptive convergence distributions were omitted from the terminal result"
+                if not resumable
+                else None
+            ),
             "convergence_streak": int(converged_streak),
             "required_convergence_streak": int(required_streak),
+            "last_convergence_evaluated_n_boxes_total": (
+                None
+                if last_convergence_evaluated_n_boxes_total is None
+                else int(last_convergence_evaluated_n_boxes_total)
+            ),
+            "last_convergence_evaluated_n_boxes_accepted": (
+                None
+                if last_convergence_evaluated_n_boxes_accepted is None
+                else int(last_convergence_evaluated_n_boxes_accepted)
+            ),
             "dump_trajectory": bool(dump_traj),
             "dump_every_steps": int(dump_every),
             "schedule": dict(sched_report),
@@ -1241,20 +1764,34 @@ def run_custom_schedule(
             "cutoffs": [{"pair": [int(a), int(b)], "cutoff": float(c)} for (a, b), c in sorted((prod_cutoffs or {}).items())],
             "metrics_checked": metrics_checked_from_conv_spec(conv_spec),
             "convergence_spec": conv_spec,
-            "converged_md": bool(converged),
+            "converged_md": (
+                bool(converged_now) if check_convergence else None
+            ),
             "convergence_md": conv_report,
             "convergence": conv_report,
             "crystal_motifs": motif_summary,
             "boxes": report_boxes,
             "rejected_boxes": report_rej,
+            "graph_outputs": dict(graph_output_paths),
+            "paths": dict(graph_output_paths),
             "ensemble_dir": _relpath(prod_dir, outdir),
         }
+        return _attach_production_state_integrity(
+            state,
+            outdir=outdir,
+            identity_cache=integrity_file_cache,
+            force_rehash=terminal,
+        )
 
     def _summary(status: str, error: Optional[str] = None) -> dict[str, Any]:
         prod_state = _production_state(status, error=error)
         all_entries = list(prod_state.get("boxes", [])) + list(prod_state.get("rejected_boxes", []))
         return {
             "status": str(status),
+            "execution_status": (
+                "completed" if str(status) in {"ok", "incomplete", "not_converged"}
+                else str(status)
+            ),
             "error": None if error is None else str(error),
             "workflow": "custom_stage_schedule",
             "workflow_label": str(schedule.workflow_label),
@@ -1269,7 +1806,9 @@ def run_custom_schedule(
             },
             "replicates": all_entries,
             "production": prod_state,
+            "graph_outputs": dict((prod_state.get("graph_outputs", {}) if isinstance(prod_state, Mapping) else {}) or {}),
             "resume_fingerprint": dict(resume_fingerprint),
+            "engine_build_identities": dict(engine_build_identities),
             "provenance": {
                 "resume_fingerprint_schema": str(resume_fingerprint.get("schema", _RESUME_FINGERPRINT_SCHEMA)),
                 "resume_fingerprint_sha256": str(resume_fingerprint.get("sha256", "")),
@@ -1281,6 +1820,7 @@ def run_custom_schedule(
                 "condensed_log": "condensed.log",
                 "run_results": "run_results.json",
                 "resume_fingerprint": _RESUME_FINGERPRINT_SIDECAR,
+                **dict((prod_state.get("graph_outputs", {}) if isinstance(prod_state, Mapping) else {}) or {}),
             },
         }
 
@@ -1379,6 +1919,9 @@ def run_custom_schedule(
                 rejects_dir=(rejects_dir if exclude_defects else None),
                 relax_dump_path=dump_path,
                 relax_traj_path=traj_path,
+                embed_structures=bool(getattr(prod_cfg, "embed_structures", True)),
+                lammps_units_style=str(lammps_units),
+                engine=str(getattr(config, "engine", "lammps") or "lammps"),
             )
             entry["schedule"] = dict(sched_report)
             entry.setdefault("paths", {})["initial_data"] = _relpath(input_data, outdir)
@@ -1388,7 +1931,7 @@ def run_custom_schedule(
                 entry.setdefault("paths", {})[f"stage_{st.name}_dir"] = _relpath(bdir / st.name, outdir)
 
             if conv_spec is None:
-                conv_spec = build_production_convergence_spec(entry)
+                conv_spec = build_production_convergence_spec(entry, metrics_cfg)
             else:
                 validate_production_entry_against_spec(entry, conv_spec, box_label=b)
 
@@ -1402,26 +1945,63 @@ def run_custom_schedule(
             _checkpoint("running")
 
         if not check_convergence:
-            converged = True
-            conv_report = {}
-            break
-        if conv_spec is None:
+            fixed_count_complete = len(boxes) >= min_boxes
             converged = False
-            conv_report = {"error": "no convergence spec available"}
+            converged_now = False
+            conv_report = assess_fixed_count_convergence_posthoc(
+                boxes,
+                conv_spec,
+                conv_cfg,
+                execution_target_met=bool(fixed_count_complete),
+                min_boxes=int(min_boxes),
+            )
+            if not fixed_count_complete:
+                conv_report["error"] = (
+                    f"accepted {len(boxes)} boxes, below min_boxes={min_boxes}"
+                )
+            progress.convergence("custom-posthoc", conv_report)
             break
-        if len(boxes) < 1:
-            converged = False
-            conv_report = {"error": "no accepted boxes"}
-            break
-
-        converged_now, conv_report = check_production_convergence(boxes, conv_spec, conv_cfg)
-        if converged_now:
-            converged_streak += 1
-        else:
-            converged_streak = 0
-        progress.convergence("custom", conv_report)
-        progress.info("custom", f"convergence streak: {converged_streak}/{required_streak}")
-        _checkpoint("running")
+        current_total = len(boxes) + len(rejected_boxes)
+        current_accepted = len(boxes)
+        already_evaluated = (
+            last_convergence_evaluated_n_boxes_total == current_total
+            and last_convergence_evaluated_n_boxes_accepted == current_accepted
+        )
+        if not already_evaluated:
+            previous_accepted = last_convergence_evaluated_n_boxes_accepted
+            accepted_ensemble_changed = (
+                previous_accepted is None
+                or current_accepted != int(previous_accepted)
+            )
+            new_accepted_evidence = (
+                previous_accepted is None
+                or current_accepted > int(previous_accepted)
+            )
+            # A rejected-only batch leaves the accepted sample unchanged and
+            # cannot count as another passing convergence look.
+            if accepted_ensemble_changed:
+                if conv_spec is None:
+                    converged_now = False
+                    conv_report = {"error": "no convergence spec available"}
+                elif len(boxes) < 1:
+                    converged_now = False
+                    conv_report = {"error": "no accepted boxes"}
+                else:
+                    converged_now, conv_report = check_production_convergence(
+                        boxes, conv_spec, conv_cfg
+                    )
+                if new_accepted_evidence and converged_now:
+                    converged_streak += 1
+                else:
+                    converged_streak = 0
+            last_convergence_evaluated_n_boxes_total = current_total
+            last_convergence_evaluated_n_boxes_accepted = current_accepted
+            progress.convergence("custom", conv_report)
+            progress.info(
+                "custom",
+                f"convergence streak: {converged_streak}/{required_streak}",
+            )
+            _checkpoint("running")
 
         if converged_now and converged_streak >= required_streak and len(boxes) >= min_boxes:
             converged = True
@@ -1443,6 +2023,48 @@ def run_custom_schedule(
         max_boxes=max_boxes,
         n_total=(len(boxes) + len(rejected_boxes)),
     )
+    if graph_requested:
+        # Enhanced graph output is explicit and terminal-only. Intermediate
+        # checkpoints remain cheap and cannot expose partially rewritten
+        # sidecars.
+        graph_output_paths = write_graph_analysis_outputs(
+            outdir,
+            boxes=boxes,
+            rejected_boxes=rejected_boxes,
+            metrics=metrics_cfg,
+            type_to_species=type_to_species,
+            legacy_cutoffs=prod_cutoffs,
+        )
+    final_engine_build_identities = query_engine_build_identities(
+        config,
+        workdir=outdir,
+        primary_engine="lammps",
+        include_cp2k_refinement=False,
+    )
+    assert_engine_build_identity_bundle_unchanged(
+        engine_build_identities,
+        final_engine_build_identities,
+        context="during custom-schedule execution",
+    )
+    terminal_fingerprint = _build_resume_fingerprint(
+        config=config,
+        schedule=schedule,
+        analysis_roles=analysis_roles,
+        steps=steps,
+        sched_report=fingerprint_sched_report,
+        time_unit_ps=float(time_unit_ps),
+        md_pressure=float(md_pressure),
+        lammps_units=str(lammps_units),
+        config_path=config_path,
+        engine_build_identities=final_engine_build_identities,
+    )
+    if str(terminal_fingerprint.get("sha256", "")) != str(
+        resume_fingerprint.get("sha256", "")
+    ):
+        raise RuntimeError(
+            "Custom-schedule configuration or scientific input bytes changed "
+            "during execution; refusing to seal a mixed-potential result"
+        )
     summary = _summary(status, error=error)
     atomic_write_json(outdir / _RESUME_FINGERPRINT_SIDECAR, resume_fingerprint)
     atomic_write_json(outdir / "run_results.json", summary)

@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
+
+from ..lammps_units import time_to_ps_factor
+
 
 
 def _relpath_or_str(path: Path, base: Path) -> str:
@@ -36,6 +40,8 @@ def collect_stage_metrics_timeseries(
     stage_role: Optional[str] = None,
     quench_window_steps_range: Optional[Tuple[float, float]] = None,
     sampling_hint: Optional[Mapping[str, float]] = None,
+    lammps_units_style: Optional[str] = "metal",
+    engine: str = "lammps",
 ) -> dict[str, Any]:
     """Stage metrics timeseries."""
 
@@ -49,14 +55,6 @@ def collect_stage_metrics_timeseries(
 
     role = str(stage_role or "").strip().lower()
     max_frames_effective = int(max_frames_requested)
-    if role == "quench" and (
-        quench_window_steps_range is not None or (sampling_hint is not None and len(dict(sampling_hint)) > 0)
-    ):
-        max_frames_effective = max(
-            int(max_frames_requested),
-            int(quench_tail_min_frames) + 4,
-            2 * int(max_frames_requested),
-        )
 
     from ..analysis.timeseries import compute_metrics_timeseries
 
@@ -75,11 +73,17 @@ def collect_stage_metrics_timeseries(
         except Exception:
             freeze_temperature = None
 
+    engine_name = str(engine or "lammps").strip().lower()
+    timestep_ps = (
+        float(md_timestep) * 1.0e-3
+        if engine_name == "cp2k"
+        else float(md_timestep) * float(time_to_ps_factor(lammps_units_style))
+    )
     mts = compute_metrics_timeseries(
         stage_dir=stage_dir,
         metrics=metrics_cfg,
         cutoffs=cutoffs,
-        md_timestep=float(md_timestep),
+        md_timestep=timestep_ps,
         type_to_species=type_to_species,
         frame_stride=int(frame_stride),
         max_frames=int(max_frames_effective),
@@ -92,19 +96,55 @@ def collect_stage_metrics_timeseries(
         quench_tail_fraction=float(quench_tail_fraction),
         quench_tail_min_frames=int(quench_tail_min_frames),
         quench_tail_fallback_fraction=float(quench_tail_fallback_fraction),
+        trajectory_lammps_units_style=lammps_units_style,
     )
 
     csv_path = stage_dir / "metrics_timeseries.csv"
     mts.to_csv(csv_path)
 
+    metric_columns = [
+        str(name) for name in mts.columns if str(name) not in {"Step", "time"}
+    ]
+    column_index = {str(name): idx for idx, name in enumerate(mts.columns)}
+    metric_data = np.asarray(mts.data, dtype=float)
+    plot_coordinate = (
+        metric_data[:, column_index["time"]]
+        if "time" in column_index
+        else np.full(metric_data.shape[0], np.nan, dtype=float)
+    )
+    unavailable_metric_columns = [
+        name
+        for name in metric_columns
+        if not np.any(
+            np.isfinite(plot_coordinate)
+            & np.isfinite(metric_data[:, column_index[name]])
+        )
+    ]
+    plot_warning = (
+        f"{len(unavailable_metric_columns)} metric "
+        f"column{'s' if len(unavailable_metric_columns) != 1 else ''} had no finite "
+        "selected-frame values and "
+        f"{'are' if len(unavailable_metric_columns) != 1 else 'is'} annotated "
+        "as unavailable in the plot"
+        if make_plot and unavailable_metric_columns
+        else None
+    )
+
     manifest = {
         "status": "ok",
+        "plot_status": "pending" if make_plot else "not_requested",
+        "engine": engine_name,
+        "reporting_contract": "vitriflow.canonical_physical_units.v1",
+        "time_unit": "ps",
         "n_rows": int(mts.data.shape[0]),
         "n_columns": int(len(mts.columns)),
         "columns": list(mts.columns),
+        "unavailable_metric_columns": list(unavailable_metric_columns),
+        "plot_warning": plot_warning,
         "frame_stride": int(frame_stride),
         "max_frames_requested": int(max_frames_requested),
         "max_frames_effective": int(max_frames_effective),
+        "max_frames_hard_cap": True,
         "stage_role": role or None,
         "quench_window_steps": [float(quench_window_steps_range[0]), float(quench_window_steps_range[1])] if quench_window_steps_range is not None else None,
         "sampling_hint": dict(sampling_hint or {}),
@@ -130,15 +170,39 @@ def collect_stage_metrics_timeseries(
                 xaxis="time",
                 title=f"Stage metrics: {stage_dir.name}",
             )
-        except Exception:
-            plot_path = None
+            if not plot_path.is_file() or int(plot_path.stat().st_size) < 1:
+                raise RuntimeError(
+                    "plot_metrics_timeseries returned without producing a non-empty PDF"
+                )
+        except Exception as exc:
+            # A requested plot is part of the public production-artifact
+            # contract.  Silently returning status='ok' with plot=None masks
+            # plotting regressions and makes local/external validation appear
+            # complete when it is not.
+            manifest["status"] = "failed"
+            manifest["plot_status"] = "failed"
+            manifest["plot_error"] = str(exc)
+            manifest_path.write_text(json.dumps(manifest, indent=2))
+            raise RuntimeError(
+                "Requested stage metrics plot failed for "
+                f"stage_role={role or 'unspecified'} directory={stage_dir}: {exc}"
+            ) from exc
+        else:
+            manifest["plot_status"] = "ok"
+            manifest["plot"] = str(plot_path.name)
+            manifest_path.write_text(json.dumps(manifest, indent=2))
 
     base = Path(outdir) if outdir is not None else stage_dir.parent
     return {
         "status": "ok",
+        "engine": engine_name,
+        "reporting_contract": "vitriflow.canonical_physical_units.v1",
+        "time_unit": "ps",
         "csv": _relpath_or_str(csv_path, base),
         "summary": _relpath_or_str(manifest_path, base),
         "plot": _relpath_or_str(plot_path, base) if plot_path is not None and plot_path.exists() else None,
         "n_rows": int(mts.data.shape[0]),
         "n_columns": int(len(mts.columns)),
+        "unavailable_metric_columns": list(unavailable_metric_columns),
+        "plot_warning": plot_warning,
     }

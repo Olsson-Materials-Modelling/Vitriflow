@@ -26,10 +26,10 @@ potential:
   user_units: metal
   interactions: [C]
   files:
-    - ../potentials/Carbon_GAP_20U+gr.xml
-    - ../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8891
-    - ../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8892
-    - ../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8893
+    - ../../potentials/Carbon_GAP_20U+gr.xml
+    - ../../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8891
+    - ../../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8892
+    - ../../potentials/Carbon_GAP_20U+gr.xml.sparseX.GAP_2022_11_4_0_14_40_15_8893
   commands:
     - pair_style quip
     - 'pair_coeff * * Carbon_GAP_20U+gr.xml "Potential xml_label=GAP_2022_11_4_0_14_40_15_889" 6'

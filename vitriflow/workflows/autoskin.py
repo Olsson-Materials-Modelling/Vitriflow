@@ -82,11 +82,25 @@ def _archive_file(path: Path, suffix: str) -> None:
 
 def _cleanup(paths: Sequence[Path]) -> None:
     for p in paths:
+        path = Path(p)
         try:
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect stale LAMMPS stage artifact before execution: {path}"
+            ) from exc
+        try:
+            # unlink() removes symbolic and hardlink directory entries without
+            # following them.  Directories and permission failures are hard
+            # errors because a stale artifact must never survive into a new
+            # provenance attempt.
+            path.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot remove stale LAMMPS stage artifact before execution: {path}"
+            ) from exc
 
 
 def run_with_neighbor_skin_autotune(
@@ -106,6 +120,7 @@ def run_with_neighbor_skin_autotune(
     # once decide pppm
     script0 = script_builder(md_cfg)
     if not md_cfg.neighbor_skin_autotune or not script_uses_pppm(script0):
+        _cleanup(cleanup)
         runner.run(script0, workdir=workdir, log_name=log_name, timeout_sec=timeout_sec)
         return float(getattr(md_cfg, "neighbor_skin", 0.0)), 0
 
@@ -118,6 +133,7 @@ def run_with_neighbor_skin_autotune(
         md_try = md_cfg.model_copy(update={"neighbor_skin": float(skin)})
         script = script_builder(md_try)
         try:
+            _cleanup(cleanup)
             runner.run(script, workdir=workdir, log_name=log_name, timeout_sec=timeout_sec)
             # propagate skin subsequent
             # reuse stable
@@ -139,9 +155,6 @@ def run_with_neighbor_skin_autotune(
             _archive_file(workdir / "screen.out", tag)
             _archive_file(workdir / "stdout.txt", tag)
             _archive_file(workdir / "stderr.txt", tag)
-
-            # remove outputs append
-            _cleanup(cleanup)
 
             skin = nxt
             n_retry += 1

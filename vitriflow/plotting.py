@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Sequence, Mapping
 
@@ -33,6 +35,451 @@ _OKABE_ITO_CYCLE = [
     OKABE_ITO["yellow"],
     OKABE_ITO["black"],
 ]
+
+
+_PLOT_CDF_ROUNDOFF_ATOL = 1.0e-12
+
+
+def _require_positive_integer(value: Any, *, context: str) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{context} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} must be a positive integer") from exc
+    try:
+        exact = float(value)
+    except (TypeError, ValueError):
+        exact = float(parsed)
+    if parsed <= 0 or not np.isfinite(exact) or exact != float(parsed):
+        raise ValueError(f"{context} must be a positive integer")
+    return parsed
+
+
+def _strict_production_plot_box_id(value: Any, *, context: str) -> int:
+    """Validate one public box identifier without lossy integer coercion."""
+
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{context} has invalid boolean box identifier")
+    if isinstance(value, Integral):
+        parsed = int(value)
+    else:
+        try:
+            exact = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError, AttributeError) as exc:
+            raise ValueError(
+                f"{context} has invalid box identifier {value!r}"
+            ) from exc
+        if not exact.is_finite() or exact != exact.to_integral_value():
+            raise ValueError(
+                f"{context} has non-integral box identifier {value!r}"
+            )
+        parsed = int(exact)
+    if parsed < 0:
+        raise ValueError(f"{context} has negative box identifier {parsed}")
+    return int(parsed)
+
+
+def _normalise_production_plot_boxes(
+    raw_boxes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return uniquely keyed boxes, preserving the native zero-based contract.
+
+    Current files normally carry either ``box`` or ``box_id``.  When both are
+    present they are independent provenance claims and must agree; selecting
+    one by truthiness or precedence could otherwise conceal corrupt input.
+    """
+
+    boxes: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for ordinal, raw_box in enumerate(raw_boxes, start=1):
+        if not isinstance(raw_box, Mapping):
+            raise ValueError(f"Production box {ordinal} must be a mapping")
+        box = dict(raw_box)
+        has_box = "box" in box and box.get("box") is not None
+        has_box_id = "box_id" in box and box.get("box_id") is not None
+        if has_box:
+            from_box = _strict_production_plot_box_id(
+                box.get("box"), context=f"Production box {ordinal}"
+            )
+        else:
+            from_box = None
+        if has_box_id:
+            from_box_id = _strict_production_plot_box_id(
+                box.get("box_id"), context=f"Production box {ordinal}"
+            )
+        else:
+            from_box_id = None
+        if from_box is not None and from_box_id is not None and from_box != from_box_id:
+            raise ValueError(
+                f"Production box {ordinal} has conflicting box identifiers "
+                f"box={from_box} and box_id={from_box_id}"
+            )
+        identifier = (
+            from_box_id
+            if from_box_id is not None
+            else from_box
+            if from_box is not None
+            else int(ordinal)
+        )
+        if identifier in seen:
+            raise ValueError(
+                f"Production section contains duplicate box identifier {identifier}"
+            )
+        seen.add(identifier)
+        box["box_id"] = int(identifier)
+        boxes.append(box)
+    return boxes
+
+
+def _validated_plot_cdf_payload(
+    payload: Mapping[str, Any],
+    *,
+    xkey: str = "x",
+    allow_implicit_integer_axis: bool = False,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Validate a stored CDF for plotting without repairing scientific data.
+
+    Only legacy coordination payloads with an entirely absent ``x`` key may
+    infer the integer support ``0, 1, ...``.  Current payloads, especially soft
+    graph coordination CDFs, must retain and use their explicit physical axis.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("CDF payload must be a mapping")
+    try:
+        cdf = np.asarray(payload.get("cdf", []), dtype=float)
+    except Exception as exc:
+        raise ValueError("CDF values must be numeric") from exc
+    if cdf.ndim != 1 or cdf.size == 0 or not np.all(np.isfinite(cdf)):
+        raise ValueError("CDF must be a non-empty one-dimensional finite array")
+
+    if allow_implicit_integer_axis and xkey not in payload:
+        x = np.arange(int(cdf.size), dtype=float)
+        axis_source = "implicit_integer_index_legacy"
+    else:
+        try:
+            x = np.asarray(payload.get(xkey, []), dtype=float)
+        except Exception as exc:
+            raise ValueError(f"CDF axis '{xkey}' must be numeric") from exc
+        if x.ndim != 1 or x.size == 0 or not np.all(np.isfinite(x)):
+            raise ValueError(f"CDF axis '{xkey}' must be a non-empty one-dimensional finite array")
+        axis_source = "explicit_stored_axis"
+
+    if x.size != cdf.size:
+        raise ValueError(
+            f"CDF axis/value length mismatch ({int(x.size)} != {int(cdf.size)})"
+        )
+    if x.size > 1 and not np.all(np.diff(x) > 0.0):
+        raise ValueError("CDF axis must be strictly increasing with no duplicates")
+    atol = float(_PLOT_CDF_ROUNDOFF_ATOL)
+    if np.any(cdf < -atol) or np.any(cdf > 1.0 + atol):
+        raise ValueError("CDF values must lie in [0, 1]")
+    if cdf.size > 1 and np.any(np.diff(cdf) < -atol):
+        raise ValueError("CDF values must be nondecreasing")
+
+    # Only accepted floating-point boundary noise is normalised.
+    cdf = np.maximum.accumulate(np.clip(cdf, 0.0, 1.0))
+    return np.asarray(x, dtype=float), np.asarray(cdf, dtype=float), str(axis_source)
+
+
+def _evaluate_plot_cdf_right_continuous(
+    x: np.ndarray,
+    cdf: np.ndarray,
+    x_ref: np.ndarray,
+) -> np.ndarray:
+    """Evaluate a validated empirical CDF on a strictly increasing support."""
+
+    x = np.asarray(x, dtype=float)
+    cdf = np.asarray(cdf, dtype=float)
+    x_ref = np.asarray(x_ref, dtype=float)
+    if (
+        x.ndim != 1
+        or cdf.ndim != 1
+        or x_ref.ndim != 1
+        or x.size == 0
+        or x.size != cdf.size
+        or x_ref.size == 0
+        or not np.all(np.isfinite(x))
+        or not np.all(np.isfinite(cdf))
+        or not np.all(np.isfinite(x_ref))
+        or (x.size > 1 and not np.all(np.diff(x) > 0.0))
+        or (x_ref.size > 1 and not np.all(np.diff(x_ref) > 0.0))
+    ):
+        raise ValueError("CDF evaluation requires finite, strictly increasing, matching arrays")
+    atol = float(_PLOT_CDF_ROUNDOFF_ATOL)
+    if np.any(cdf < -atol) or np.any(cdf > 1.0 + atol) or (
+        cdf.size > 1 and np.any(np.diff(cdf) < -atol)
+    ):
+        raise ValueError("CDF evaluation requires nondecreasing values in [0, 1]")
+
+    cdf = np.maximum.accumulate(np.clip(cdf, 0.0, 1.0))
+    indices = np.searchsorted(x, x_ref, side="right") - 1
+    out = np.zeros_like(x_ref, dtype=float)
+    valid = indices >= 0
+    out[valid] = cdf[indices[valid]]
+    out[x_ref >= x[-1]] = float(cdf[-1])
+    return out
+
+
+def _align_plot_cdf_payloads(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    xkey: str = "x",
+    allow_implicit_integer_axis: bool = False,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Align stored CDFs on their union support using step-CDF semantics."""
+
+    if not payloads:
+        raise ValueError("no CDF payloads supplied")
+    curves = [
+        _validated_plot_cdf_payload(
+            payload,
+            xkey=xkey,
+            allow_implicit_integer_axis=allow_implicit_integer_axis,
+        )
+        for payload in payloads
+    ]
+    x_ref = np.unique(np.concatenate([x for x, _cdf, _source in curves]))
+    if x_ref.size == 0 or not np.all(np.isfinite(x_ref)) or (
+        x_ref.size > 1 and not np.all(np.diff(x_ref) > 0.0)
+    ):
+        raise ValueError("could not construct a finite strictly increasing CDF union support")
+    mat = np.vstack(
+        [
+            _evaluate_plot_cdf_right_continuous(x, cdf, x_ref)
+            for x, cdf, _source in curves
+        ]
+    ).astype(float)
+    first = curves[0][0]
+    same_grid = all(
+        x.shape == first.shape
+        and np.allclose(x, first, rtol=0.0, atol=1.0e-10)
+        for x, _cdf, _source in curves
+    )
+    axis_sources = [source for _x, _cdf, source in curves]
+    return x_ref.astype(float), mat, {
+        "grid_source": "native_common_grid" if same_grid else "ensemble_union_support_grid",
+        "grid_alignment_method": "right_continuous_cdf_evaluation",
+        "axis_source": (
+            axis_sources[0]
+            if len(set(axis_sources)) == 1
+            else "mixed_explicit_and_implicit_legacy_axes"
+        ),
+    }
+
+
+def _align_sampled_plot_payloads(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    family: str,
+    xkey: str,
+    ykey: str,
+    x_ref: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Align complete g(r)/S(q) payloads on their common physical support.
+
+    Plotting deliberately keeps this dependency-light instead of importing the
+    full production-analysis stack.  It still enforces the same essential
+    contract: every box contributes a finite, increasing curve; interpolation
+    never extrapolates; and current S(q) representation metadata must be
+    present consistently and agree on estimator-defining invariants.
+    """
+
+    if not payloads:
+        raise ValueError(f"no payloads supplied for {family} curve")
+    curves: list[tuple[np.ndarray, np.ndarray]] = []
+    for idx, payload in enumerate(payloads):
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"{family} curve payload {idx} must be a mapping")
+        try:
+            x = np.asarray(payload.get(xkey, []), dtype=float)
+            y = np.asarray(payload.get(ykey, []), dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{family} curve payload {idx} must be numeric") from exc
+        if (
+            x.ndim != 1
+            or y.ndim != 1
+            or x.size < 2
+            or y.size != x.size
+            or not np.all(np.isfinite(x))
+            or not np.all(np.isfinite(y))
+            or not np.all(np.diff(x) > 0.0)
+        ):
+            raise ValueError(
+                f"{family} curve payload {idx} requires matching finite arrays "
+                "on a strictly increasing grid"
+            )
+        curves.append((x, y))
+
+    representation_status = "not_applicable"
+    if str(family) == "sq":
+        present = ["representation" in payload for payload in payloads]
+        if any(present) and not all(present):
+            raise ValueError(
+                "mixed S(q) representation metadata availability is not comparable"
+            )
+        if all(present):
+            reps: list[Mapping[str, Any]] = []
+            invariant_fields = (
+                "schema",
+                "observable",
+                "estimator",
+                "normalization",
+                "normalization_family",
+                "normalization_formula",
+                "self_term",
+                "pair",
+                "resolved_type_sets",
+                "scattering_weights",
+                "scattering_weighted",
+                "dimensionless",
+                "q_unit",
+                "r_unit",
+                "termination_window",
+                "rdf_normalization",
+                "termination_window_definition",
+                "radial_transform_kernel",
+                "radial_quadrature",
+                "r_support_requested_A",
+                "r_support_policy",
+                "n_r_bins",
+                "q_min_A^-1",
+                "q_max_A^-1",
+                "n_q_points",
+                "q_zero_semantics",
+                "frame_aggregation",
+                "density_handling",
+                "density_prefactor_unit",
+                "partial_kind",
+            )
+            for idx, payload in enumerate(payloads):
+                rep = payload.get("representation")
+                if not isinstance(rep, Mapping):
+                    raise ValueError(
+                        f"S(q) representation in payload {idx} must be a mapping"
+                    )
+                if rep.get("schema") != "vitriflow.sq_representation.v1":
+                    raise ValueError(
+                        f"S(q) representation in payload {idx} has an unsupported schema"
+                    )
+                try:
+                    json.dumps(dict(rep), sort_keys=True, allow_nan=False)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"S(q) representation in payload {idx} is not strict JSON data"
+                    ) from exc
+                try:
+                    n_q = int(rep.get("n_q_points"))
+                    n_requested = int(rep.get("n_frames_requested"))
+                    n_used = int(rep.get("n_frames_used"))
+                    support = float(rep.get("r_support_effective_A"))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"S(q) representation in payload {idx} has invalid dimensions"
+                    ) from exc
+                if (
+                    n_q != int(curves[idx][0].size)
+                    or n_requested < 1
+                    or n_requested != n_used
+                    or not (np.isfinite(support) and support > 0.0)
+                ):
+                    raise ValueError(
+                        f"S(q) representation in payload {idx} disagrees with its curve"
+                    )
+                reps.append(rep)
+            reference = reps[0]
+            optional_invariants = (
+                {"resolved_type_sets", "partial_kind"}
+                if reference.get("normalization_family") == "number_number"
+                else set()
+            )
+            required_invariants = [
+                field
+                for field in invariant_fields
+                if field not in optional_invariants
+            ]
+            for field in invariant_fields:
+                if field not in reference and field not in optional_invariants:
+                    raise ValueError(
+                        f"S(q) representation is missing invariant field {field!r}"
+                    )
+            for idx, rep in enumerate(reps[1:], start=1):
+                for field in required_invariants:
+                    if json.dumps(
+                        rep.get(field), sort_keys=True, allow_nan=False
+                    ) != json.dumps(
+                        reference.get(field), sort_keys=True, allow_nan=False
+                    ):
+                        raise ValueError(
+                            f"S(q) representation invariant {field!r} differs in payload {idx}"
+                        )
+                if int(rep.get("n_frames_used")) != int(
+                    reference.get("n_frames_used")
+                ):
+                    raise ValueError("S(q) frame counts differ across payloads")
+                supports = [
+                    float(reference.get("r_support_effective_A")),
+                    float(rep.get("r_support_effective_A")),
+                ]
+                tolerance = 128.0 * np.finfo(float).eps * max(
+                    1.0, *(abs(value) for value in supports)
+                )
+                if abs(supports[1] - supports[0]) > tolerance:
+                    raise ValueError(
+                        "S(q) effective radial support differs across payloads"
+                    )
+            representation_status = "validated"
+        else:
+            representation_status = "legacy_unavailable"
+
+    overlap_min = max(float(x[0]) for x, _y in curves)
+    overlap_max = min(float(x[-1]) for x, _y in curves)
+    if not (
+        np.isfinite(overlap_min)
+        and np.isfinite(overlap_max)
+        and overlap_max > overlap_min
+    ):
+        raise ValueError(f"{family} curve grids have no common physical support")
+
+    first = curves[0][0]
+    same_grid = all(
+        x.shape == first.shape
+        and np.allclose(x, first, rtol=0.0, atol=1.0e-10)
+        for x, _y in curves[1:]
+    )
+    if x_ref is not None:
+        common = np.asarray(x_ref, dtype=float)
+        if (
+            common.ndim != 1
+            or common.size < 2
+            or not np.all(np.isfinite(common))
+            or not np.all(np.diff(common) > 0.0)
+            or float(common[0]) < overlap_min - 1.0e-12
+            or float(common[-1]) > overlap_max + 1.0e-12
+        ):
+            raise ValueError("reference sampled-curve grid lies outside common support")
+        grid_source = "provided_ensemble_common_grid"
+    elif same_grid:
+        common = first.copy()
+        grid_source = "native_common_grid"
+    else:
+        within = [x[(x >= overlap_min) & (x <= overlap_max)] for x, _y in curves]
+        common = np.unique(
+            np.concatenate(
+                [np.asarray([overlap_min, overlap_max], dtype=float), *within]
+            )
+        )
+        common.sort()
+        grid_source = "ensemble_union_common_support_grid"
+    if common.size < 2:
+        raise ValueError(f"cannot construct a common grid for {family} curve")
+    matrix = np.vstack([np.interp(common, x, y) for x, y in curves])
+    return common, matrix, {
+        "grid_source": grid_source,
+        "grid_alignment_method": "linear_interpolation_without_extrapolation",
+        "representation_validation_status": representation_status,
+    }
 
 
 def _apply_publication_style(*, base_fontsize: float = 10.0) -> None:
@@ -206,14 +653,474 @@ def _style_and_save_figure(fig: Any, out_path: Path, *, dpi: int, close: bool = 
 
 
 def _units_from_results(data: dict[str, Any]) -> tuple[str, Optional[float]]:
+    if not isinstance(data, Mapping):
+        raise ValueError("results root must be a mapping")
     u = data.get("units", {}) or {}
-    units_style = str(u.get("lammps_units", "") or "").strip().lower()
-    time_unit_ps = u.get("time_unit_ps", None)
+    params = data.get("parameters", {}) or {}
+    plan = data.get("production_plan", {}) or {}
+    u = u if isinstance(u, Mapping) else {}
+    params = params if isinstance(params, Mapping) else {}
+    plan = plan if isinstance(plan, Mapping) else {}
+
+    unit_claims = {
+        str(value).strip().lower()
+        for value in (u.get("lammps_units"), params.get("lammps_units"))
+        if value is not None and str(value).strip()
+    }
+    potential = plan.get("potential_config", {})
+    if isinstance(potential, Mapping):
+        claim = str(potential.get("user_units", "") or "").strip().lower()
+        if claim:
+            unit_claims.add(claim)
+    if len(unit_claims) > 1:
+        raise ValueError(
+            f"results contain conflicting LAMMPS unit metadata: {sorted(unit_claims)}"
+        )
+    units_style = next(iter(unit_claims), "")
+
+    time_claims: list[float] = []
+    for value in (
+        u.get("time_unit_ps"),
+        params.get("time_unit_ps"),
+        plan.get("time_unit_ps"),
+    ):
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("results time_unit_ps must be numeric") from exc
+        if not (np.isfinite(parsed) and parsed > 0.0):
+            raise ValueError("results time_unit_ps must be finite and > 0")
+        time_claims.append(parsed)
+    if time_claims and any(
+        not np.isclose(value, time_claims[0], rtol=1.0e-12, atol=0.0)
+        for value in time_claims[1:]
+    ):
+        raise ValueError("results contain conflicting time_unit_ps metadata")
+    return units_style, (time_claims[0] if time_claims else None)
+
+
+def _rate_scan_coordinates(
+    results: Sequence[Mapping[str, Any]],
+    *,
+    time_unit_ps: Optional[float],
+) -> tuple[np.ndarray, str]:
+    """Return a complete, dimensionally consistent rate-scan coordinate.
+
+    Current results store the native cooling rate as ``rate`` and its explicit
+    canonical conversion as ``rate_K_per_ps``.  ``rate_K_per_time`` is accepted
+    only as a read-only legacy alias.  A mixture that cannot be placed on one
+    common axis is rejected rather than rendered as a blank or partly missing
+    plot.
+    """
+
+    rows = list(results)
+    if not rows:
+        raise ValueError("rate_scan contains no rate rows")
+
+    scale = _maybe_float(time_unit_ps)
+    has_scale = bool(np.isfinite(scale) and scale > 0.0)
+    native: list[float] = []
+    per_ps: list[float] = []
+
+    for idx, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"rate_scan row {idx} is not a mapping")
+
+        rate_current = _maybe_float(row.get("rate"))
+        rate_legacy = _maybe_float(row.get("rate_K_per_time"))
+        if np.isfinite(rate_current) and np.isfinite(rate_legacy) and not np.isclose(
+            rate_current,
+            rate_legacy,
+            rtol=1.0e-12,
+            atol=0.0,
+        ):
+            raise ValueError(
+                f"rate_scan row {idx} has conflicting 'rate' and legacy "
+                "'rate_K_per_time' values"
+            )
+        rate_native = rate_current if np.isfinite(rate_current) else rate_legacy
+        rate_ps = _maybe_float(row.get("rate_K_per_ps"))
+
+        if np.isfinite(rate_native) and rate_native <= 0.0:
+            raise ValueError(f"rate_scan row {idx} has a non-positive native rate")
+        if np.isfinite(rate_ps) and rate_ps <= 0.0:
+            raise ValueError(f"rate_scan row {idx} has a non-positive rate_K_per_ps")
+
+        if np.isfinite(rate_native) and np.isfinite(rate_ps) and has_scale:
+            expected_ps = float(rate_native) / float(scale)
+            if not np.isclose(rate_ps, expected_ps, rtol=1.0e-10, atol=0.0):
+                raise ValueError(
+                    f"rate_scan row {idx} has inconsistent native and K/ps rates: "
+                    f"{rate_native:g} / {scale:g} != {rate_ps:g}"
+                )
+
+        if not np.isfinite(rate_ps) and np.isfinite(rate_native) and has_scale:
+            rate_ps = float(rate_native) / float(scale)
+        if not np.isfinite(rate_native) and np.isfinite(rate_ps) and has_scale:
+            rate_native = float(rate_ps) * float(scale)
+
+        native.append(float(rate_native))
+        per_ps.append(float(rate_ps))
+
+    per_ps_arr = np.asarray(per_ps, dtype=float)
+    native_arr = np.asarray(native, dtype=float)
+    if np.all(np.isfinite(per_ps_arr)):
+        return per_ps_arr, "cooling rate (K/ps)"
+    if np.all(np.isfinite(native_arr)):
+        return native_arr, "cooling rate (K / time unit)"
+    raise ValueError(
+        "rate_scan rows do not provide one complete rate coordinate; expected "
+        "rate_K_per_ps or rate/rate_K_per_time with units.time_unit_ps"
+    )
+
+
+def _require_finite_plot_points(x: Any, y: Any, *, context: str) -> None:
+    """Reject successful-but-empty public plots."""
+
     try:
-        time_unit_ps_f = float(time_unit_ps) if time_unit_ps is not None else None
+        xa = np.asarray(x, dtype=float)
+        ya = np.asarray(y, dtype=float)
+    except Exception as exc:
+        raise ValueError(f"{context} plot data must be numeric") from exc
+    if xa.ndim != 1 or ya.ndim != 1 or xa.size != ya.size:
+        raise ValueError(
+            f"{context} plot coordinate/value arrays must be one-dimensional and equal length"
+        )
+    if xa.size == 0 or not np.any(np.isfinite(xa) & np.isfinite(ya)):
+        raise ValueError(f"{context} contains no finite coordinate/value pairs")
+
+
+def _strict_optional_bool(value: Any) -> Optional[bool]:
+    return value if type(value) is bool else None
+
+
+def _production_convergence_display(
+    production: Mapping[str, Any],
+    convergence: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Interpret convergence without coercing null/unassessed states to failure.
+
+    The returned label deliberately distinguishes a terminal fixed-count
+    diagnostic from a stopping decision and carries the inference-validity
+    qualification emitted by the convergence engine.
+    """
+
+    prod = production if isinstance(production, Mapping) else {}
+    conv_raw = convergence if convergence is not None else prod.get("convergence", {})
+    conv = conv_raw if isinstance(conv_raw, Mapping) else {}
+
+    check_enabled = _strict_optional_bool(prod.get("check_convergence"))
+    assessment_role = str(
+        conv.get("assessment_role", prod.get("assessment_role", "")) or ""
+    ).strip().lower()
+    sampling_design = str(
+        conv.get("sampling_design", prod.get("sampling_design", "")) or ""
+    ).strip().lower()
+    status = str(
+        conv.get("status", prod.get("convergence_status", "")) or ""
+    ).strip().lower()
+    inference_status = str(
+        prod.get(
+            "convergence_inference_status",
+            conv.get("convergence_inference_status", conv.get("sequential_inference_status", "")),
+        )
+        or ""
+    ).strip().lower()
+    contract = conv.get("inference_contract", {})
+    contract = contract if isinstance(contract, Mapping) else {}
+    sequentially_valid = _strict_optional_bool(
+        contract.get("sequentially_valid", conv.get("sequentially_valid"))
+    )
+
+    posthoc = bool(
+        assessment_role == "terminal_posthoc_diagnostic"
+        or sampling_design == "fixed_n"
+        or status.startswith("fixed_n_terminal_posthoc")
+    )
+    if posthoc:
+        criterion = _strict_optional_bool(conv.get("posthoc_criterion_met"))
+        if criterion is None:
+            criterion = _strict_optional_bool(
+                prod.get("posthoc_convergence_criterion_met")
+            )
+        if criterion is True:
+            label = "terminal post-hoc criterion met; not a stopping result"
+            state = "posthoc_criterion_met"
+        elif criterion is False:
+            label = "terminal post-hoc criterion not met; not a stopping result"
+            state = "posthoc_criterion_not_met"
+        else:
+            label = "terminal post-hoc convergence unassessed; not a stopping result"
+            state = "unassessed"
+        return {
+            "state": state,
+            "label": label,
+            "criterion_met": criterion,
+            "sequentially_valid": False,
+            "inference_status": inference_status or "not_sequentially_valid",
+        }
+
+    overall = conv.get("convergence_degree", {})
+    overall = overall.get("overall", {}) if isinstance(overall, Mapping) else {}
+    overall_assessed = (
+        _strict_optional_bool(overall.get("assessed"))
+        if isinstance(overall, Mapping)
+        else None
+    )
+    assessment_performed = _strict_optional_bool(conv.get("assessment_performed"))
+    report_has_assessment_evidence = bool(
+        isinstance(conv.get("familywise"), Mapping)
+        and (
+            bool(conv.get("scalars"))
+            or bool(conv.get("distributions"))
+            or isinstance(conv.get("convergence_degree"), Mapping)
+        )
+    )
+    explicit_unassessed = bool(
+        status in {"skipped", "not_evaluated", "not_yet_assessed", "unassessed"}
+        or status.endswith("_unassessed")
+        or inference_status in {"not_yet_assessed", "fixed_count_unassessed"}
+        or overall_assessed is False
+        or assessment_performed is False
+        or (status == "" and not report_has_assessment_evidence)
+    )
+    if check_enabled is False:
+        explicit_unassessed = True
+
+    criterion = _strict_optional_bool(prod.get("converged"))
+    if criterion is None:
+        criterion = _strict_optional_bool(conv.get("converged"))
+    if criterion is None and status == "converged":
+        criterion = True
+    if criterion is None and status == "not_converged":
+        criterion = False
+
+    if explicit_unassessed or criterion is None:
+        reason = (
+            "convergence checking disabled"
+            if check_enabled is False
+            else "no assessed convergence decision"
+        )
+        return {
+            "state": "unassessed",
+            "label": f"convergence unassessed; {reason}",
+            "criterion_met": None,
+            "sequentially_valid": sequentially_valid,
+            "inference_status": inference_status or "not_assessed",
+        }
+
+    repeated_looks_invalid = bool(
+        sequentially_valid is False
+        or "not_sequentially_valid" in inference_status
+        or "repeated_looks" in inference_status
+    )
+    if repeated_looks_invalid:
+        qualification = "repeated-look inference is not sequentially valid"
+    elif sequentially_valid is True:
+        qualification = "sequential inference declared valid"
+    else:
+        qualification = "inference validity not declared"
+    return {
+        "state": "criterion_met" if criterion else "criterion_not_met",
+        "label": f"criterion {'met' if criterion else 'not met'}; {qualification}",
+        "criterion_met": criterion,
+        "sequentially_valid": sequentially_valid,
+        "inference_status": inference_status or "not_declared",
+    }
+
+
+def _familywise_error_annotation(
+    familywise: Mapping[str, Any],
+    *,
+    alpha_per_test: float,
+    bounded_ci_method: str,
+) -> str:
+    """Build a statistically unambiguous familywise-error annotation."""
+
+    fw = familywise if isinstance(familywise, Mapping) else {}
+    alpha_family = _maybe_float(fw.get("alpha_family"))
+    m_tests_raw = fw.get("m_tests", 0)
+    try:
+        m_tests = int(m_tests_raw)
     except Exception:
-        time_unit_ps_f = None
-    return units_style, time_unit_ps_f
+        m_tests = 0
+    if np.isfinite(alpha_family) and 0.0 < alpha_family < 1.0:
+        family_confidence = 1.0 - float(alpha_family)
+        fwer = (
+            f"FWER alpha={alpha_family:.3g} "
+            f"(family confidence={family_confidence:.3f})"
+        )
+    else:
+        fwer = "FWER alpha=not declared"
+    return (
+        f"{fwer}  M={m_tests}  alpha_test={float(alpha_per_test):.2e}  "
+        f"bounded_CI={bounded_ci_method}"
+    )
+
+
+def _coordination_sweep_matrices(
+    boxes: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Collect complete coordination-cutoff sensitivity curves by metric name."""
+
+    rows = list(boxes)
+    names: set[str] = set()
+    for box in rows:
+        details = box.get("coordination_defect_details", {})
+        if not isinstance(details, Mapping):
+            continue
+        for name, detail in details.items():
+            if isinstance(detail, Mapping) and isinstance(
+                detail.get("coordination_sweep"), Mapping
+            ):
+                names.add(str(name))
+
+    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name in sorted(names):
+        x_ref: Optional[np.ndarray] = None
+        curves: list[np.ndarray] = []
+        for box_idx, box in enumerate(rows):
+            details = box.get("coordination_defect_details", {})
+            detail = details.get(name, {}) if isinstance(details, Mapping) else {}
+            sweep = (
+                detail.get("coordination_sweep", {})
+                if isinstance(detail, Mapping)
+                else {}
+            )
+            if not isinstance(sweep, Mapping):
+                raise ValueError(
+                    f"coordination sweep {name!r} is missing for box index {box_idx}"
+                )
+            x = np.asarray(sweep.get("delta_r", []), dtype=float)
+            y = np.asarray(sweep.get("defect_fraction", []), dtype=float)
+            _require_finite_plot_points(
+                x,
+                y,
+                context=f"coordination sweep {name!r} box index {box_idx}",
+            )
+            if x.size > 1 and not np.all(np.diff(x) > 0.0):
+                raise ValueError(
+                    f"coordination sweep {name!r} delta_r grid is not strictly increasing"
+                )
+            if x_ref is None:
+                x_ref = x
+            elif x.shape != x_ref.shape or not np.allclose(
+                x,
+                x_ref,
+                rtol=0.0,
+                atol=1.0e-12,
+            ):
+                raise ValueError(
+                    f"coordination sweep {name!r} uses inconsistent grids across boxes"
+                )
+            curves.append(y)
+        if x_ref is not None and len(curves) == len(rows) and curves:
+            out[name] = (x_ref, np.vstack(curves))
+    return out
+
+
+def _uses_canonical_report_units(data: Mapping[str, Any]) -> bool:
+    """Whether reported physical observables use engine-neutral units.
+
+    Releases before the canonical reporting contract stored several scan
+    quantities in the active LAMMPS units.  Keep that legacy plotting path for
+    old files, while new files and standalone analysis results are always
+    interpreted in their declared physical units.
+    """
+
+    units_raw = data.get("units", {}) if isinstance(data, Mapping) else {}
+    units = units_raw if isinstance(units_raw, Mapping) else {}
+    contract = str(units.get("reporting_contract", "") or "").strip().lower()
+    if contract.startswith("vitriflow.canonical_physical_units."):
+        return True
+    schema = str(data.get("schema", "") or "").strip().lower()
+    return schema.startswith("vitriflow.analysis_results.v2")
+
+
+def _stage_plot_metadata(
+    stage_dir: Path,
+    *,
+    results_json: Optional[Path],
+) -> dict[str, Any]:
+    """Resolve stage plotting units with stage-local provenance as authority."""
+
+    from .io.stage_manifest import (
+        STAGE_ARTIFACT_MANIFEST_NAME,
+        load_stage_artifact_manifest,
+    )
+
+    manifest_path = Path(stage_dir) / STAGE_ARTIFACT_MANIFEST_NAME
+    if manifest_path.exists():
+        # A present but malformed manifest must not be silently ignored: that
+        # could label native or modified CSV values as canonical physical data.
+        manifest = load_stage_artifact_manifest(manifest_path)
+        native = manifest.get("native_source_units", {}) or {}
+        units_style = (
+            str(native.get("lammps_units_style", "") or "").strip().lower()
+            if isinstance(native, Mapping)
+            else ""
+        )
+        return {
+            "dt": float(manifest["timestep_ps"]),
+            "units_style": units_style,
+            "time_unit_ps": 1.0,
+            "canonical_units": True,
+            "manifest": manifest,
+            "source": "stage_manifest",
+        }
+
+    dt = None
+    units_style = ""
+    time_unit_ps = None
+    canonical_units = False
+    if results_json is not None:
+        result_path = Path(results_json).resolve()
+        stage_resolved = Path(stage_dir).resolve()
+        if not stage_resolved.is_relative_to(result_path.parent):
+            raise ValueError(
+                "plot-stage --dir must be inside the output directory bound to --results"
+            )
+        try:
+            data = json.loads(result_path.read_text())
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise ValueError(f"Invalid results JSON for plot-stage: {result_path}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("plot-stage results JSON root must be an object")
+        dt = _infer_dt_from_results(data)
+        units_style, time_unit_ps = _units_from_results(data)
+        canonical_units = _uses_canonical_report_units(data)
+    return {
+        "dt": dt,
+        "units_style": units_style,
+        "time_unit_ps": time_unit_ps,
+        "canonical_units": canonical_units,
+        "manifest": None,
+        "source": "results_json" if results_json is not None else "legacy",
+    }
+
+
+def _verify_stage_plot_artifact(
+    *,
+    stage_dir: Path,
+    manifest: Mapping[str, Any],
+    artifact_key: str,
+    expected_name: str,
+) -> bool:
+    from .io.stage_manifest import verify_manifest_artifact
+
+    records = manifest.get("artifacts", {})
+    record = records.get(artifact_key) if isinstance(records, Mapping) else None
+    if not isinstance(record, Mapping) or str(record.get("path", "")) != expected_name:
+        raise ValueError(
+            f"Stage manifest {artifact_key!r} does not identify expected file {expected_name!r}"
+        )
+    return verify_manifest_artifact(
+        stage_dir=stage_dir,
+        manifest=manifest,
+        artifact_key=artifact_key,
+    )
 
 
 def _diffusion_for_plot(
@@ -236,51 +1143,148 @@ def _diffusion_for_plot(
 
 
 def _infer_dt_from_results(data: dict[str, Any]) -> Optional[float]:
-    # timestep actually recommended
-    cand = None
-    try:
-        cand = (data.get("recommendation", {}) or {}).get("md", {})
-        cand = (cand or {}).get("timestep", None)
-    except Exception:
-        cand = None
-    if cand is None:
+    # Use the selected/replayed timestep, checking redundant claims rather
+    # than silently preferring whichever field happens to be inspected first.
+    recommendation = data.get("recommendation", {}) or {}
+    preflight = data.get("preflight", {}) or {}
+    plan = data.get("production_plan", {}) or {}
+    parameters = data.get("parameters", {}) or {}
+    recommendation = recommendation if isinstance(recommendation, Mapping) else {}
+    preflight = preflight if isinstance(preflight, Mapping) else {}
+    plan = plan if isinstance(plan, Mapping) else {}
+    parameters = parameters if isinstance(parameters, Mapping) else {}
+    rec_md = recommendation.get("md", {}) or {}
+    plan_md = plan.get("md_use", {}) or {}
+    param_md = parameters.get("md", {}) or {}
+    rec_md = rec_md if isinstance(rec_md, Mapping) else {}
+    plan_md = plan_md if isinstance(plan_md, Mapping) else {}
+    param_md = param_md if isinstance(param_md, Mapping) else {}
+
+    claims: list[float] = []
+    for value in (
+        rec_md.get("timestep"),
+        preflight.get("selected_timestep"),
+        plan_md.get("timestep"),
+        param_md.get("timestep"),
+    ):
+        if value is None:
+            continue
         try:
-            cand = (data.get("preflight", {}) or {}).get("selected_timestep", None)
-        except Exception:
-            cand = None
-    try:
-        if cand is None:
-            return None
-        dt = float(cand)
-        if not np.isfinite(dt) or dt <= 0.0:
-            return None
-        return dt
-    except Exception:
-        return None
+            dt = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("results timestep metadata must be numeric") from exc
+        if not (np.isfinite(dt) and dt > 0.0):
+            raise ValueError("results timestep metadata must be finite and > 0")
+        claims.append(dt)
+    if claims and any(
+        not np.isclose(value, claims[0], rtol=1.0e-12, atol=0.0)
+        for value in claims[1:]
+    ):
+        raise ValueError("results contain conflicting selected timestep metadata")
+    return claims[0] if claims else None
 
 
-def _thermo_unit_label(col: str, units_style: str) -> str:
+def _thermo_unit_label(col: str, units_style: str, *, canonical: bool = False) -> str:
     c = str(col)
     lc = c.strip().lower()
+    pressure_columns = {"press", "pressure", "pxx", "pyy", "pzz", "pxy", "pxz", "pyz"}
+    length_columns = {"lx", "ly", "lz", "xlo", "xhi", "ylo", "yhi", "zlo", "zhi"}
+    energy_columns = {
+        "pe", "ke", "etotal", "poteng", "kineng", "toteng", "enthalpy",
+        "e_pair", "e_mol", "e_vdwl", "e_coul", "e_long", "e_bond",
+        "e_angle", "e_dihed", "e_impro", "e_tail", "etot",
+    }
     if lc in ("temp", "t"):
         return "K"
-    if lc in ("density",):
-        if units_style in ("metal", "real", "electron"):
+    if canonical:
+        if lc == "time":
+            return "ps"
+        if lc in ("density",):
             return "g/cm³"
-    if lc in ("press", "pressure"):
-        if units_style == "metal":
-            return "bar"
-        if units_style == "real":
-            return "atm"
-    if lc in ("vol", "volume"):
-        if units_style in ("metal", "real", "electron"):
+        if lc in pressure_columns:
+            return "GPa"
+        if lc in ("vol", "volume"):
             return "Å³"
-    if lc.endswith("eng") or lc.endswith("energy") or lc in ("pe", "ke", "etotal", "poteng", "toteng"):
-        if units_style == "metal":
+        if lc in length_columns:
+            return "Å"
+        if lc.endswith("eng") or lc.endswith("energy") or lc in energy_columns:
             return "eV"
-        if units_style == "real":
-            return "kcal/mol"
+    native_units = {
+        "metal": {
+            "length": "Å", "volume": "Å³", "density": "g/cm³",
+            "pressure": "bar", "energy": "eV", "time": "ps", "msd": "Å²",
+        },
+        "real": {
+            "length": "Å", "volume": "Å³", "density": "g/cm³",
+            "pressure": "atm", "energy": "kcal/mol", "time": "fs", "msd": "Å²",
+        },
+        "electron": {
+            "length": "bohr", "volume": "bohr³", "density": "amu/bohr³",
+            "pressure": "Pa", "energy": "hartree", "time": "fs", "msd": "bohr²",
+        },
+        "nano": {
+            "length": "nm", "volume": "nm³", "density": "ag/nm³",
+            "pressure": "ag/(nm·ns²)", "energy": "ag·nm²/ns²", "time": "ns", "msd": "nm²",
+        },
+        "si": {
+            "length": "m", "volume": "m³", "density": "kg/m³",
+            "pressure": "Pa", "energy": "J", "time": "s", "msd": "m²",
+        },
+        "cgs": {
+            "length": "cm", "volume": "cm³", "density": "g/cm³",
+            "pressure": "dyne/cm²", "energy": "erg", "time": "s", "msd": "cm²",
+        },
+        "micro": {
+            "length": "µm", "volume": "µm³", "density": "pg/µm³",
+            "pressure": "pg/(µm·µs²)", "energy": "pg·µm²/µs²", "time": "µs", "msd": "µm²",
+        },
+    }.get(str(units_style or "").strip().lower(), {})
+    if lc == "time":
+        return native_units.get("time", "")
+    if lc == "density":
+        return native_units.get("density", "")
+    if lc in pressure_columns:
+        return native_units.get("pressure", "")
+    if lc in {"vol", "volume"}:
+        return native_units.get("volume", "")
+    if lc in length_columns:
+        return native_units.get("length", "")
+    if lc.endswith("eng") or lc.endswith("energy") or lc in energy_columns:
+        return native_units.get("energy", "")
     return ""
+
+
+def _native_length_unit_label(units_style: str) -> str:
+    return {
+        "metal": "Å", "real": "Å", "electron": "bohr", "nano": "nm",
+        "si": "m", "cgs": "cm", "micro": "µm",
+    }.get(str(units_style or "").strip().lower(), "")
+
+
+def _native_msd_unit_label(units_style: str) -> str:
+    return {
+        "metal": "Å²", "real": "Å²", "electron": "bohr²", "nano": "nm²",
+        "si": "m²", "cgs": "cm²", "micro": "µm²",
+    }.get(str(units_style or "").strip().lower(), "")
+
+
+def _legacy_diffusion_plot_scale(
+    *, units_style: str, time_unit_ps: Optional[float]
+) -> tuple[float, str]:
+    """Return native D -> A^2/ps scaling when legacy units are declared."""
+
+    if time_unit_ps is None:
+        return 1.0, "D (length²/time)"
+    try:
+        time_scale = float(time_unit_ps)
+        if not np.isfinite(time_scale) or time_scale <= 0.0:
+            return 1.0, "D (length²/time)"
+        from .lammps_units import length_to_angstrom_factor
+
+        length_scale = float(length_to_angstrom_factor(units_style))
+    except (TypeError, ValueError):
+        return 1.0, "D (length²/time)"
+    return (length_scale * length_scale) / time_scale, "D (Å²/ps)"
 
 
 def _time_axis(
@@ -313,6 +1317,7 @@ def plot_stage_timeseries(
 ) -> None:
     """Stage timeseries."""
 
+    dpi = _require_positive_integer(dpi, context="dpi")
     stage_dir = Path(stage_dir)
     out_path = Path(out_path)
 
@@ -323,25 +1328,25 @@ def plot_stage_timeseries(
 
     _apply_publication_style()
 
-    # metadata
-    dt = None
-    units_style = ""
-    time_unit_ps = None
-    if results_json is not None:
-        try:
-            data = json.loads(Path(results_json).read_text())
-            dt = _infer_dt_from_results(data)
-            units_style, time_unit_ps = _units_from_results(data)
-        except Exception:
-            dt = None
-            units_style = ""
-            time_unit_ps = None
+    metadata = _stage_plot_metadata(stage_dir, results_json=results_json)
+    dt = metadata["dt"]
+    units_style = str(metadata["units_style"])
+    time_unit_ps = metadata["time_unit_ps"]
+    canonical_units = bool(metadata["canonical_units"])
+    manifest = metadata["manifest"]
 
     from .io.thermo import parse_thermo_csv, parse_msd_csv
 
     thermo_path = stage_dir / "thermo.csv"
     if not thermo_path.exists():
         raise FileNotFoundError(f"Missing thermo.csv in stage directory: {stage_dir}")
+    if isinstance(manifest, Mapping) and not _verify_stage_plot_artifact(
+        stage_dir=stage_dir,
+        manifest=manifest,
+        artifact_key="thermo_csv",
+        expected_name=thermo_path.name,
+    ):
+        raise ValueError(f"Stage manifest declares thermo.csv unavailable: {stage_dir}")
     table = parse_thermo_csv(thermo_path)
     cols = list(table.columns)
     arr = table.as_dict()
@@ -366,7 +1371,15 @@ def plot_stage_timeseries(
     msd_x = None
     msd_y = None
     msd_path = stage_dir / "msd.csv"
-    if include_msd and msd_path.exists():
+    msd_available = msd_path.exists()
+    if include_msd and isinstance(manifest, Mapping):
+        msd_available = _verify_stage_plot_artifact(
+            stage_dir=stage_dir,
+            manifest=manifest,
+            artifact_key="msd_csv",
+            expected_name=msd_path.name,
+        )
+    if include_msd and msd_available:
         try:
             ms_step, msd = parse_msd_csv(msd_path)
             if xaxis == "time":
@@ -374,13 +1387,31 @@ def plot_stage_timeseries(
             else:
                 msd_x = ms_step
             msd_y = msd
-        except Exception:
+        except Exception as exc:
+            if isinstance(manifest, Mapping):
+                # The manifest has asserted that this exact, identity-bound
+                # artifact is available and canonical.  A strict parse failure
+                # is therefore an integrity error, not an optional missing
+                # panel that may be silently dropped.
+                raise ValueError(
+                    f"Manifest-bound MSD artifact failed strict parsing: {msd_path}"
+                ) from exc
+            # Explicit legacy path: pre-manifest MSD was optional and malformed
+            # files were historically omitted from the plot.
             msd_x = None
             msd_y = None
 
     n_panels = int(len(thermo_cols)) + (1 if (msd_x is not None and msd_y is not None) else 0)
     if n_panels < 1:
         raise ValueError("No plottable series found (thermo columns missing and/or MSD unavailable).")
+    for column in thermo_cols:
+        _require_finite_plot_points(
+            x,
+            np.asarray(arr.get(column, np.full_like(x, np.nan)), dtype=float),
+            context=f"stage thermo series {column!r}",
+        )
+    if msd_x is not None and msd_y is not None:
+        _require_finite_plot_points(msd_x, msd_y, context="stage MSD series")
 
     fig_h = max(2.0, 1.8 * float(n_panels))
     fig, axes = plt.subplots(n_panels, 1, figsize=(6.5, fig_h), sharex=True)
@@ -392,7 +1423,7 @@ def plot_stage_timeseries(
         y = np.asarray(arr.get(c, np.full_like(x, np.nan)), dtype=float)
         ax = axes[k]
         ax.plot(x, y)
-        unit = _thermo_unit_label(c, units_style)
+        unit = _thermo_unit_label(c, units_style, canonical=canonical_units)
         ylabel = f"{c} ({unit})" if unit else str(c)
         ax.set_ylabel(ylabel)
         k += 1
@@ -400,7 +1431,8 @@ def plot_stage_timeseries(
     if msd_x is not None and msd_y is not None:
         ax = axes[k]
         ax.plot(msd_x, msd_y)
-        ax.set_ylabel("MSD")
+        msd_unit = "Å²" if canonical_units else _native_msd_unit_label(units_style)
+        ax.set_ylabel(f"MSD ({msd_unit})" if msd_unit else "MSD")
         # msd useful linear
 
     axes[-1].set_xlabel(xlabel)
@@ -424,9 +1456,12 @@ def plot_scan_metric(
 ) -> None:
     """Scan metric."""
 
+    dpi = _require_positive_integer(dpi, context="dpi")
     json_path = Path(json_path)
     out_path = Path(out_path)
     data = json.loads(json_path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("Scan plotting input must be a JSON object")
 
     import matplotlib
 
@@ -436,6 +1471,7 @@ def plot_scan_metric(
     _apply_publication_style()
 
     units_style, time_unit_ps = _units_from_results(data)
+    canonical_units = _uses_canonical_report_units(data)
 
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
 
@@ -451,10 +1487,14 @@ def plot_scan_metric(
         # metric aggregated arrays
         if mkey.lower() in ("d", "diffusion"):
             D_scale = 1.0
-            ylab = "Diffusion coefficient"
-            if units_style in ("metal", "real", "electron") and time_unit_ps is not None:
-                D_scale = 1.0 / float(time_unit_ps)
-                ylab = "Diffusion coefficient (Å²/ps)"
+            ylab = "Diffusion coefficient (Å²/ps)" if canonical_units else "Diffusion coefficient"
+            if not canonical_units:
+                D_scale, legacy_label = _legacy_diffusion_plot_scale(
+                    units_style=units_style,
+                    time_unit_ps=time_unit_ps,
+                )
+                if legacy_label == "D (Å²/ps)":
+                    ylab = "Diffusion coefficient (Å²/ps)"
             y = _diffusion_for_plot(np.asarray(agg["D"], dtype=float), scale=D_scale, zero_below=0.1)
             lo = _diffusion_for_plot(np.asarray(agg["D_lo"], dtype=float), scale=D_scale, zero_below=0.1)
             hi = _diffusion_for_plot(np.asarray(agg["D_hi"], dtype=float), scale=D_scale, zero_below=0.1)
@@ -463,18 +1503,22 @@ def plot_scan_metric(
             y = np.asarray(agg["rho"], dtype=float)
             lo = np.asarray(agg["rho_lo"], dtype=float)
             hi = np.asarray(agg["rho_hi"], dtype=float)
-            ylab = f"Density ({'g/cm³' if units_style in ('metal','real','electron') else 'units'})"
+            density_unit = (
+                "g/cm³" if canonical_units else _thermo_unit_label("Density", units_style)
+            ) or "units"
+            ylab = f"Density ({density_unit})"
         elif mkey.lower() in ("pe", "poteng", "potential_energy"):
             y = np.asarray(agg["pe"], dtype=float)
             lo = np.asarray(agg["pe_lo"], dtype=float)
             hi = np.asarray(agg["pe_hi"], dtype=float)
-            unit = _thermo_unit_label("PotEng", units_style)
+            unit = _thermo_unit_label("PotEng", units_style, canonical=canonical_units)
             ylab = f"Potential energy ({unit})" if unit else "Potential energy"
         elif mkey.lower() in ("msd_rms", "msdrms", "rms"):
             y = np.asarray(agg["msdrms"], dtype=float)
             lo = np.asarray(agg["msdrms_lo"], dtype=float)
             hi = np.asarray(agg["msdrms_hi"], dtype=float)
-            ylab = "RMS displacement"
+            rms_unit = "Å" if canonical_units else _native_length_unit_label(units_style)
+            ylab = f"RMS displacement ({rms_unit})" if rms_unit else "RMS displacement"
         elif mkey.lower() in ("gr_peak_height", "peak_height"):
             y = np.asarray(agg["gH"], dtype=float)
             lo = np.asarray(agg["gH_lo"], dtype=float)
@@ -484,13 +1528,15 @@ def plot_scan_metric(
             y = np.asarray(agg["gW"], dtype=float)
             lo = np.asarray(agg["gW_lo"], dtype=float)
             hi = np.asarray(agg["gW_hi"], dtype=float)
-            ylab = "g(r) first-peak FWHM"
+            width_unit = "Å" if canonical_units else _native_length_unit_label(units_style)
+            ylab = f"g(r) first-peak FWHM ({width_unit})" if width_unit else "g(r) first-peak FWHM"
         else:
             raise ValueError(
                 f"Unsupported tm_scan metric '{mkey}'. "
                 "Use one of: D, density, pe, msd_rms, gr_peak_height, gr_peak_fwhm."
             )
 
+        _require_finite_plot_points(x, y, context=f"tm_scan metric {mkey!r}")
         _plot_mean_band(ax, x, y, lo, hi, label=None, show_band=True)
         if show_replicates and outcomes:
             # overlay replica points
@@ -537,11 +1583,10 @@ def plot_scan_metric(
 
         # x axis
         if st == "rate_scan":
-            x = np.asarray([float(r.get("rate_K_per_time", float("nan"))) for r in results], dtype=float)
-            xlabel = "cooling rate (K / time unit)"
-            if time_unit_ps is not None and np.isfinite(float(time_unit_ps)):
-                xlabel = "cooling rate (K/ps)"
-                x = x / float(time_unit_ps)
+            x, xlabel = _rate_scan_coordinates(
+                results,
+                time_unit_ps=time_unit_ps,
+            )
         else:
             # prefer present multiplier
             x = np.asarray([float(r.get("n_atoms", r.get("multiplier", float("nan")))) for r in results], dtype=float)
@@ -551,13 +1596,16 @@ def plot_scan_metric(
         if mkey.lower() in ("density", "rho"):
             y = np.asarray([float(r.get("density_mean", float("nan"))) for r in results], dtype=float)
             se = np.asarray([float(r.get("density_stderr", float("nan"))) for r in results], dtype=float)
-            unit = "g/cm³" if units_style in ("metal", "real", "electron") else "units"
+            unit = (
+                "g/cm³" if canonical_units else _thermo_unit_label("Density", units_style)
+            ) or "units"
             ylab = f"Density ({unit})"
         else:
             y = np.asarray([float((r.get("metrics_mean", {}) or {}).get(mkey, float("nan"))) for r in results], dtype=float)
             se = np.asarray([float((r.get("metrics_stderr", {}) or {}).get(mkey, float("nan"))) for r in results], dtype=float)
             ylab = str(mkey)
 
+        _require_finite_plot_points(x, y, context=f"{key} metric {mkey!r}")
         lo = y - se
         hi = y + se
         _plot_mean_band(ax, x, y, lo, hi, label=None, show_band=True)
@@ -565,12 +1613,10 @@ def plot_scan_metric(
         if show_replicates:
             xs = []
             ys = []
-            for r in results:
-                xv = float(r.get("rate_K_per_time", float("nan"))) if st == "rate_scan" else float(r.get("n_atoms", r.get("multiplier", float("nan"))))
+            for row_idx, r in enumerate(results):
+                xv = float(x[row_idx]) if st == "rate_scan" else float(r.get("n_atoms", r.get("multiplier", float("nan"))))
                 if not np.isfinite(xv):
                     continue
-                if st == "rate_scan" and time_unit_ps is not None and np.isfinite(float(time_unit_ps)):
-                    xv = xv / float(time_unit_ps)
                 reps = list(r.get("replicates", []) or [])
                 for re in reps:
                     if mkey.lower() in ("density", "rho"):
@@ -615,10 +1661,17 @@ def plot_scan_metric(
             if vv.size >= 2:
                 se[i] = float(np.std(vv, ddof=1) / np.sqrt(float(vv.size)))
 
+        _require_finite_plot_points(
+            n_grid,
+            mu,
+            context=f"production metric {mkey!r}",
+        )
         _plot_mean_band(ax, n_grid, mu, mu - se, mu + se, label=None, show_band=True)
         ax.set_xlabel("number of boxes")
         if mkey.lower() in ("density", "rho"):
-            unit = "g/cm³" if units_style in ("metal", "real", "electron") else "units"
+            unit = (
+                "g/cm³" if canonical_units else _thermo_unit_label("Density", units_style)
+            ) or "units"
             ax.set_ylabel(f"Density ({unit})")
         else:
             ax.set_ylabel(str(mkey))
@@ -721,12 +1774,24 @@ def _aggregate_outcomes_by_T(outcomes: list[dict[str, Any]], *, spread: SpreadMo
     def _nanarr() -> np.ndarray:
         return np.full_like(Ts, np.nan)
 
-    D = _nanarr(); Dlo = _nanarr(); Dhi = _nanarr()
-    rho = _nanarr(); rholo = _nanarr(); rhohi = _nanarr()
-    pe = _nanarr(); pelo = _nanarr(); pehi = _nanarr()
-    msdr = _nanarr(); msdr_lo = _nanarr(); msdr_hi = _nanarr()
-    gH = _nanarr(); gHlo = _nanarr(); gHhi = _nanarr()
-    gW = _nanarr(); gWlo = _nanarr(); gWhi = _nanarr()
+    D = _nanarr()
+    Dlo = _nanarr()
+    Dhi = _nanarr()
+    rho = _nanarr()
+    rholo = _nanarr()
+    rhohi = _nanarr()
+    pe = _nanarr()
+    pelo = _nanarr()
+    pehi = _nanarr()
+    msdr = _nanarr()
+    msdr_lo = _nanarr()
+    msdr_hi = _nanarr()
+    gH = _nanarr()
+    gHlo = _nanarr()
+    gHhi = _nanarr()
+    gW = _nanarr()
+    gWlo = _nanarr()
+    gWhi = _nanarr()
 
     for i, Ti in enumerate(Ts):
         rows = groups[float(Ti)]
@@ -847,30 +1912,32 @@ def plot_autotune_results(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    dpi = _require_positive_integer(dpi, context="dpi")
     _apply_publication_style()
 
     data = json.loads(Path(json_path).read_text())
+    if not isinstance(data, Mapping):
+        raise ValueError("Autotune plotting input must be a JSON object")
+    canonical_units = _uses_canonical_report_units(data)
 
-    units = data.get("units", {}) or {}
-    units_style = str(units.get("lammps_units", "") or "").strip().lower()
-    time_unit_ps = units.get("time_unit_ps", None)
-    time_unit_ps = _maybe_float(time_unit_ps, default=float("nan"))
-    if not np.isfinite(time_unit_ps) or time_unit_ps <= 0:
-        time_unit_ps = None
+    units_style, time_unit_ps = _units_from_results(dict(data))
 
-    # diffusion coefficients consistent
-    # stored lammps time
+    # New results are stored in canonical A^2/ps.  Legacy files retain their
+    # native-time conversion for backwards-compatible plotting.
     D_scale = float(1.0)
-    D_label = "D (length²/time)"
-    if units_style in ("metal", "real", "electron") and time_unit_ps is not None:
-        D_scale = 1.0 / float(time_unit_ps)
-        D_label = "D (Å²/ps)"
+    D_label = "D (Å²/ps)" if canonical_units else "D (length²/time)"
+    if not canonical_units:
+        D_scale, D_label = _legacy_diffusion_plot_scale(
+            units_style=units_style,
+            time_unit_ps=time_unit_ps,
+        )
     rho_label = "density"
-    if units_style in ("metal", "real", "electron"):
-        rho_label = "density (g/cm³)"
-    pe_unit = _thermo_unit_label("PotEng", units_style)
+    density_unit = "g/cm³" if canonical_units else _thermo_unit_label("Density", units_style)
+    if density_unit:
+        rho_label = f"density ({density_unit})"
+    pe_unit = _thermo_unit_label("PotEng", units_style, canonical=canonical_units)
     pe_label = f"potential energy ({pe_unit})" if pe_unit else "potential energy"
-    rms_unit = "Å" if units_style in ("metal", "real", "electron") else "(distance units)"
+    rms_unit = "Å" if canonical_units else (_native_length_unit_label(units_style) or "distance units")
 
     # tm scan series
     # tm scan series
@@ -882,33 +1949,67 @@ def plot_autotune_results(
         agg = _aggregate_outcomes_by_T(outcomes, spread=spread)
         T = agg["T"]
         nrep = agg["nrep"]
-        D = agg["D"]; Dlo = agg["D_lo"]; Dhi = agg["D_hi"]
-        rho = agg["rho"]; rholo = agg["rho_lo"]; rhohi = agg["rho_hi"]
-        pe = agg["pe"]; pelo = agg["pe_lo"]; pehi = agg["pe_hi"]
-        msdr = agg["msdrms"]; msdrlo = agg["msdrms_lo"]; msdrhi = agg["msdrms_hi"]
-        gH = agg["gH"]; gHlo = agg["gH_lo"]; gHhi = agg["gH_hi"]
-        gW = agg["gW"]; gWlo = agg["gW_lo"]; gWhi = agg["gW_hi"]
+        D = agg["D"]
+        Dlo = agg["D_lo"]
+        Dhi = agg["D_hi"]
+        rho = agg["rho"]
+        rholo = agg["rho_lo"]
+        rhohi = agg["rho_hi"]
+        pe = agg["pe"]
+        pelo = agg["pe_lo"]
+        pehi = agg["pe_hi"]
+        msdr = agg["msdrms"]
+        msdrlo = agg["msdrms_lo"]
+        msdrhi = agg["msdrms_hi"]
+        gH = agg["gH"]
+        gHlo = agg["gH_lo"]
+        gHhi = agg["gH_hi"]
+        gW = agg["gW"]
+        gWlo = agg["gW_lo"]
+        gWhi = agg["gW_hi"]
     else:
         # schema
         T = np.array([_maybe_float(x) for x in tm.get("temps", [])], dtype=float)
         D = np.maximum(np.array([_maybe_float(x) for x in tm.get("D", [])], dtype=float), 0.0)
         Dlo = np.full_like(D, np.nan)
         Dhi = np.full_like(D, np.nan)
-        rho = np.full_like(D, np.nan); rholo = np.full_like(D, np.nan); rhohi = np.full_like(D, np.nan)
-        pe = np.full_like(D, np.nan); pelo = np.full_like(D, np.nan); pehi = np.full_like(D, np.nan)
-        msdr = np.full_like(D, np.nan); msdrlo = np.full_like(D, np.nan); msdrhi = np.full_like(D, np.nan)
-        gH = np.full_like(D, np.nan); gHlo = np.full_like(D, np.nan); gHhi = np.full_like(D, np.nan)
-        gW = np.full_like(D, np.nan); gWlo = np.full_like(D, np.nan); gWhi = np.full_like(D, np.nan)
+        rho = np.full_like(D, np.nan)
+        rholo = np.full_like(D, np.nan)
+        rhohi = np.full_like(D, np.nan)
+        pe = np.full_like(D, np.nan)
+        pelo = np.full_like(D, np.nan)
+        pehi = np.full_like(D, np.nan)
+        msdr = np.full_like(D, np.nan)
+        msdrlo = np.full_like(D, np.nan)
+        msdrhi = np.full_like(D, np.nan)
+        gH = np.full_like(D, np.nan)
+        gHlo = np.full_like(D, np.nan)
+        gHhi = np.full_like(D, np.nan)
+        gW = np.full_like(D, np.nan)
+        gWlo = np.full_like(D, np.nan)
+        gWhi = np.full_like(D, np.nan)
         nrep = np.zeros_like(D)
 
     order = np.argsort(T)
     T = T[order]
-    D = D[order]; Dlo = Dlo[order]; Dhi = Dhi[order]
-    rho = rho[order]; rholo = rholo[order]; rhohi = rhohi[order]
-    pe = pe[order]; pelo = pelo[order]; pehi = pehi[order]
-    msdr = msdr[order]; msdrlo = msdrlo[order]; msdrhi = msdrhi[order]
-    gH = gH[order]; gHlo = gHlo[order]; gHhi = gHhi[order]
-    gW = gW[order]; gWlo = gWlo[order]; gWhi = gWhi[order]
+    D = D[order]
+    Dlo = Dlo[order]
+    Dhi = Dhi[order]
+    rho = rho[order]
+    rholo = rholo[order]
+    rhohi = rhohi[order]
+    pe = pe[order]
+    pelo = pelo[order]
+    pehi = pehi[order]
+    msdr = msdr[order]
+    msdrlo = msdrlo[order]
+    msdrhi = msdrhi[order]
+    gH = gH[order]
+    gHlo = gHlo[order]
+    gHhi = gHhi[order]
+    gW = gW[order]
+    gWlo = gWlo[order]
+    gWhi = gWhi[order]
     nrep = nrep[order]
 
     rec = data.get("recommendation", {}) or {}
@@ -928,36 +2029,35 @@ def plot_autotune_results(
     # rate scan
     rate_scan = data.get("rate_scan", {}) or {}
     rate_points = rate_scan.get("rates", []) or []
-    rates_ps: list[float] = []
-    rates_time: list[float] = []
+    if rate_points:
+        rate_plot_x, rate_xlabel = _rate_scan_coordinates(
+            rate_points,
+            time_unit_ps=time_unit_ps,
+        )
+    else:
+        rate_plot_x = np.asarray([], dtype=float)
+        rate_xlabel = "cooling rate (K/ps)"
     rho_r: list[float] = []
     rho_r_lo: list[float] = []
     rho_r_hi: list[float] = []
     rho_r_n: list[int] = []
     metric_name: Optional[str] = None
     metric_mu: list[float] = []
-    metric_lo: list[float] = []
-    metric_hi: list[float] = []
 
     # replicate scatter storage
     rate_rep_x: list[float] = []
     rate_rep_rho: list[float] = []
 
-    for rr in rate_points:
-        rt = _maybe_float(rr.get("rate"))
-        rp = rr.get("rate_K_per_ps", None)
-        rp = _maybe_float(rp) if rp is not None else float("nan")
-        if not np.isfinite(rp) and time_unit_ps is not None and np.isfinite(rt):
-            rp = float(rt) / float(time_unit_ps)
-
+    for rr_idx, rr in enumerate(rate_points):
         # replicate between replica
         reps = rr.get("replicates", None)
         if isinstance(reps, list) and len(reps) > 0:
             dens_vals = np.array([_maybe_float(r.get("density")) for r in reps], dtype=float)
             c, lo, hi, nn = _center_band(dens_vals, spread)
-            if np.isfinite(rp):
+            rate_coord = float(rate_plot_x[rr_idx])
+            if np.isfinite(rate_coord):
                 for r in reps:
-                    rate_rep_x.append(rp)
+                    rate_rep_x.append(rate_coord)
                     rate_rep_rho.append(_maybe_float(r.get("density")))
         else:
             c = _maybe_float(rr.get("density_mean"))
@@ -965,8 +2065,6 @@ def plot_autotune_results(
             hi = float("nan")
             nn = 1
 
-        rates_time.append(rt)
-        rates_ps.append(rp)
         rho_r.append(c)
         rho_r_lo.append(lo)
         rho_r_hi.append(hi)
@@ -985,22 +2083,15 @@ def plot_autotune_results(
             # rate replica metrics
             val = _maybe_float(mm.get(metric_name))
             metric_mu.append(val)
-            metric_lo.append(float("nan"))
-            metric_hi.append(float("nan"))
 
-    rates_ps_arr = np.asarray(rates_ps, dtype=float)
-    rates_time_arr = np.asarray(rates_time, dtype=float)
     rho_r_arr = np.asarray(rho_r, dtype=float)
     rho_r_lo_arr = np.asarray(rho_r_lo, dtype=float)
     rho_r_hi_arr = np.asarray(rho_r_hi, dtype=float)
     metric_mu_arr = np.asarray(metric_mu, dtype=float) if metric_mu else None
-    metric_lo_arr = np.asarray(metric_lo, dtype=float) if metric_lo else None
-    metric_hi_arr = np.asarray(metric_hi, dtype=float) if metric_hi else None
 
-    use_rate_ps = np.isfinite(rates_ps_arr).any() or np.isfinite(chosen_rate_ps)
-    rate_x = rates_ps_arr if use_rate_ps else rates_time_arr
+    use_rate_ps = rate_xlabel == "cooling rate (K/ps)"
+    rate_x = rate_plot_x
     chosen_rate_x = chosen_rate_ps if use_rate_ps else chosen_rate_time
-    rate_xlabel = "cooling rate (K/ps)" if use_rate_ps else "cooling rate (K/time unit)"
 
     # size scan series
     # size scan series
@@ -1051,6 +2142,26 @@ def plot_autotune_results(
     hD_arr = np.asarray(hD, dtype=float)
     hD_arr_plot = np.maximum(hD_arr, 0.0) * float(D_scale)
     hD_c, hD_lo, hD_hi, hD_n = _center_band_log10(np.maximum(hD_arr_plot, 0.0), spread)
+
+    has_plottable_data = any(
+        bool(np.any(np.isfinite(xv) & np.isfinite(yv)))
+        for xv, yv in (
+            (T, D),
+            (T, rho),
+            (T, pe),
+            (T, msdr),
+            (T, gH),
+            (T, gW),
+            (rate_x, rho_r_arr),
+            (mult_arr, rho_s_arr),
+            (np.arange(hD_arr_plot.size, dtype=float), hD_arr_plot),
+        )
+        if np.asarray(xv).shape == np.asarray(yv).shape
+    )
+    if not has_plottable_data:
+        raise ValueError(
+            "autotune_results.json contains no finite plottable scan or high-temperature data"
+        )
 
     # plot
     # plot
@@ -1274,6 +2385,258 @@ def plot_autotune_results(
     _style_and_save_figure(fig, out_path, dpi=int(dpi))
 
 
+
+
+def _plot_analysis_results_without_convergence(
+    data: Mapping[str, Any],
+    prod: Mapping[str, Any],
+    json_path: Path,
+    out_path: Path,
+    *,
+    title: Optional[str],
+    dpi: int,
+    show_boxes: bool,
+    max_pages: Optional[int],
+) -> None:
+    """Plot standalone analysis data even when production convergence is absent.
+
+    Analysis-only datasets may intentionally carry advisory descriptor-set
+    convergence diagnostics rather than the production ``familywise`` report.
+    Plotting must still expose the analysed structures, scalar descriptors,
+    stored distributions and graph sidecar coverage instead of failing.
+    """
+
+    import csv
+    import math
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    def _finite(v: Any) -> float:
+        try:
+            x = float(v)
+        except Exception:
+            return float("nan")
+        return x if math.isfinite(x) else float("nan")
+
+    boxes = [dict(b) for b in list(prod.get("boxes", []) or []) if isinstance(b, Mapping)]
+    n_boxes = int(len(boxes))
+    conv = dict(prod.get("convergence", {}) or {}) if isinstance(prod.get("convergence", {}), Mapping) else {}
+    groups = dict(conv.get("groups", {}) or {}) if isinstance(conv.get("groups", {}), Mapping) else {}
+
+    pages: list[tuple[str, Any]] = []
+    # Keep analysis-only fallback plotting compact by default.  Users can still
+    # request more pages explicitly with --max-pages, but an analysis JSON with
+    # hundreds of graph-rule descriptors should never appear to hang while
+    # attempting to render every convenience scalar and curve.
+    page_budget = 6
+    if max_pages is not None:
+        if int(max_pages) <= 0:
+            raise ValueError("max_pages must be a positive integer when provided")
+        # max_pages means extra data pages beyond the mandatory summary page.
+        page_budget = 1 + int(max_pages)
+
+    def _page_budget_exhausted() -> bool:
+        return len(pages) >= page_budget
+
+    def _add_page(name: str, fig: Any) -> None:
+        # Do not retain pages beyond the requested budget.
+        if len(pages) < page_budget:
+            pages.append((str(name), fig))
+        else:
+            try:
+                import matplotlib.pyplot as _plt
+                _plt.close(fig)
+            except Exception:
+                pass
+
+    def _fig_summary():
+        fig = plt.figure(figsize=(8.0, 5.0), dpi=int(dpi))
+        ax = fig.add_subplot(1, 1, 1)
+        ax.axis("off")
+        status = str(data.get("status", "unknown"))
+        schema = str(data.get("schema", "unknown"))
+        filtering = data.get("filtering", {}) if isinstance(data.get("filtering", {}), Mapping) else {}
+        convergence_display = _production_convergence_display(prod, conv)
+        lines = [
+            title or f"VitriFlow analysis summary: {Path(json_path).name}",
+            "",
+            f"schema: {schema}",
+            f"status: {status}",
+            f"boxes analysed: {n_boxes}",
+            f"accepted/rejected fields: {prod.get('n_boxes_accepted', n_boxes)}/{prod.get('n_boxes_rejected', 0)}",
+            f"would reject under analysis settings: {data.get('n_boxes_would_be_rejected', 0)}",
+            f"filtering semantics: {filtering.get('semantics', 'not declared')}",
+            f"embedded structures: {data.get('embed_structures', 'not declared')}",
+            "",
+            "Descriptor-set convergence is advisory for analysis-only inputs.",
+            f"convergence assessment: {convergence_display['label']}",
+        ]
+        if groups:
+            lines.append("")
+            lines.append("descriptor sets:")
+            for name in ("short", "medium", "long"):
+                g = groups.get(name, {}) if isinstance(groups.get(name, {}), Mapping) else {}
+                items = g.get("items", []) if isinstance(g.get("items", []), list) else []
+                passed = g.get("passed", None)
+                status_g = g.get("status", "not_evaluated")
+                lines.append(f"  {name}: status={status_g}, passed={passed}, n_items={len(items)}")
+        if conv.get("reason"):
+            lines.append("")
+            lines.append(f"convergence note: {conv.get('reason')}")
+        ax.text(0.02, 0.98, "\n".join(str(x) for x in lines), va="top", ha="left", family="monospace", fontsize=9)
+        fig.subplots_adjust(left=0.08, right=0.98, bottom=0.08, top=0.92)
+        return fig
+
+    _add_page("analysis_summary", _fig_summary())
+
+    # Scalar descriptor trends from boxes[].density and boxes[].metrics.
+    scalar_values: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for idx, b in enumerate(boxes, start=1):
+        bid = _finite(b.get("box_id", b.get("box", idx)))
+        if not math.isfinite(bid):
+            bid = float(idx)
+        dens = _finite(b.get("density"))
+        if math.isfinite(dens):
+            scalar_values["density"].append((bid, dens))
+        metrics = b.get("metrics", {}) if isinstance(b.get("metrics", {}), Mapping) else {}
+        for key, val in metrics.items():
+            fv = _finite(val)
+            if math.isfinite(fv):
+                scalar_values[str(key)].append((bid, fv))
+
+    scalar_items = [(k, v) for k, v in sorted(scalar_values.items()) if len(v) >= 1]
+    if scalar_items:
+        # Put density and common topology scalars first, then deterministic alphabetical order.
+        priority = {"density": -10, "ring_mean_size": -9, "ring_count": -8, "component_count": -7}
+        scalar_items.sort(key=lambda kv: (priority.get(kv[0], 0), kv[0]))
+        per_page = 6
+        for page_idx in range(0, len(scalar_items), per_page):
+            if _page_budget_exhausted():
+                break
+            chunk = scalar_items[page_idx : page_idx + per_page]
+
+            def _make_scalar_fig(chunk=chunk, page_idx=page_idx):
+                n = len(chunk)
+                fig = plt.figure(figsize=(8.0, 1.8 * max(1, n)), dpi=int(dpi))
+                axes = fig.subplots(n, 1, squeeze=False).reshape(-1)
+                for ax, (name, vals) in zip(axes, chunk):
+                    arr = np.asarray(vals, dtype=float)
+                    order = np.argsort(arr[:, 0])
+                    arr = arr[order]
+                    ax.plot(arr[:, 0], arr[:, 1], "o-" if show_boxes else "o")
+                    if arr.shape[0] >= 2:
+                        mu = float(np.mean(arr[:, 1]))
+                        ax.axhline(mu, linestyle="--", linewidth=1.0)
+                    ax.set_xlabel("box")
+                    ax.set_ylabel(str(name))
+                    ax.set_title(str(name))
+                fig.subplots_adjust(left=0.08, right=0.98, bottom=0.08, top=0.92)
+                return fig
+
+            _add_page(f"scalar_metrics_{page_idx//per_page+1:02d}", _make_scalar_fig())
+
+    # Stored distributions: plot ensemble mean curves directly from boxes[].distributions.
+    def _dist_names(kind: str) -> list[str]:
+        names: set[str] = set()
+        for b in boxes:
+            d = b.get("distributions", {}) if isinstance(b.get("distributions", {}), Mapping) else {}
+            fam = d.get(kind, {}) if isinstance(d.get(kind, {}), Mapping) else {}
+            names.update(str(k) for k in fam.keys())
+        return sorted(names)
+
+    def _curve_payload(box: Mapping[str, Any], kind: str, name: str) -> Mapping[str, Any]:
+        d = box.get("distributions", {}) if isinstance(box.get("distributions", {}), Mapping) else {}
+        fam = d.get(kind, {}) if isinstance(d.get(kind, {}), Mapping) else {}
+        payload = fam.get(name, {}) if isinstance(fam.get(name, {}), Mapping) else {}
+        return payload
+
+    def _fig_curve(kind: str, name: str):
+        x_key = "r" if kind == "gr" else ("q" if kind == "sq" else "x")
+        y_key = "g" if kind == "gr" else ("s" if kind == "sq" else "cdf")
+        x_ref = None
+        curves = []
+        for b in boxes:
+            payload = _curve_payload(b, kind, name)
+            x = np.asarray(payload.get(x_key, []), dtype=float)
+            y = np.asarray(payload.get(y_key, []), dtype=float)
+            if x.ndim != 1 or y.ndim != 1 or x.size == 0 or x.size != y.size:
+                continue
+            if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+                continue
+            if x_ref is None:
+                x_ref = x
+                curves.append(y)
+            elif x.shape == x_ref.shape and float(np.max(np.abs(x - x_ref))) < 1e-8:
+                curves.append(y)
+            else:
+                curves.append(np.interp(x_ref, x, y))
+        fig = plt.figure(figsize=(6.5, 4.0), dpi=int(dpi))
+        ax = fig.add_subplot(1, 1, 1)
+        if x_ref is not None and curves:
+            mat = np.vstack(curves)
+            mu = np.mean(mat, axis=0)
+            ax.plot(x_ref, mu, label="ensemble mean")
+            if show_boxes:
+                for row in mat:
+                    ax.plot(x_ref, row, alpha=0.25, linewidth=0.8)
+            if mat.shape[0] >= 2:
+                se = np.std(mat, axis=0, ddof=1) / np.sqrt(float(mat.shape[0]))
+                ax.fill_between(x_ref, mu - se, mu + se, alpha=0.18, linewidth=0.0)
+            ax.legend(frameon=False)
+        else:
+            ax.text(0.5, 0.5, "No finite curves available", ha="center", va="center")
+        ax.set_xlabel(x_key)
+        ax.set_ylabel(y_key if kind in {"gr", "sq"} else "CDF")
+        ax.set_title(f"{kind}: {name}")
+        fig.subplots_adjust(left=0.08, right=0.98, bottom=0.08, top=0.92)
+        return fig
+
+    for kind in ("bondlen", "angle", "coord", "void", "gr", "sq"):
+        if _page_budget_exhausted():
+            break
+        for name in _dist_names(kind):
+            if _page_budget_exhausted():
+                break
+            _add_page(f"{kind}_{name}", _fig_curve(kind, name))
+
+    # Optional graph sidecar audit coverage page.
+    side = data.get("graph_metric_by_rule", {}) if isinstance(data.get("graph_metric_by_rule", {}), Mapping) else {}
+    side_path = side.get("path", None)
+    if side_path:
+        candidate = Path(json_path).parent / str(side_path)
+        if candidate.exists():
+            counts: dict[str, int] = defaultdict(int)
+            try:
+                with candidate.open("r", newline="", errors="replace") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        fam = str(row.get("metric_family", "unknown") or "unknown")
+                        counts[fam] += 1
+            except Exception:
+                counts = {}
+            if counts and not _page_budget_exhausted():
+                fig = plt.figure(figsize=(7.0, 4.0), dpi=int(dpi))
+                ax = fig.add_subplot(1, 1, 1)
+                names = sorted(counts)
+                vals = [counts[n] for n in names]
+                ax.bar(np.arange(len(names)), vals)
+                ax.set_xticks(np.arange(len(names)))
+                ax.set_xticklabels(names, rotation=45, ha="right")
+                ax.set_ylabel("rows")
+                ax.set_title("graph_metric_by_rule.csv coverage")
+                fig.subplots_adjust(left=0.08, right=0.98, bottom=0.08, top=0.92)
+                _add_page("graph_metric_coverage", fig)
+
+    _save_plot_pages(
+        pages,
+        Path(out_path),
+        dpi=int(dpi),
+        name_cleaner=lambda nm: str(nm).replace(" ", "_").replace("/", "-"),
+    )
+
 def plot_production_results(
     json_path: Path,
     out_path: Path,
@@ -1293,20 +2656,39 @@ def plot_production_results(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    dpi = _require_positive_integer(dpi, context="dpi")
     _apply_publication_style()
 
-    data, prod = _prepare_production_plot_payload(json_path)
+    if max_pages is not None:
+        max_pages = _require_positive_integer(max_pages, context="max_pages")
 
-    boxes = prod.get("boxes", []) or []
-    if not isinstance(boxes, list) or len(boxes) < 1:
+    data, prod = _prepare_production_plot_payload(json_path)
+    canonical_units = _uses_canonical_report_units(data)
+
+    raw_boxes = prod.get("boxes", []) or []
+    if not isinstance(raw_boxes, list) or len(raw_boxes) < 1:
         raise RuntimeError("Production section contains no boxes.")
+    boxes = _normalise_production_plot_boxes(raw_boxes)
 
     conv = prod.get("convergence", {}) or {}
-    if not isinstance(conv, dict) or "familywise" not in conv:
-        raise RuntimeError(
-            "Production convergence report is missing. "
-            "Run with autotune.production.check_convergence=true and store distributions." 
+    conv_has_report_payload = (
+        isinstance(conv, dict)
+        and "familywise" in conv
+        and (bool((conv.get("scalars", {}) or {})) or bool((conv.get("distributions", {}) or {})))
+    )
+    conv_status = str((conv or {}).get("status", "") if isinstance(conv, dict) else "").strip().lower()
+    if (not isinstance(conv, dict)) or "familywise" not in conv or (conv_status in {"skipped", "not_evaluated"} and not conv_has_report_payload):
+        _plot_analysis_results_without_convergence(
+            data,
+            {**prod, "boxes": boxes},
+            Path(json_path),
+            Path(out_path),
+            title=title,
+            dpi=int(dpi),
+            show_boxes=bool(show_boxes),
+            max_pages=max_pages,
         )
+        return
 
     # convergence reports ensembles
     conv_md = prod.get("convergence_md", None)
@@ -1317,7 +2699,16 @@ def plot_production_results(
         conv_dft = None
 
     # box metrics distributions
-    dft_final_ids = set(int(x) for x in (prod.get("boxes_dft_final", []) or []) if isinstance(x, (int, float)))
+    dft_final_ids_list = [
+        _strict_production_plot_box_id(
+            value,
+            context=f"production.boxes_dft_final[{idx}]",
+        )
+        for idx, value in enumerate(prod.get("boxes_dft_final", []) or [])
+    ]
+    if len(dft_final_ids_list) != len(set(dft_final_ids_list)):
+        raise ValueError("production.boxes_dft_final contains duplicate box identifier")
+    dft_final_ids = set(dft_final_ids_list)
     dft_boxes = []
     for b in boxes:
         d = b.get("dft_opt", None)
@@ -1345,7 +2736,7 @@ def plot_production_results(
     fw = conv.get("familywise", {}) or {}
     alpha_test = float(fw.get("alpha_per_test", float("nan")))
     if not (math.isfinite(alpha_test) and alpha_test > 0.0 and alpha_test < 1.0):
-        raise RuntimeError("Invalid alpha_per_test in production.convergence.familywise.")
+        alpha_test = 0.05
 
     bounded_ci_method = str(fw.get("bounded_ci_method", "t")).strip().lower()
     if bounded_ci_method not in ("t", "empirical_bernstein", "hoeffding"):
@@ -1354,15 +2745,14 @@ def plot_production_results(
     units_style = str((data.get("units", {}) or {}).get("lammps_units", "")).strip().lower()
 
     def _distance_unit_label() -> str:
-        # metal angstrom distance
-        if units_style in ("metal", "real", "electron"):
+        if canonical_units:
             return "Å"
-        return "(distance units)"
+        return _native_length_unit_label(units_style) or "(distance units)"
 
     def _density_unit_label() -> str:
-        if units_style in ("metal", "real", "electron"):
+        if canonical_units:
             return "g/cm³"
-        return "(density units)"
+        return _thermo_unit_label("Density", units_style) or "(density units)"
 
     def _critical_value(n: int, alpha: float) -> tuple[float, str]:
         a = float(min(1.0, max(0.0, alpha)))
@@ -1420,7 +2810,7 @@ def plot_production_results(
         return mu, np.sqrt(var)
 
     # extract convergence present
-    spec = prod.get("convergence_spec", {}) or {}
+    spec = (conv.get("convergence_spec_effective") if isinstance(conv, dict) else None) or prod.get("convergence_spec", {}) or {}
     bond_names = list(spec.get("bondlen_names", []))
     angle_names = list(spec.get("angle_names", []))
     coord_names = list(spec.get("coord_names", []))
@@ -1430,15 +2820,21 @@ def plot_production_results(
     void_names = list(spec.get("void_names", []))
     has_ring_mean = bool(spec.get("ring_has_mean_size", False))
 
-    # distributions kept
-    if "distributions" not in boxes[0]:
+    # Per-box distributions are preferred.  Analysis-only results may instead
+    # carry authoritative ensemble-level CDF sidecars; in that case the plotting
+    # code falls back to the hydrated convergence.distributions entries below.
+    if "distributions" not in boxes[0] and not bool((conv.get("distributions", {}) or {})):
         raise RuntimeError(
-            "Per-box distributions were not stored (production.store_distributions=false). "
-            "Enable store_distributions to plot distribution convergence." 
+            "Per-box distributions were not stored and no ensemble CDF sidecar/convergence distribution was available. "
+            "Enable store_distributions or keep ensemble_cdfs.json next to analysis_results.json."
         )
 
     # density
     dens = np.asarray([float(b.get("density", float("nan"))) for b in boxes], dtype=float)
+    if dens.size != N or not np.all(np.isfinite(dens)):
+        raise RuntimeError(
+            "Production density is missing or non-finite for one or more boxes"
+        )
     dens_abs = float(((conv.get("scalars", {}) or {}).get("density", {}) or {}).get("abs_tol", 0.0))
     dens_rel = float(((conv.get("scalars", {}) or {}).get("density", {}) or {}).get("rel_tol", 0.0))
 
@@ -1459,49 +2855,126 @@ def plot_production_results(
             m = b.get("metrics", {}) or {}
             for j, k in enumerate(ring_keys):
                 ring_mat[i, j] = float(m.get(k, float("nan")))
+        if not np.all(np.isfinite(ring_mat)):
+            raise RuntimeError(
+                "Declared ring-fraction metrics are missing or non-finite for one or more boxes"
+            )
 
     ring_mean_abs = float(((conv.get("scalars", {}) or {}).get("ring_mean_size", {}) or {}).get("abs_tol", 0.0))
     ring_mean_rel = float(((conv.get("scalars", {}) or {}).get("ring_mean_size", {}) or {}).get("rel_tol", 0.0))
     ring_mean_vec = None
     if has_ring_mean:
         ring_mean_vec = np.asarray([float((b.get("metrics", {}) or {}).get("ring_mean_size", float("nan"))) for b in boxes], dtype=float)
+        if not np.all(np.isfinite(ring_mean_vec)):
+            raise RuntimeError(
+                "Declared ring_mean_size is missing or non-finite for one or more boxes"
+            )
 
     # cdf curves
     curve_mats: list[dict[str, Any]] = []
 
+    def _plot_stack_continuous_cdfs(src_boxes: Sequence[Mapping[str, Any]], kind: str, name: str, *, xkey: str = "x") -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        payloads: list[Mapping[str, Any]] = []
+        for idx, b in enumerate(src_boxes):
+            fam = ((b.get("distributions", {}) or {}).get(kind, {}) or {})
+            payload = fam.get(name, None) if isinstance(fam, Mapping) else None
+            if not isinstance(payload, Mapping):
+                raise RuntimeError(f"Missing {kind} CDF '{name}' in box {idx + 1}")
+            payloads.append(payload)
+        return _align_plot_cdf_payloads(payloads, xkey=xkey)
+
+    def _plot_stack_coord_cdfs(src_boxes: Sequence[Mapping[str, Any]], name: str) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        payloads: list[Mapping[str, Any]] = []
+        for idx, b in enumerate(src_boxes):
+            fam = ((b.get("distributions", {}) or {}).get("coord", {}) or {})
+            payload = fam.get(name, None) if isinstance(fam, Mapping) else None
+            if not isinstance(payload, Mapping):
+                raise RuntimeError(f"Missing coordination CDF '{name}' in box {idx + 1}")
+            payloads.append(payload)
+        x_common, mat, meta = _align_plot_cdf_payloads(
+            payloads,
+            xkey="x",
+            allow_implicit_integer_axis=True,
+        )
+        integer = np.arange(int(x_common.size), dtype=float)
+        is_integer_support = bool(
+            x_common.shape == integer.shape
+            and np.allclose(
+                x_common,
+                integer,
+                rtol=0.0,
+                atol=float(_PLOT_CDF_ROUNDOFF_ATOL),
+            )
+        )
+        meta = {
+            **dict(meta),
+            "grid_source": (
+                "ensemble_common_integer_grid"
+                if is_integer_support
+                else "ensemble_common_explicit_coordination_grid"
+            ),
+            "coordination_support": (
+                "integer" if is_integer_support else "fractional_or_nonuniform"
+            ),
+        }
+        return x_common, mat, meta
+
     def _stack_cdf(kind: str, name: str, xkey: str = "x") -> None:
-        # bondlen angle coord
-        # name distribution
-        # extract convergence report
+        # Continuous CDFs may have been produced on box-specific adaptive grids.
+        # Build the same explicit ensemble grid used by the convergence checker
+        # instead of requiring the first box's grid to be universal.
         drep = (conv.get("distributions", {}) or {}).get(name, None)
         if not isinstance(drep, dict):
-            raise RuntimeError(f"Missing convergence report entry for '{name}'.")
+            drep = {}
         abs_tol = float(drep.get("abs_tol", 0.0))
         rel_tol = float(drep.get("rel_tol", 0.0))
-        # x grid
-        x0 = np.asarray(((boxes[0]["distributions"][kind] or {}).get(name, {}) or {}).get(xkey, []), dtype=float)
-        if x0.size < 2:
-            return
-        # stack cdfs
-        mats = np.zeros((N, int(x0.size)), dtype=float)
-        for i, b in enumerate(boxes):
-            dd = (b.get("distributions", {}) or {}).get(kind, {}) or {}
-            d = dd.get(name, None)
-            if d is None:
-                raise RuntimeError(f"Box {i+1} missing distribution '{name}'.")
-            xi = np.asarray(d.get(xkey, []), dtype=float)
-            if xi.shape != x0.shape or (np.max(np.abs(xi - x0)) > 1e-10):
-                raise RuntimeError(f"Inconsistent grid for '{name}' across boxes.")
-            mats[i, :] = np.asarray(d.get("cdf", []), dtype=float)
+        try:
+            x0, mats, meta = _plot_stack_continuous_cdfs(boxes, kind, name, xkey=xkey)
+        except Exception as exc:
+            # A malformed stored box payload must not be hidden by substituting
+            # an ensemble mean.  Report-only fallback is reserved for outputs
+            # where per-box distributions were deliberately not embedded.
+            has_stored_payload = any(
+                isinstance(
+                    (((b.get("distributions", {}) or {}).get(kind, {}) or {}).get(name, None)),
+                    Mapping,
+                )
+                for b in boxes
+            )
+            if has_stored_payload:
+                raise RuntimeError(
+                    f"Malformed stored {kind} CDF {name!r}; refusing to omit its public plot"
+                ) from exc
+            try:
+                x0, y_report, _axis_source = _validated_plot_cdf_payload(
+                    {
+                        xkey: drep.get(xkey, drep.get("x", [])),
+                        "cdf": drep.get("mean", drep.get("ensemble_cdf", [])),
+                    },
+                    xkey=xkey,
+                )
+            except ValueError as report_exc:
+                raise RuntimeError(
+                    f"Declared {kind} CDF {name!r} has neither complete per-box "
+                    "payloads nor a valid convergence-report curve"
+                ) from report_exc
+            mats = np.tile(y_report[None, :], (N, 1))
+            meta = {
+                "group": drep.get("group", ""),
+                "kind": drep.get("kind", f"{kind}_cdf"),
+                "name": name,
+                "grid_source": "convergence_report_only",
+            }
         curve_mats.append(
             {
-                "group": drep.get("group", ""),
-                "kind": str(drep.get("kind", "")),
+                "group": drep.get("group", meta.get("group", "")),
+                "kind": str(drep.get("kind", meta.get("kind", f"{kind}_cdf"))),
                 "name": str(name),
-                "x": x0,
-                "mat": mats,
+                "x": np.asarray(x0, dtype=float),
+                "mat": np.asarray(mats, dtype=float),
                 "abs_tol": abs_tol,
                 "rel_tol": rel_tol,
+                "grid_source": str(meta.get("grid_source", "ensemble_common_grid")),
             }
         )
 
@@ -1517,121 +2990,125 @@ def plot_production_results(
     for nm in coord_names:
         drep = (conv.get("distributions", {}) or {}).get(nm, None)
         if not isinstance(drep, dict):
-            raise RuntimeError(f"Missing convergence report entry for '{nm}'.")
+            drep = {}
         abs_tol = float(drep.get("abs_tol", 0.0))
         rel_tol = float(drep.get("rel_tol", 0.0))
-        kmax = 0
-        for b in boxes:
-            dcoord = (b.get("distributions", {}) or {}).get("coord", {}) or {}
-            dn = (dcoord.get(nm, {}) or {})
-            cdf = np.asarray(dn.get("cdf", []), dtype=float)
-            if cdf.size > 0:
-                kmax = max(kmax, int(cdf.size) - 1)
-        if kmax < 1:
-            continue
-        xk = np.arange(0, kmax + 1, dtype=float)
-        p = int(xk.size)
-        mats = np.zeros((N, p), dtype=float)
-        for i, b in enumerate(boxes):
-            d = (((b.get("distributions", {}) or {}).get("coord", {}) or {}).get(nm, {}) or {})
-            cdf = np.asarray(d.get("cdf", []), dtype=float)
-            if cdf.size == 0:
-                raise RuntimeError(f"Empty coord CDF for '{nm}' in box {i+1}.")
-            if cdf.size < p:
-                cdf2 = np.concatenate([cdf, np.ones((p - cdf.size,), dtype=float)])
-            else:
-                cdf2 = cdf[:p]
-            mats[i, :] = cdf2
+        try:
+            xk, mats, meta = _plot_stack_coord_cdfs(boxes, nm)
+        except Exception as exc:
+            has_stored_payload = any(
+                isinstance(
+                    (((b.get("distributions", {}) or {}).get("coord", {}) or {}).get(nm, None)),
+                    Mapping,
+                )
+                for b in boxes
+            )
+            if has_stored_payload:
+                raise RuntimeError(
+                    f"Malformed stored coordination CDF {nm!r}; refusing to omit its public plot"
+                ) from exc
+            report_payload: dict[str, Any] = {
+                "cdf": drep.get("mean", drep.get("ensemble_cdf", [])),
+            }
+            if "x" in drep:
+                report_payload["x"] = drep.get("x")
+            try:
+                xk, y_report, axis_source = _validated_plot_cdf_payload(
+                    report_payload,
+                    xkey="x",
+                    allow_implicit_integer_axis=True,
+                )
+            except ValueError as report_exc:
+                raise RuntimeError(
+                    f"Declared coordination CDF {nm!r} has neither complete per-box "
+                    "payloads nor a valid convergence-report curve"
+                ) from report_exc
+            mats = np.tile(y_report[None, :], (N, 1))
+            meta = {
+                "grid_source": "convergence_report_only",
+                "axis_source": axis_source,
+            }
         curve_mats.append(
             {
-                "group": drep.get("group", ""),
-                "kind": str(drep.get("kind", "")),
+                "group": drep.get("group", "short"),
+                "kind": str(drep.get("kind", "coord_cdf")),
                 "name": str(nm),
-                "x": xk,
-                "mat": mats,
+                "x": np.asarray(xk, dtype=float),
+                "mat": np.asarray(mats, dtype=float),
                 "abs_tol": abs_tol,
                 "rel_tol": rel_tol,
+                "grid_source": str(meta.get("grid_source", "ensemble_common_integer_grid")),
             }
         )
 
-    # curves align ref
-    for lab in gr_labels:
+    def _stack_sampled_curve(family: str, lab: str, axis_key: str, value_key: str, default_kind: str) -> None:
         drep = (conv.get("distributions", {}) or {}).get(lab, None)
-        if not isinstance(drep, dict):
-            raise RuntimeError(f"Missing convergence report entry for '{lab}'.")
-        abs_tol = float(drep.get("abs_tol", 0.0))
-        rel_tol = float(drep.get("rel_tol", 0.0))
-        r0 = np.asarray((((boxes[0].get("distributions", {}) or {}).get("gr", {}) or {}).get(lab, {}) or {}).get("r", []), dtype=float)
-        if r0.size < 2:
-            continue
-        nb = int(r0.size)
-        # rmax eff boxes
-        rmax_eff = float("inf")
-        for b in boxes:
-            r = np.asarray((((b.get("distributions", {}) or {}).get("gr", {}) or {}).get(lab, {}) or {}).get("r", []), dtype=float)
-            if r.size != nb:
-                raise RuntimeError(f"Inconsistent g(r) length for '{lab}' across boxes")
-            dr = float(r[1] - r[0])
-            rmax_eff = min(rmax_eff, float(r[-1] + 0.5 * dr))
-        edges = np.linspace(0.0, float(rmax_eff), nb + 1)
-        r_ref = 0.5 * (edges[:-1] + edges[1:])
-        mats = np.zeros((N, nb), dtype=float)
-        for i, b in enumerate(boxes):
-            d = (((b.get("distributions", {}) or {}).get("gr", {}) or {}).get(lab, {}) or {})
-            r = np.asarray(d.get("r", []), dtype=float)
-            g = np.asarray(d.get("g", []), dtype=float)
-            mats[i, :] = np.interp(r_ref, r, g)
-        curve_mats.append(
-            {
-                "group": drep.get("group", ""),
-                "kind": str(drep.get("kind", "")),
-                "name": str(lab),
-                "x": r_ref,
-                "mat": mats,
-                "abs_tol": abs_tol,
-                "rel_tol": rel_tol,
-            }
+        if not isinstance(drep, Mapping):
+            drep = {}
+        has_stored_payload = any(
+            isinstance(
+                (((b.get("distributions", {}) or {}).get(family, {}) or {}).get(lab, None)),
+                Mapping,
+            )
+            for b in boxes
         )
-
-
-
-    # curves align ref
-    for lab in sq_labels:
-        drep = conv.get("distributions", {}).get(lab, {})
-        kind = str(drep.get("kind", "sq_curve"))
-        abs_tol = float(drep.get("abs_tol", 0.0))
-        rel_tol = float(drep.get("rel_tol", 0.0))
-
-        q0 = np.asarray(((boxes[0].get("distributions", {}) or {}).get("sq", {}) or {}).get(lab, {}).get("q", []), dtype=float)
-        if q0.size < 2:
-            continue
-        nb = int(q0.size)
-        qmax_eff = float("inf")
-        for b in boxes:
-            q = np.asarray(((b.get("distributions", {}) or {}).get("sq", {}) or {}).get(lab, {}).get("q", []), dtype=float)
-            if q.size != nb:
-                raise RuntimeError(f"Inconsistent S(q) length for '{lab}' across boxes")
-            qmax_eff = min(qmax_eff, float(q[-1]))
-        q_ref = np.linspace(0.0, float(qmax_eff), nb)
-
-        mats = np.zeros((N, nb), dtype=float)
-        for i, b in enumerate(boxes):
-            d = ((b.get("distributions", {}) or {}).get("sq", {}) or {}).get(lab, {}) or {}
-            q = np.asarray(d.get("q", []), dtype=float)
-            s = np.asarray(d.get("s", []), dtype=float)
-            mats[i, :] = np.interp(q_ref, q, s)
-
+        if has_stored_payload:
+            try:
+                payloads = [
+                    (((b.get("distributions", {}) or {}).get(family, {}) or {}).get(lab, None))
+                    for b in boxes
+                ]
+                x_ref, mats, stack_meta = _align_sampled_plot_payloads(
+                    payloads,
+                    family=family,
+                    xkey=axis_key,
+                    ykey=value_key,
+                )
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"Malformed stored {family} curve {lab!r}; refusing to omit its public plot"
+                ) from exc
+            grid_source = str(stack_meta.get("grid_source", "ensemble_common_axis_overlap"))
+        else:
+            try:
+                x_ref = np.asarray(
+                    drep.get(axis_key, drep.get("x", [])),
+                    dtype=float,
+                )
+                y_report = np.asarray(drep.get("mean", []), dtype=float)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Declared {family} curve {lab!r} has no numeric convergence-report curve"
+                ) from exc
+            _require_finite_plot_points(
+                x_ref,
+                y_report,
+                context=f"declared {family} curve {lab!r}",
+            )
+            if x_ref.size < 2 or not np.all(np.diff(x_ref) > 0.0):
+                raise RuntimeError(
+                    f"Declared {family} curve {lab!r} has an invalid report grid"
+                )
+            mats = np.tile(y_report[None, :], (N, 1))
+            grid_source = "convergence_report_only"
         curve_mats.append(
             {
                 "group": str(drep.get("group", "long")),
-                "kind": kind,
+                "kind": str(drep.get("kind", default_kind)),
                 "name": str(lab),
-                "x": q_ref,
+                "x": x_ref,
                 "mat": mats,
-                "abs_tol": abs_tol,
-                "rel_tol": rel_tol,
+                "abs_tol": float(drep.get("abs_tol", 0.0)),
+                "rel_tol": float(drep.get("rel_tol", 0.0)),
+                "grid_source": grid_source,
             }
         )
+
+    for lab in gr_labels:
+        _stack_sampled_curve("gr", lab, "r", "g", "gr_curve")
+
+    for lab in sq_labels:
+        _stack_sampled_curve("sq", lab, "q", "s", "sq_curve")
     # convergence trend figure
     # convergence trend figure
     # n grid
@@ -1866,35 +3343,94 @@ def plot_production_results(
                     continue
                 try:
                     if kind == "gr_curve":
-                        m1 = np.vstack([np.asarray(b["distributions"]["gr"][name]["g"], dtype=float) for b in g1])
-                        m2 = np.vstack([np.asarray(b["distributions"]["gr"][name]["g"], dtype=float) for b in g2])
+                        all_payloads = [
+                            (((b.get("distributions", {}) or {}).get("gr", {}) or {}).get(name, None))
+                            for b in boxes[:n]
+                        ]
+                        x_ref, _mall, _meta = _align_sampled_plot_payloads(
+                            all_payloads, family="gr", xkey="r", ykey="g"
+                        )
+                        g1_payloads = [
+                            (((b.get("distributions", {}) or {}).get("gr", {}) or {}).get(name, None))
+                            for b in g1
+                        ]
+                        g2_payloads = [
+                            (((b.get("distributions", {}) or {}).get("gr", {}) or {}).get(name, None))
+                            for b in g2
+                        ]
+                        _x1, m1, _meta1 = _align_sampled_plot_payloads(
+                            g1_payloads,
+                            family="gr",
+                            xkey="r",
+                            ykey="g",
+                            x_ref=x_ref,
+                        )
+                        _x2, m2, _meta2 = _align_sampled_plot_payloads(
+                            g2_payloads,
+                            family="gr",
+                            xkey="r",
+                            ykey="g",
+                            x_ref=x_ref,
+                        )
                     elif kind == "sq_curve":
-                        m1 = np.vstack([np.asarray(b["distributions"]["sq"][name]["s"], dtype=float) for b in g1])
-                        m2 = np.vstack([np.asarray(b["distributions"]["sq"][name]["s"], dtype=float) for b in g2])
-                    elif kind == "bondlen_cdf":
-                        m1 = np.vstack([np.asarray(b["distributions"]["bondlen"][name]["cdf"], dtype=float) for b in g1])
-                        m2 = np.vstack([np.asarray(b["distributions"]["bondlen"][name]["cdf"], dtype=float) for b in g2])
-                    elif kind == "angle_cdf":
-                        m1 = np.vstack([np.asarray(b["distributions"]["angle"][name]["cdf"], dtype=float) for b in g1])
-                        m2 = np.vstack([np.asarray(b["distributions"]["angle"][name]["cdf"], dtype=float) for b in g2])
-                    elif kind == "void_cdf":
-                        m1 = np.vstack([np.asarray(b["distributions"]["void"][name]["cdf"], dtype=float) for b in g1])
-                        m2 = np.vstack([np.asarray(b["distributions"]["void"][name]["cdf"], dtype=float) for b in g2])
+                        all_payloads = [
+                            (((b.get("distributions", {}) or {}).get("sq", {}) or {}).get(name, None))
+                            for b in boxes[:n]
+                        ]
+                        x_ref, _mall, _meta = _align_sampled_plot_payloads(
+                            all_payloads, family="sq", xkey="q", ykey="s"
+                        )
+                        g1_payloads = [
+                            (((b.get("distributions", {}) or {}).get("sq", {}) or {}).get(name, None))
+                            for b in g1
+                        ]
+                        g2_payloads = [
+                            (((b.get("distributions", {}) or {}).get("sq", {}) or {}).get(name, None))
+                            for b in g2
+                        ]
+                        _x1, m1, _meta1 = _align_sampled_plot_payloads(
+                            g1_payloads,
+                            family="sq",
+                            xkey="q",
+                            ykey="s",
+                            x_ref=x_ref,
+                        )
+                        _x2, m2, _meta2 = _align_sampled_plot_payloads(
+                            g2_payloads,
+                            family="sq",
+                            xkey="q",
+                            ykey="s",
+                            x_ref=x_ref,
+                        )
                     else:
-                        # coord cdf length
-                        kmax = 0
-                        for b in g1 + g2:
-                            kmax = max(kmax, int(len(b["distributions"]["coord"][name]["cdf"])) - 1)
-                        p = int(kmax + 1)
-                        def _pad(v):
-                            v = np.asarray(v, dtype=float)
-                            if v.size < p:
-                                v = np.concatenate([v, np.ones((p - v.size,), dtype=float)])
-                            return v[:p]
-                        m1 = np.vstack([_pad(b["distributions"]["coord"][name]["cdf"]) for b in g1])
-                        m2 = np.vstack([_pad(b["distributions"]["coord"][name]["cdf"]) for b in g2])
+                        family = {
+                            "bondlen_cdf": "bondlen",
+                            "angle_cdf": "angle",
+                            "coord_cdf": "coord",
+                            "void_cdf": "void",
+                        }[kind]
+                        payloads: list[Mapping[str, Any]] = []
+                        for b in [*g1, *g2]:
+                            fam = ((b.get("distributions", {}) or {}).get(family, {}) or {})
+                            payload = fam.get(name, None) if isinstance(fam, Mapping) else None
+                            if not isinstance(payload, Mapping):
+                                raise ValueError("missing CDF payload in stability split")
+                            payloads.append(payload)
+                        _x_ref, mall, _meta = _align_plot_cdf_payloads(
+                            payloads,
+                            allow_implicit_integer_axis=(kind == "coord_cdf"),
+                        )
+                        m1 = mall[: len(g1), :]
+                        m2 = mall[len(g1) :, :]
                     d = float(_curve_dist(m1, m2))
                 except Exception:
+                    if kind in {
+                        "bondlen_cdf",
+                        "angle_cdf",
+                        "coord_cdf",
+                        "void_cdf",
+                    }:
+                        ratios.append(float("inf"))
                     continue
                 if math.isfinite(d):
                     ratios.append(float(d) / float(tol))
@@ -1947,13 +3483,21 @@ def plot_production_results(
         ax.set_xlabel("number of boxes")
         ax.set_ylabel("max(ratio / tolerance)")
         ax.set_yscale("log")
-        ax.set_title("Production convergence trend")
+        ax.set_title("Retrospective production convergence diagnostic")
         ax.legend(frameon=False)
-        # annotate family wise
-        m_tests = int((fw.get("m_tests", 0) or 0))
-        alpha_family = float(fw.get("alpha_family", float("nan")))
-        txt = f"FWER={1.0-alpha_family:.3f}  M={m_tests}  alpha_test={alpha_test:.2e}  bounded_CI={bounded_ci_method}"
+        # alpha_family is the familywise *error probability*, not confidence.
+        txt = _familywise_error_annotation(
+            fw,
+            alpha_per_test=alpha_test,
+            bounded_ci_method=bounded_ci_method,
+        )
         ax.text(0.02, 0.02, txt, transform=ax.transAxes, va="bottom", ha="left")
+        crossing = (
+            f"retrospective first threshold crossing: n={int(n_conv)}"
+            if n_conv is not None
+            else "retrospective first threshold crossing: none"
+        )
+        ax.text(0.02, 0.98, crossing, transform=ax.transAxes, va="top", ha="left")
         return fig
 
     # distribution plot helpers
@@ -2006,11 +3550,15 @@ def plot_production_results(
     n_acc = int(prod.get("n_boxes_accepted", prod.get("n_boxes", N)))
     n_rej = int(prod.get("n_boxes_rejected", 0))
     n_tot = int(prod.get("n_boxes_total", n_acc + n_rej))
-    conv_flag = bool(prod.get("converged", False))
+    convergence_display = _production_convergence_display(prod, conv)
+    convergence_label = str(convergence_display["label"])
     if n_rej > 0:
-        base2 = f"{base} | accepted={n_acc}/{n_tot} | rejected={n_rej} | converged={conv_flag}"
+        base2 = (
+            f"{base} | accepted={n_acc}/{n_tot} | rejected={n_rej} | "
+            f"{convergence_label}"
+        )
     else:
-        base2 = f"{base} | n={n_acc} | converged={conv_flag}"
+        base2 = f"{base} | n={n_acc} | {convergence_label}"
     pages[0][1].suptitle(base2)
 
     # density page
@@ -2035,6 +3583,23 @@ def plot_production_results(
         rrep = (conv.get("distributions", {}) or {}).get("ring", {}) or {}
         mu = np.asarray(rrep.get("mean", []), dtype=float)
         half = np.asarray(rrep.get("ci_halfwidth", []), dtype=float)
+        if mu.size != len(ring_keys) and ring_mat is not None:
+            # Analysis-only or degraded convergence payloads can declare ring
+            # keys before the ensemble PMF has been materialized.  Build a
+            # plotting summary directly from boxes[].metrics rather than
+            # failing on an empty report entry.
+            try:
+                mu = np.nanmean(np.asarray(ring_mat, dtype=float), axis=0)
+                if np.asarray(ring_mat).shape[0] >= 2:
+                    half = np.nanstd(np.asarray(ring_mat, dtype=float), axis=0, ddof=1) / math.sqrt(float(np.asarray(ring_mat).shape[0]))
+                else:
+                    half = np.zeros_like(mu, dtype=float)
+            except Exception:
+                mu = np.asarray([], dtype=float)
+                half = np.asarray([], dtype=float)
+        if mu.size != len(ring_keys):
+            mu = np.asarray([], dtype=float)
+            half = np.asarray([], dtype=float)
         # parse sizes keys
         sizes = []
         for k in ring_keys:
@@ -2045,18 +3610,31 @@ def plot_production_results(
         sizes_arr = np.asarray(sizes, dtype=int)
         order = np.argsort(sizes_arr)
         sizes_arr = sizes_arr[order]
-        mu = mu[order]
-        half = half[order]
+        if mu.size == sizes_arr.size:
+            mu = mu[order]
+            half = half[order] if half.size == sizes_arr.size else np.zeros_like(mu, dtype=float)
+        else:
+            sizes_arr = np.asarray([], dtype=int)
+            mu = np.asarray([], dtype=float)
+            half = np.asarray([], dtype=float)
 
-        fig, ax = plt.subplots(figsize=(6.5, 4.0))
-        ax.bar(sizes_arr.astype(float), mu, color="0.8", edgecolor="0.2")
-        if mu.size == half.size and mu.size > 0 and np.all(np.isfinite(half)):
-            ax.errorbar(sizes_arr.astype(float), mu, yerr=half, fmt="none", ecolor="black", capsize=2.5, linewidth=1.0)
-        ax.set_xlabel("ring size")
-        ax.set_ylabel("fraction")
-        ax.set_title("Ring statistics")
-        fig.suptitle(base2)
-        pages.append(("rings", fig))
+        if mu.size == 0:
+            fig, ax = plt.subplots(figsize=(6.5, 4.0))
+            ax.text(0.5, 0.5, "Ring PMF unavailable", ha="center", va="center")
+            ax.set_axis_off()
+            fig.suptitle(base2)
+            pages.append(("rings_unavailable", fig))
+            # Continue to other available descriptor plots.
+        else:
+            fig, ax = plt.subplots(figsize=(6.5, 4.0))
+            ax.bar(sizes_arr.astype(float), mu, color="0.8", edgecolor="0.2")
+            if mu.size == half.size and mu.size > 0 and np.all(np.isfinite(half)):
+                ax.errorbar(sizes_arr.astype(float), mu, yerr=half, fmt="none", ecolor="black", capsize=2.5, linewidth=1.0)
+            ax.set_xlabel("ring size")
+            ax.set_ylabel("fraction")
+            ax.set_title("Ring statistics")
+            fig.suptitle(base2)
+            pages.append(("rings", fig))
 
     if ring_mean_vec is not None:
         rrep = ((conv.get("scalars", {}) or {}).get("ring_mean_size", {}) or {})
@@ -2074,6 +3652,103 @@ def plot_production_results(
         ax.legend(frameon=False)
         fig.suptitle(base2)
         pages.append(("ring_mean", fig))
+
+    # Every finite scalar emitted by the configured metric pipeline receives a
+    # public production page.  Distribution families are plotted separately
+    # below; these pages cover their scalar summaries plus amorphous, graph, and
+    # other diagnostic scalar plumbing without silently dropping them.
+    scalar_metric_keys: set[str] = set()
+    for box in boxes:
+        metrics_row = box.get("metrics", {})
+        if isinstance(metrics_row, Mapping):
+            scalar_metric_keys.update(str(key) for key in metrics_row)
+    scalar_metric_keys = {
+        key
+        for key in scalar_metric_keys
+        if not key.startswith("ring_frac_") and key != "ring_mean_size"
+    }
+    scalar_crit, _scalar_crit_method = _critical_value(N, alpha_test)
+    for key in sorted(scalar_metric_keys):
+        values = np.asarray(
+            [
+                _maybe_float(
+                    (box.get("metrics", {}) or {}).get(key)
+                    if isinstance(box.get("metrics", {}), Mapping)
+                    else None
+                )
+                for box in boxes
+            ],
+            dtype=float,
+        )
+        fig, ax = plt.subplots(figsize=(6.5, 4.0))
+        finite = np.isfinite(values)
+        if np.any(finite):
+            ids = np.arange(1, N + 1, dtype=float)
+            ax.plot(ids[finite], values[finite], "o", label="box value")
+            mu = float(np.mean(values[finite]))
+            ax.axhline(mu, color="black", linewidth=1.2, label="mean")
+            if int(np.sum(finite)) >= 2 and math.isfinite(scalar_crit):
+                se = float(
+                    np.std(values[finite], ddof=1)
+                    / math.sqrt(float(np.sum(finite)))
+                )
+                half = float(scalar_crit) * se
+                ax.axhspan(mu - half, mu + half, color="0.7", alpha=0.2, label="fixed-look CI")
+            ax.text(
+                0.02,
+                0.98,
+                f"finite boxes: {int(np.sum(finite))}/{N}",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+            )
+            ax.legend(frameon=False)
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "Metric emitted but unavailable/non-finite in every box",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+        ax.set_xlabel("box index")
+        ax.set_ylabel(str(key))
+        ax.set_title(_clean_name(key))
+        fig.suptitle(base2)
+        pages.append((f"scalar_{key}", fig))
+
+    # The coordination cutoff sweep is a nested diagnostic rather than a
+    # scalar/distribution entry.  Plot it explicitly so enabling the metric
+    # cannot leave its application-facing path untested.
+    for name, (delta_r, sweep_matrix) in _coordination_sweep_matrices(boxes).items():
+        mu = np.mean(sweep_matrix, axis=0)
+        if sweep_matrix.shape[0] >= 2:
+            se = np.std(sweep_matrix, axis=0, ddof=1) / math.sqrt(
+                float(sweep_matrix.shape[0])
+            )
+            half = float(scalar_crit) * se
+        else:
+            half = np.full_like(mu, np.nan, dtype=float)
+        fig, ax = plt.subplots(figsize=(6.5, 4.0))
+        _plot_mean_band(
+            ax,
+            delta_r,
+            mu,
+            mu - half,
+            mu + half,
+            label="ensemble mean",
+            show_band=True,
+        )
+        if show_boxes:
+            for row in sweep_matrix:
+                ax.plot(delta_r, row, linewidth=0.6, alpha=0.25, color="0.5")
+        ax.set_xlabel(f"cutoff shift [{_distance_unit_label()}]")
+        ax.set_ylabel("coordination-defect fraction")
+        ax.set_title(f"Coordination cutoff sensitivity: {_clean_name(name)}")
+        ax.legend(frameon=False)
+        fig.suptitle(base2)
+        pages.append((f"coordination_sweep_{name}", fig))
 
     # curve pages
     # descriptors plot informative
@@ -2117,7 +3792,9 @@ def plot_production_results(
 
         if kind in ("bondlen_cdf", "angle_cdf", "void_cdf"):
             if xgrid.size < 3:
-                continue
+                raise RuntimeError(
+                    f"Declared distribution {nm!r} needs at least three CDF grid points for density plotting"
+                )
             dx = np.diff(xgrid)
             if not np.all(dx > 0):
                 raise RuntimeError(f"Non-increasing grid for '{nm}'.")
@@ -2151,7 +3828,9 @@ def plot_production_results(
 
         elif kind == "coord_cdf":
             if xgrid.size < 2:
-                continue
+                raise RuntimeError(
+                    f"Declared coordination distribution {nm!r} has fewer than two support points"
+                )
             pmf = np.zeros_like(X, dtype=float)
             pmf[:, 0] = X[:, 0]
             pmf[:, 1:] = X[:, 1:] - X[:, :-1]
@@ -2200,7 +3879,9 @@ def plot_production_results(
                 se = sd / math.sqrt(float(N)) if N >= 2 else np.full_like(mu, np.nan)
                 half = crit_N * se
             if mu.size < 2:
-                continue
+                raise RuntimeError(
+                    f"Declared sampled curve {nm!r} has fewer than two finite points"
+                )
             fig = _plot_curve_page(
                 x=x,
                 mu=mu,
@@ -2214,7 +3895,9 @@ def plot_production_results(
             )
 
         else:
-            continue
+            raise RuntimeError(
+                f"Declared distribution {nm!r} has unsupported plotting kind {kind!r}"
+            )
 
         fig.suptitle(base2)
         pages.append((nm, fig))
@@ -2264,22 +3947,46 @@ def plot_production_results(
             if isinstance(conv_report, dict):
                 rep = (conv_report.get("distributions", {}) or {}).get(name, None)
                 if isinstance(rep, dict):
-                    mu = np.asarray(rep.get("mean", []), dtype=float)
-                    hw = np.asarray(rep.get("ci_halfwidth", []), dtype=float)
-                    if mu.size > 0 and hw.size == mu.size:
-                        if kind == "gr":
-                            x = np.asarray(src_boxes[0]["distributions"]["gr"][name]["r"], dtype=float)
-                        elif kind == "sq":
-                            x = np.asarray(src_boxes[0]["distributions"]["sq"][name]["q"], dtype=float)
-                        elif kind == "bondlen":
-                            x = np.asarray(src_boxes[0]["distributions"]["bondlen"][name]["x"], dtype=float)
-                        elif kind == "void":
-                            x = np.asarray(src_boxes[0]["distributions"]["void"][name]["x"], dtype=float)
-                        elif kind == "angle":
-                            x = np.asarray(src_boxes[0]["distributions"]["angle"][name]["x"], dtype=float)
-                        else:
-                            x = np.arange(mu.size, dtype=float)
-                        return x, mu, hw
+                    try:
+                        hw = np.asarray(rep.get("ci_halfwidth", []), dtype=float)
+                    except Exception:
+                        hw = np.asarray([], dtype=float)
+                    if kind in {"bondlen", "void", "angle", "coord"}:
+                        report_payload: dict[str, Any] = {"cdf": rep.get("mean", [])}
+                        if "x" in rep:
+                            report_payload["x"] = rep.get("x")
+                        try:
+                            x, mu, _axis_source = _validated_plot_cdf_payload(
+                                report_payload,
+                                allow_implicit_integer_axis=(kind == "coord"),
+                            )
+                        except ValueError:
+                            x = np.asarray([], dtype=float)
+                            mu = np.asarray([], dtype=float)
+                        if x.size > 0 and hw.size == mu.size and np.all(np.isfinite(hw)):
+                            return x, mu, hw
+                    else:
+                        try:
+                            mu = np.asarray(rep.get("mean", []), dtype=float)
+                            if kind == "gr":
+                                x = np.asarray(rep.get("r", rep.get("x", [])), dtype=float)
+                            else:
+                                x = np.asarray(rep.get("q", rep.get("x", [])), dtype=float)
+                        except Exception:
+                            x = np.asarray([], dtype=float)
+                            mu = np.asarray([], dtype=float)
+                        if (
+                            x.ndim == 1
+                            and mu.ndim == 1
+                            and x.size >= 2
+                            and mu.size == x.size
+                            and hw.size == mu.size
+                            and np.all(np.isfinite(x))
+                            and np.all(np.diff(x) > 0.0)
+                            and np.all(np.isfinite(mu))
+                            and np.all(np.isfinite(hw))
+                        ):
+                            return x, mu, hw
 
             # fallback
             if kind == "gr":
@@ -2288,21 +3995,28 @@ def plot_production_results(
             elif kind == "sq":
                 curves = [np.asarray(b["distributions"]["sq"][name]["s"], dtype=float) for b in src_boxes]
                 x = np.asarray(src_boxes[0]["distributions"]["sq"][name]["q"], dtype=float)
-            elif kind == "bondlen":
-                curves = [np.asarray(b["distributions"]["bondlen"][name]["cdf"], dtype=float) for b in src_boxes]
-                x = np.asarray(src_boxes[0]["distributions"]["bondlen"][name]["x"], dtype=float)
-            elif kind == "void":
-                curves = [np.asarray(b["distributions"]["void"][name]["cdf"], dtype=float) for b in src_boxes]
-                x = np.asarray(src_boxes[0]["distributions"]["void"][name]["x"], dtype=float)
-            elif kind == "angle":
-                curves = [np.asarray(b["distributions"]["angle"][name]["cdf"], dtype=float) for b in src_boxes]
-                x = np.asarray(src_boxes[0]["distributions"]["angle"][name]["x"], dtype=float)
             else:
-                curves = [np.asarray(b["distributions"]["coord"][name]["cdf"], dtype=float) for b in src_boxes]
-                p = int(max(c.size for c in curves))
-                curves = [np.concatenate([c, np.ones((p - c.size,), dtype=float)]) if c.size < p else c[:p] for c in curves]
-                x = np.arange(p, dtype=float)
-            mat = np.vstack(curves)
+                payloads: list[Mapping[str, Any]] = []
+                try:
+                    for b in src_boxes:
+                        fam = ((b.get("distributions", {}) or {}).get(kind, {}) or {})
+                        payload = fam.get(name, None) if isinstance(fam, Mapping) else None
+                        if not isinstance(payload, Mapping):
+                            raise ValueError("missing CDF payload")
+                        payloads.append(payload)
+                    x, mat, _meta = _align_plot_cdf_payloads(
+                        payloads,
+                        allow_implicit_integer_axis=(kind == "coord"),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return (
+                        np.asarray([], dtype=float),
+                        np.asarray([], dtype=float),
+                        np.asarray([], dtype=float),
+                    )
+                curves = []
+            if kind in {"gr", "sq"}:
+                mat = np.vstack(curves)
             mu = np.nanmean(mat, axis=0)
             sd = np.nanstd(mat, axis=0, ddof=1)
             z = float((conv_report or {}).get("zscore", 2.0)) if isinstance(conv_report, dict) else 2.0
@@ -2346,14 +4060,15 @@ def plot_production_results(
             ax.plot(x_df, mu_df, label="DFT-opt")
             if mu_df.size == hw_df.size and mu_df.size > 0:
                 ax.fill_between(x_df, mu_df - hw_df, mu_df + hw_df, alpha=0.12)
+            distance_unit = _distance_unit_label()
             ax.set_xlabel(
-                f"r [{unit}]"
+                f"r [{distance_unit}]"
                 if kind in ("gr", "bondlen")
                 else (
-                    f"q [1/{unit}]"
+                    f"q [1/{distance_unit}]"
                     if kind == "sq"
                     else (
-                        f"clearance r [{unit}]"
+                        f"clearance r [{distance_unit}]"
                         if kind == "void"
                         else ("θ [deg]" if kind == "angle" else ("k" if kind == "coord" else "x"))
                     )
@@ -2452,8 +4167,11 @@ def plot_metrics_timeseries(
 
     _apply_publication_style(base_fontsize=10.0)
 
+    dpi = _require_positive_integer(dpi, context="dpi")
     in_path = Path(input_csv)
     out_path = Path(output)
+    if max_pages is not None:
+        max_pages = _require_positive_integer(max_pages, context="max_pages")
 
     # read numeric csv
     with in_path.open("r", newline="", errors="replace") as f:
@@ -2486,16 +4204,60 @@ def plot_metrics_timeseries(
     if xcol not in col_idx:
         raise ValueError(f"Missing required column for xaxis='{xaxis}': {xcol}")
     x = data[:, col_idx[xcol]]
+    if not np.any(np.isfinite(x)):
+        raise ValueError(
+            f"metrics-timeseries x column {xcol!r} contains no finite values"
+        )
 
     # determine metric plot
     skip = {"Step", "time"}
     cand = [c for c in cols if c not in skip]
     if metrics is not None:
         req = [str(m) for m in metrics]
+        missing = [name for name in req if name not in cand]
+        if missing:
+            raise ValueError(
+                "Requested metric column(s) are absent from the CSV: "
+                + ", ".join(missing)
+            )
         req_set = set(req)
         cand = [c for c in cand if c in req_set]
     if not cand:
         raise ValueError("No metric columns selected")
+
+    def _draw_metric(ax: Any, name: str) -> None:
+        """Plot available samples or explicitly report an unavailable metric.
+
+        Some valid structural descriptors are undefined for a particular set
+        of frames.  For example, a first-peak FWHM has no value unless both
+        half-height crossings are bracketed.  The CSV deliberately represents
+        that state as NaN.  A requested diagnostic plot must preserve and
+        disclose the unavailable state rather than either inventing a value or
+        aborting an otherwise valid production box.
+        """
+
+        y = np.asarray(data[:, col_idx[name]], dtype=float)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if np.any(finite):
+            # Keep unavailable samples as gaps so a line cannot imply evidence
+            # across a frame whose descriptor was undefined.
+            x_plot = np.where(finite, x, np.nan)
+            y_plot = np.where(finite, y, np.nan)
+            ax.plot(x_plot, y_plot)
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "Metric unavailable: no finite values in selected frames",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+            )
+        ax.set_xlabel(xcol)
+        ax.set_ylabel(str(name))
+        ax.grid(False)
+        if title is not None:
+            ax.set_title(str(title))
 
     def _slug(s: str) -> str:
         out = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in str(s))
@@ -2513,13 +4275,7 @@ def plot_metrics_timeseries(
                     break
                 fig = plt.figure(figsize=(6.5, 4.0), dpi=int(dpi))
                 ax = fig.add_subplot(1, 1, 1)
-                y = data[:, col_idx[nm]]
-                ax.plot(x, y)
-                ax.set_xlabel(xcol)
-                ax.set_ylabel(str(nm))
-                ax.grid(False)
-                if title is not None:
-                    ax.set_title(str(title))
+                _draw_metric(ax, nm)
                 _style_figure(fig)
                 fig.tight_layout()
                 pdf.savefig(fig)
@@ -2533,13 +4289,7 @@ def plot_metrics_timeseries(
                 break
             fig = plt.figure(figsize=(6.5, 4.0), dpi=int(dpi))
             ax = fig.add_subplot(1, 1, 1)
-            y = data[:, col_idx[nm]]
-            ax.plot(x, y)
-            ax.set_xlabel(xcol)
-            ax.set_ylabel(str(nm))
-            ax.grid(False)
-            if title is not None:
-                ax.set_title(str(title))
+            _draw_metric(ax, nm)
             _style_figure(fig)
             fig.tight_layout()
             fig.savefig(out_path / f"{_slug(nm)}.png", dpi=int(dpi))
@@ -2551,13 +4301,7 @@ def plot_metrics_timeseries(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig = plt.figure(figsize=(6.5, 4.0), dpi=int(dpi))
     ax = fig.add_subplot(1, 1, 1)
-    y = data[:, col_idx[nm]]
-    ax.plot(x, y)
-    ax.set_xlabel(xcol)
-    ax.set_ylabel(str(nm))
-    ax.grid(False)
-    if title is not None:
-        ax.set_title(str(title))
+    _draw_metric(ax, nm)
     _style_figure(fig)
     fig.tight_layout()
     fig.savefig(out_path, dpi=int(dpi))
@@ -2576,6 +4320,8 @@ def _prepare_production_plot_payload(json_path: Path) -> tuple[dict[str, Any], d
 
     path = Path(json_path)
     data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("Production plotting input must be a JSON object")
 
     prod_raw = data.get("production", None)
     if isinstance(prod_raw, Mapping) and bool(prod_raw.get("enabled", False)):
@@ -2598,18 +4344,83 @@ def _prepare_production_plot_payload(json_path: Path) -> tuple[dict[str, Any], d
             continue
         box = dict(entry)
         if box.get("box_id", None) is None and box.get("box", None) is not None:
-            try:
-                box["box_id"] = int(box.get("box"))
-            except Exception:
-                box["box_id"] = box.get("box")
+            # Preserve the serialized value for the strict validator.  An
+            # eager int() here used to coerce True and fractional ids before
+            # validation, masking malformed or ambiguous provenance.
+            box["box_id"] = box.get("box")
         boxes.append(box)
+
+    conv_norm = dict(data.get("convergence", {}) or {})
+
+    def _load_ensemble_cdf_sidecar() -> dict[str, Any]:
+        ref = data.get("ensemble_cdfs", None)
+        if not isinstance(ref, Mapping):
+            return {}
+        rel = ref.get("path", None)
+        if not rel:
+            return {}
+        sidecar_path = (path.parent / str(rel)).resolve(strict=False)
+        if not sidecar_path.exists():
+            return {}
+        try:
+            payload = json.loads(sidecar_path.read_text())
+        except Exception:
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        out: dict[str, Any] = {}
+        direct = payload.get("distributions", {})
+        if isinstance(direct, Mapping):
+            for name, entry in direct.items():
+                if isinstance(entry, Mapping):
+                    out[str(name)] = dict(entry)
+        families = payload.get("families", {})
+        if isinstance(families, Mapping):
+            for _family, mapping in families.items():
+                if not isinstance(mapping, Mapping):
+                    continue
+                for name, entry in mapping.items():
+                    if not isinstance(entry, Mapping):
+                        continue
+                    d = dict(entry)
+                    if "mean" not in d and "mean_cdf" in d:
+                        d["mean"] = d.get("mean_cdf")
+                    if "cdf" not in d and "mean_cdf" in d:
+                        d["cdf"] = d.get("mean_cdf")
+                    out.setdefault(str(name), d)
+        return out
+
+    sidecar_dists = _load_ensemble_cdf_sidecar()
+    if sidecar_dists:
+        conv_d = dict(conv_norm.get("distributions", {}) or {})
+        for name, entry in sidecar_dists.items():
+            d = dict(entry)
+            if "mean" not in d and "mean_cdf" in d:
+                d["mean"] = d.get("mean_cdf")
+            if "cdf" not in d and "mean" in d:
+                d["cdf"] = d.get("mean")
+            conv_d.setdefault(str(name), d)
+        conv_norm["distributions"] = conv_d
+        conv_norm.setdefault("ensemble_cdf_sidecar_loaded", True)
 
     prod = {
         "enabled": True,
         "boxes": boxes,
-        "convergence": dict(data.get("convergence", {}) or {}),
+        "convergence": conv_norm,
         "convergence_spec": dict(data.get("convergence_spec", {}) or {}),
-        "converged": bool(data.get("converged", False)),
+        # Preserve tri-state convergence.  None/missing means unassessed, not
+        # failure, and must remain distinguishable in plot labels.
+        "converged": data.get("converged", None),
+        "check_convergence": data.get("check_convergence", None),
+        "convergence_status": data.get("convergence_status", None),
+        "convergence_inference_status": data.get(
+            "convergence_inference_status",
+            conv_norm.get("convergence_inference_status", None),
+        ),
+        "posthoc_convergence_criterion_met": data.get(
+            "posthoc_convergence_criterion_met",
+            conv_norm.get("posthoc_criterion_met", None),
+        ),
         "n_boxes": int(data.get("n_boxes", len(boxes)) or len(boxes)),
         "n_boxes_accepted": int(data.get("n_boxes_accepted", len(boxes)) or len(boxes)),
         "n_boxes_rejected": int(data.get("n_boxes_rejected", 0) or 0),
@@ -2642,6 +4453,8 @@ def _save_plot_pages(
     dpi: int,
     name_cleaner: Optional[Callable[[str], str]] = None,
 ) -> None:
+    if not pages:
+        raise ValueError("No plot pages were generated")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2670,9 +4483,44 @@ def _save_plot_pages(
             _style_figure(fig)
             fig.savefig(fn, dpi=int(dpi))
             plt.close(fig)
+    try:
+        import matplotlib.pyplot as _plt
+        _plt.close("all")
+    except Exception:
+        pass
 
 
 def plot_production_comparison_results(
+    json_paths: Sequence[Path],
+    out_path: Path,
+    *,
+    labels: Optional[Sequence[str]] = None,
+    title: Optional[str] = None,
+    dpi: int = 600,
+    max_pages: Optional[int] = None,
+) -> None:
+    """Compare production/analysis ensembles with exception-safe figures."""
+
+    try:
+        _plot_production_comparison_results_impl(
+            json_paths,
+            out_path,
+            labels=labels,
+            title=title,
+            dpi=dpi,
+            max_pages=max_pages,
+        )
+    except Exception:
+        # Comparison materialises several pages before later schema errors can
+        # be discovered.  Do not leak those figures into long-lived Python or
+        # validation processes when the operation fails.
+        import matplotlib.pyplot as plt
+
+        plt.close("all")
+        raise
+
+
+def _plot_production_comparison_results_impl(
     json_paths: Sequence[Path],
     out_path: Path,
     *,
@@ -2696,7 +4544,11 @@ def plot_production_comparison_results(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    dpi = _require_positive_integer(dpi, context="dpi")
     _apply_publication_style()
+
+    if max_pages is not None:
+        max_pages = _require_positive_integer(max_pages, context="max_pages")
 
     paths = [Path(p) for p in list(json_paths)]
     if len(paths) < 2:
@@ -2738,15 +4590,15 @@ def plot_production_comparison_results(
     def _slug_name(nm: str) -> str:
         return _clean_name(nm).replace(" ", "_").replace("–", "-").replace("/", "-")
 
-    def _distance_unit_label(units_style: str) -> str:
-        if units_style in ("metal", "real", "electron"):
+    def _distance_unit_label(units_style: str, *, canonical: bool = False) -> str:
+        if canonical:
             return "Å"
-        return "distance units"
+        return _native_length_unit_label(units_style) or "distance units"
 
-    def _density_unit_label(units_style: str) -> str:
-        if units_style in ("metal", "real", "electron"):
+    def _density_unit_label(units_style: str, *, canonical: bool = False) -> str:
+        if canonical:
             return "g/cm³"
-        return "density units"
+        return _thermo_unit_label("Density", units_style) or "density units"
 
     datasets: list[dict[str, Any]] = []
     seen_labels: dict[str, int] = {}
@@ -2758,9 +4610,10 @@ def plot_production_comparison_results(
             label = f"{label} ({seen_labels[label]})"
         else:
             seen_labels[label] = 1
-        boxes = list(prod.get("boxes", []) or [])
-        if not boxes:
+        raw_boxes = list(prod.get("boxes", []) or [])
+        if not raw_boxes:
             raise RuntimeError(f"No production boxes found in {path}")
+        boxes = _normalise_production_plot_boxes(raw_boxes)
         datasets.append(
             {
                 "label": label,
@@ -2771,8 +4624,25 @@ def plot_production_comparison_results(
                 "conv": dict(prod.get("convergence", {}) or {}),
                 "spec": dict(prod.get("convergence_spec", {}) or {}),
                 "units_style": str((data.get("units", {}) or {}).get("lammps_units", "") or "").strip().lower(),
+                "canonical_units": _uses_canonical_report_units(data),
             }
         )
+
+    canonical_flags = {bool(ds["canonical_units"]) for ds in datasets}
+    if len(canonical_flags) > 1:
+        raise ValueError(
+            "Cannot compare a mixture of canonical-reporting and legacy/native-unit "
+            "datasets without an explicit conversion contract"
+        )
+    if canonical_flags == {False}:
+        legacy_styles = {
+            str(ds["units_style"]) for ds in datasets if str(ds["units_style"])
+        }
+        if len(legacy_styles) > 1:
+            raise ValueError(
+                "Cannot compare legacy production datasets with different LAMMPS "
+                f"unit styles: {sorted(legacy_styles)}"
+            )
 
     def _metric_keys(ds: dict[str, Any]) -> set[str]:
         keys: set[str] = set()
@@ -2783,13 +4653,18 @@ def plot_production_comparison_results(
         return keys
 
     def _dist_names(ds: dict[str, Any], kind: str, spec_key: str) -> set[str]:
+        names: set[str] = set()
         spec_names = ds["spec"].get(spec_key, None)
         if isinstance(spec_names, list) and len(spec_names) > 0:
-            return {str(x) for x in spec_names}
-        try:
-            return {str(k) for k in (((ds["boxes"][0].get("distributions", {}) or {}).get(kind, {}) or {}).keys())}
-        except Exception:
-            return set()
+            names.update(str(x) for x in spec_names)
+        for box in ds["boxes"]:
+            try:
+                family = ((box.get("distributions", {}) or {}).get(kind, {}) or {})
+            except Exception:
+                family = {}
+            if isinstance(family, Mapping):
+                names.update(str(key) for key in family)
+        return names
 
     def _dist_entry(box: Mapping[str, Any], kind: str, name: str) -> dict[str, Any]:
         if not isinstance(box, Mapping):
@@ -2841,15 +4716,42 @@ def plot_production_comparison_results(
     def _curve_summary(ds: dict[str, Any], kind: str, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         rep = ((ds["conv"].get("distributions", {}) or {}).get(str(name), None))
         if isinstance(rep, Mapping):
-            if kind == "gr":
-                x = np.asarray(rep.get("r", rep.get("x", [])), dtype=float)
-            elif kind == "sq":
-                x = np.asarray(rep.get("q", rep.get("x", [])), dtype=float)
+            try:
+                half = np.asarray(rep.get("ci_halfwidth", []), dtype=float)
+            except Exception:
+                half = np.asarray([], dtype=float)
+            if kind in {"bondlen", "angle", "coord", "void"}:
+                report_payload: dict[str, Any] = {"cdf": rep.get("mean", [])}
+                if "x" in rep:
+                    report_payload["x"] = rep.get("x")
+                try:
+                    x, mu, _axis_source = _validated_plot_cdf_payload(
+                        report_payload,
+                        allow_implicit_integer_axis=(kind == "coord"),
+                    )
+                except ValueError:
+                    x = np.asarray([], dtype=float)
+                    mu = np.asarray([], dtype=float)
             else:
-                x = np.asarray(rep.get("x", []), dtype=float)
-            mu = np.asarray(rep.get("mean", []), dtype=float)
-            half = np.asarray(rep.get("ci_halfwidth", []), dtype=float)
-            if x.size > 0 and mu.size == x.size and half.size == x.size:
+                try:
+                    if kind == "gr":
+                        x = np.asarray(rep.get("r", rep.get("x", [])), dtype=float)
+                    else:
+                        x = np.asarray(rep.get("q", rep.get("x", [])), dtype=float)
+                    mu = np.asarray(rep.get("mean", []), dtype=float)
+                except Exception:
+                    x = np.asarray([], dtype=float)
+                    mu = np.asarray([], dtype=float)
+            if (
+                x.ndim == 1
+                and mu.ndim == 1
+                and x.size > 0
+                and mu.size == x.size
+                and half.size == x.size
+                and np.all(np.isfinite(x))
+                and np.all(np.isfinite(mu))
+                and (x.size == 1 or np.all(np.diff(x) > 0.0))
+            ):
                 return x, mu, half
 
         boxes = ds["boxes"]
@@ -2860,14 +4762,26 @@ def plot_production_comparison_results(
             curves = [np.asarray(_dist_entry(b, "sq", name).get("s", []), dtype=float) for b in boxes]
             x = np.asarray(_dist_entry(boxes[0], "sq", name).get("q", []), dtype=float)
         else:
-            curves = [np.asarray(_dist_entry(b, kind, name).get("cdf", []), dtype=float) for b in boxes]
-            x = np.asarray(_dist_entry(boxes[0], kind, name).get("x", []), dtype=float)
+            payloads = [_dist_entry(b, kind, name) for b in boxes]
+            try:
+                x, X, _meta = _align_plot_cdf_payloads(
+                    payloads,
+                    allow_implicit_integer_axis=(kind == "coord"),
+                )
+            except (TypeError, ValueError):
+                return (
+                    np.asarray([], dtype=float),
+                    np.asarray([], dtype=float),
+                    np.asarray([], dtype=float),
+                )
+            curves = []
         if x.size == 0:
             return np.asarray([], dtype=float), np.asarray([], dtype=float), np.asarray([], dtype=float)
-        mats = [c for c in curves if c.size == x.size]
-        if not mats:
-            return x, np.asarray([], dtype=float), np.asarray([], dtype=float)
-        X = np.vstack(mats)
+        if kind in {"gr", "sq"}:
+            mats = [c for c in curves if c.size == x.size]
+            if not mats:
+                return x, np.asarray([], dtype=float), np.asarray([], dtype=float)
+            X = np.vstack(mats)
         mu = np.nanmean(X, axis=0)
         if X.shape[0] < 2:
             return x, mu, np.full_like(mu, np.nan)
@@ -2929,21 +4843,30 @@ def plot_production_comparison_results(
             ring_mean_vec = np.asarray([float((b.get("metrics", {}) or {}).get("ring_mean_size", float("nan"))) for b in boxes], dtype=float)
 
         curve_mats: list[dict[str, Any]] = []
+        cdf_evidence_blocked = False
 
-        def _stack_cdf(kind: str, name: str, xkey: str = "x") -> None:
+        def _stack_cdf(
+            kind: str,
+            name: str,
+            xkey: str = "x",
+            *,
+            allow_implicit_integer_axis: bool = False,
+        ) -> None:
+            nonlocal cdf_evidence_blocked
             drep = (conv.get("distributions", {}) or {}).get(name, None)
             if not isinstance(drep, Mapping):
+                cdf_evidence_blocked = True
                 return
-            x0 = np.asarray(_dist_entry(boxes[0], kind, name).get(xkey, []), dtype=float)
-            if x0.size < 2:
+            payloads = [_dist_entry(b, kind, name) for b in boxes]
+            try:
+                _x0, mats, _meta = _align_plot_cdf_payloads(
+                    payloads,
+                    xkey=xkey,
+                    allow_implicit_integer_axis=allow_implicit_integer_axis,
+                )
+            except (TypeError, ValueError):
+                cdf_evidence_blocked = True
                 return
-            mats = np.zeros((N, int(x0.size)), dtype=float)
-            for i_box, b in enumerate(boxes):
-                d = _dist_entry(b, kind, name)
-                xi = np.asarray(d.get(xkey, []), dtype=float)
-                if xi.shape != x0.shape:
-                    return
-                mats[i_box, :] = np.asarray(d.get("cdf", []), dtype=float)
             curve_mats.append(
                 {
                     "group": drep.get("group", ""),
@@ -2963,34 +4886,10 @@ def plot_production_comparison_results(
             _stack_cdf("void", nm)
 
         for nm in coord_names:
-            drep = (conv.get("distributions", {}) or {}).get(nm, None)
-            if not isinstance(drep, Mapping):
-                continue
-            kmax = 0
-            for b in boxes:
-                cdf = np.asarray(_dist_entry(b, "coord", nm).get("cdf", []), dtype=float)
-                if cdf.size > 0:
-                    kmax = max(kmax, int(cdf.size) - 1)
-            if kmax < 1:
-                continue
-            p = int(kmax + 1)
-            mats = np.zeros((N, p), dtype=float)
-            for i_box, b in enumerate(boxes):
-                cdf = np.asarray(_dist_entry(b, "coord", nm).get("cdf", []), dtype=float)
-                if cdf.size == 0:
-                    return np.arange(2, N + 1, dtype=int), np.full((max(N - 1, 0),), np.nan, dtype=float), None
-                if cdf.size < p:
-                    cdf = np.concatenate([cdf, np.ones((p - cdf.size,), dtype=float)])
-                mats[i_box, :] = cdf[:p]
-            curve_mats.append(
-                {
-                    "group": drep.get("group", ""),
-                    "kind": str(drep.get("kind", "")),
-                    "name": str(nm),
-                    "mat": mats,
-                    "abs_tol": float(drep.get("abs_tol", 0.0)),
-                    "rel_tol": float(drep.get("rel_tol", 0.0)),
-                }
+            _stack_cdf(
+                "coord",
+                nm,
+                allow_implicit_integer_axis=True,
             )
 
         for lab in gr_labels:
@@ -3097,7 +4996,7 @@ def plot_production_comparison_results(
 
         for n in n_grid.tolist():
             crit, _ = _critical_value(int(n), alpha_test)
-            gmax = 0.0
+            gmax = float("inf") if cdf_evidence_blocked else 0.0
 
             mu, sd = _mean_sd_from_sums(dens_S[n - 1], dens_Q[n - 1], n)
             gmax = max(gmax, _ratio_from_mu_sd(np.asarray([mu]), np.asarray([sd]), n, dens_abs, dens_rel, crit, bounded=False))
@@ -3138,26 +5037,70 @@ def plot_production_comparison_results(
             n_conv = int(n_grid[np.argmax(ok_mask)])
         return n_grid, arr, n_conv
 
-    common_metric_keys = sorted(set.intersection(*[_metric_keys(ds) for ds in datasets])) if datasets else []
-    common_metric_keys = [k for k in common_metric_keys if not str(k).startswith("ring_frac_")]
+    def _declared_scalar_metric_keys(ds: dict[str, Any]) -> set[str]:
+        keys = set(_metric_keys(ds))
+        scalar_report = ds["conv"].get("scalars", {}) or {}
+        if isinstance(scalar_report, Mapping):
+            keys.update(str(key) for key in scalar_report)
+        return keys
 
-    common_ring_keys = sorted(
-        set.intersection(*[{str(x) for x in list(ds["spec"].get("ring_keys", []) or [])} for ds in datasets]) if datasets else set(),
+    # Comparison is an audit surface, so use the deterministic union rather
+    # than silently discarding metrics that are absent from one dataset.  The
+    # individual pages explicitly identify unavailable datasets below.
+    comparison_metric_keys = sorted(
+        set.union(*[_declared_scalar_metric_keys(ds) for ds in datasets])
+        if datasets
+        else set()
+    )
+    comparison_metric_keys = [
+        key
+        for key in comparison_metric_keys
+        if key not in {"density", "ring_mean_size"}
+        and not str(key).startswith("ring_frac_")
+    ]
+
+    comparison_ring_keys = sorted(
+        set.union(
+            *[
+                {
+                    *(
+                        str(x)
+                        for x in list(ds["spec"].get("ring_keys", []) or [])
+                    ),
+                    *(
+                        key
+                        for key in _declared_scalar_metric_keys(ds)
+                        if str(key).startswith("ring_frac_")
+                    ),
+                }
+                for ds in datasets
+            ]
+        )
+        if datasets
+        else set(),
         key=lambda x: int(str(x).split("ring_frac_")[-1]) if str(x).startswith("ring_frac_") else str(x),
     )
 
-    common_bond_names = sorted(set.intersection(*[_dist_names(ds, "bondlen", "bondlen_names") for ds in datasets])) if datasets else []
-    common_angle_names = sorted(set.intersection(*[_dist_names(ds, "angle", "angle_names") for ds in datasets])) if datasets else []
-    common_coord_names = sorted(set.intersection(*[_dist_names(ds, "coord", "coord_names") for ds in datasets])) if datasets else []
-    common_void_names = sorted(set.intersection(*[_dist_names(ds, "void", "void_names") for ds in datasets])) if datasets else []
-    common_gr_labels = sorted(set.intersection(*[_dist_names(ds, "gr", "gr_labels") for ds in datasets])) if datasets else []
-    common_sq_labels = sorted(set.intersection(*[_dist_names(ds, "sq", "sq_labels") for ds in datasets])) if datasets else []
+    def _comparison_dist_names(kind: str, spec_key: str) -> list[str]:
+        return sorted(
+            set.union(*[_dist_names(ds, kind, spec_key) for ds in datasets])
+            if datasets
+            else set()
+        )
+
+    comparison_bond_names = _comparison_dist_names("bondlen", "bondlen_names")
+    comparison_angle_names = _comparison_dist_names("angle", "angle_names")
+    comparison_coord_names = _comparison_dist_names("coord", "coord_names")
+    comparison_void_names = _comparison_dist_names("void", "void_names")
+    comparison_gr_labels = _comparison_dist_names("gr", "gr_labels")
+    comparison_sq_labels = _comparison_dist_names("sq", "sq_labels")
 
     pages: list[tuple[str, Any]] = []
 
     primary_units = next((str(ds["units_style"]) for ds in datasets if str(ds["units_style"])), "")
-    dist_unit = _distance_unit_label(primary_units)
-    density_ylabel = f"density [{_density_unit_label(primary_units)}]"
+    all_canonical = all(bool(ds.get("canonical_units", False)) for ds in datasets)
+    dist_unit = _distance_unit_label(primary_units, canonical=all_canonical)
+    density_ylabel = f"density [{_density_unit_label(primary_units, canonical=all_canonical)}]"
 
     def _alpha_for_dataset(ds: dict[str, Any]) -> float:
         alpha = _maybe_float(((ds["conv"].get("familywise", {}) or {}).get("alpha_per_test", 0.05)), default=0.05)
@@ -3195,24 +5138,14 @@ def plot_production_comparison_results(
             return np.asarray([], dtype=float), np.empty((0, 0), dtype=float)
         kind = str(kind)
         name = str(name)
-        if kind == "coord":
-            kmax = -1
-            raw: list[np.ndarray] = []
-            for b in boxes:
-                cdf = np.asarray(_dist_entry(b, "coord", name).get("cdf", []), dtype=float)
-                if cdf.size == 0:
-                    return np.asarray([], dtype=float), np.empty((0, 0), dtype=float)
-                raw.append(cdf)
-                kmax = max(kmax, int(cdf.size) - 1)
-            if kmax < 0:
+        if kind in {"bondlen", "angle", "coord", "void"}:
+            try:
+                return _align_plot_cdf_payloads(
+                    [_dist_entry(b, kind, name) for b in boxes],
+                    allow_implicit_integer_axis=(kind == "coord"),
+                )[:2]
+            except (TypeError, ValueError):
                 return np.asarray([], dtype=float), np.empty((0, 0), dtype=float)
-            p = int(kmax + 1)
-            mat = []
-            for cdf in raw:
-                if cdf.size < p:
-                    cdf = np.concatenate([cdf, np.ones((p - cdf.size,), dtype=float)])
-                mat.append(cdf[:p])
-            return np.arange(p, dtype=float), np.vstack(mat)
 
         if kind == "gr":
             xkey, ykey = "r", "g"
@@ -3221,21 +5154,20 @@ def plot_production_comparison_results(
         else:
             xkey, ykey = "x", "cdf"
 
-        first = _dist_entry(boxes[0], kind, name)
-        x0 = np.asarray(first.get(xkey, []), dtype=float)
-        if x0.size == 0:
-            return np.asarray([], dtype=float), np.empty((0, 0), dtype=float)
-        rows = []
-        for b in boxes:
-            d = _dist_entry(b, kind, name)
-            xi = np.asarray(d.get(xkey, []), dtype=float)
-            yi = np.asarray(d.get(ykey, []), dtype=float)
-            if xi.size != x0.size or yi.size != x0.size:
+        if kind in {"gr", "sq"}:
+            try:
+                payloads = [_dist_entry(b, kind, name) for b in boxes]
+                x_common, matrix, _meta = _align_sampled_plot_payloads(
+                    payloads,
+                    family=kind,
+                    xkey=xkey,
+                    ykey=ykey,
+                )
+                return x_common, matrix
+            except (KeyError, TypeError, ValueError, RuntimeError):
                 return np.asarray([], dtype=float), np.empty((0, 0), dtype=float)
-            if xi.size and np.nanmax(np.abs(xi - x0)) > 1e-10:
-                return np.asarray([], dtype=float), np.empty((0, 0), dtype=float)
-            rows.append(yi)
-        return x0, np.vstack(rows) if rows else np.empty((0, 0), dtype=float)
+
+        return np.asarray([], dtype=float), np.empty((0, 0), dtype=float)
 
     def _matrix_mean_half(ds: dict[str, Any], mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         mat = np.asarray(mat, dtype=float)
@@ -3315,11 +5247,35 @@ def plot_production_comparison_results(
         fig, ax = plt.subplots(figsize=(6.5, 4.0))
         vals_by_dataset: list[tuple[dict[str, Any], np.ndarray]] = []
         all_vals: list[np.ndarray] = []
+        unavailable: list[str] = []
+        summary_only: list[str] = []
         for ds in datasets:
             vals = _scalar_values(ds, key)
-            if vals.size:
-                vals_by_dataset.append((ds, vals))
-                all_vals.append(vals)
+            if not vals.size:
+                mu, half = _scalar_summary(ds, key)
+                if np.isfinite(mu):
+                    summary_only.append(str(ds["label"]))
+                    summary = f"{ds['label']}: summary only (no finite per-box values)"
+                    ax.axvline(
+                        mu,
+                        linestyle="--",
+                        linewidth=1.0,
+                        label=summary,
+                    )
+                    if np.isfinite(half) and half > 0.0:
+                        ax.axvspan(mu - half, mu + half, alpha=0.10, linewidth=0.0)
+                else:
+                    unavailable.append(str(ds["label"]))
+                    ax.plot(
+                        [],
+                        [],
+                        linestyle="None",
+                        marker="x",
+                        label=f"{ds['label']}: unavailable (no finite values)",
+                    )
+                continue
+            vals_by_dataset.append((ds, vals))
+            all_vals.append(vals)
         if all_vals:
             all_concat = np.concatenate(all_vals)
             bins = np.histogram_bin_edges(all_concat, bins="auto") if all_concat.size >= 2 else 10
@@ -3331,8 +5287,24 @@ def plot_production_comparison_results(
                     ax.axvline(mu, linestyle="--", linewidth=1.0, color=line_color)
                 if np.isfinite(mu) and np.isfinite(half) and half > 0.0:
                     ax.axvspan(mu - half, mu + half, color=line_color, alpha=0.10, linewidth=0.0)
-        else:
-            ax.text(0.5, 0.5, f"No {page_title.lower()} values", transform=ax.transAxes, ha="center", va="center")
+        elif unavailable and not summary_only:
+            ax.text(
+                0.5,
+                0.5,
+                "No dataset contains finite per-box or summary values",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+        elif summary_only:
+            ax.text(
+                0.5,
+                0.5,
+                "Finite per-box values unavailable; summary markers shown where available",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
         ax.set_xlabel(xlabel)
         ax.set_ylabel("probability density")
         ax.set_title(page_title)
@@ -3343,7 +5315,7 @@ def plot_production_comparison_results(
     def _ring_fraction_page() -> Any:
         fig, ax = plt.subplots(figsize=(6.5, 4.0))
         sizes: list[int] = []
-        for k in common_ring_keys:
+        for k in comparison_ring_keys:
             try:
                 sizes.append(int(str(k).split("ring_frac_")[-1]))
             except Exception:
@@ -3355,16 +5327,41 @@ def plot_production_comparison_results(
         for off, ds in zip(offsets, datasets):
             mu = []
             half = []
-            for key in common_ring_keys:
+            for key in comparison_ring_keys:
                 m, h = _scalar_summary(ds, key)
                 mu.append(m)
                 half.append(h)
             y = np.asarray(mu, dtype=float)
             err = np.asarray(half, dtype=float)
-            bars = ax.bar(x + float(off), y, width=width, label=ds["label"], alpha=0.72, edgecolor=OKABE_ITO["black"], linewidth=0.6)
-            col = bars.patches[0].get_facecolor() if bars.patches else None
-            if y.size == err.size and np.any(np.isfinite(err)):
-                ax.errorbar(x + float(off), y, yerr=err, fmt="none", ecolor=OKABE_ITO["black"], capsize=2.5, linewidth=1.0)
+            finite = np.isfinite(y)
+            if np.any(finite):
+                ax.bar(x[finite] + float(off), y[finite], width=width, label=ds["label"], alpha=0.72, edgecolor=OKABE_ITO["black"], linewidth=0.6)
+                finite_err = finite & np.isfinite(err)
+                if np.any(finite_err):
+                    ax.errorbar(x[finite_err] + float(off), y[finite_err], yerr=err[finite_err], fmt="none", ecolor=OKABE_ITO["black"], capsize=2.5, linewidth=1.0)
+            else:
+                ax.plot(
+                    [],
+                    [],
+                    linestyle="None",
+                    marker="x",
+                    label=f"{ds['label']}: unavailable",
+                )
+            missing = [
+                str(key)
+                for key, available in zip(comparison_ring_keys, finite.tolist())
+                if not available
+            ]
+            if missing:
+                ax.text(
+                    0.01,
+                    0.98 - 0.055 * float(datasets.index(ds)),
+                    f"{ds['label']} unavailable: {', '.join(missing)}",
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=7,
+                )
         ax.set_xlabel("ring size")
         ax.set_ylabel("fraction")
         ax.set_title("Ring statistics")
@@ -3372,9 +5369,27 @@ def plot_production_comparison_results(
         fig.suptitle((str(title) + " | " if title else "") + "Ring statistics")
         return fig
 
-    def _curve_overlay_page(kind: str, name: str, *, xlabel: str, ylabel: str) -> Any:
+    def _curve_overlay_page(
+        kind: str,
+        name: str,
+        *,
+        spec_key: str,
+        xlabel: str,
+        ylabel: str,
+    ) -> Any:
         fig, ax = plt.subplots(figsize=(6.5, 4.0))
+        n_available = 0
         for ds in datasets:
+            declared = name in _dist_names(ds, kind, spec_key)
+            if not declared:
+                ax.plot(
+                    [],
+                    [],
+                    linestyle="None",
+                    marker="x",
+                    label=f"{ds['label']}: unavailable (not declared/emitted)",
+                )
+                continue
             if kind in {"bondlen", "angle", "void"}:
                 x, mu, half = _cdf_density_summary(ds, kind, name)
             elif kind == "coord":
@@ -3382,8 +5397,26 @@ def plot_production_comparison_results(
             else:
                 x, mu, half = _curve_summary(ds, kind, name)
             if x.size == 0 or mu.size == 0:
-                continue
+                raise ValueError(
+                    f"Comparison distribution {name!r} ({kind}) is declared for "
+                    f"dataset {ds['label']!r} but has no usable finite payload"
+                )
+            _require_finite_plot_points(
+                x,
+                mu,
+                context=f"comparison distribution {name!r} dataset {ds['label']!r}",
+            )
             _overlay_line_with_band(ax, x, mu, half, label=ds["label"])
+            n_available += 1
+        if n_available == 0:
+            ax.text(
+                0.5,
+                0.5,
+                "Distribution unavailable in every dataset",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(_clean_name(name))
@@ -3395,10 +5428,21 @@ def plot_production_comparison_results(
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     for ds in datasets:
         n_grid, trend_all, n_conv = _compute_trend(ds)
-        if n_grid.size == 0 or trend_all.size == 0:
-            continue
+        assessment = _production_convergence_display(ds["prod"], ds["conv"])
         lab = str(ds["label"])
-        lab_plot = f"{lab} (n*={n_conv})" if n_conv is not None else f"{lab} (not converged)"
+        if n_grid.size == 0 or trend_all.size == 0:
+            ax.plot(
+                [],
+                [],
+                label=f"{lab} — {assessment['label']}; retrospective trend unavailable",
+            )
+            continue
+        crossing = (
+            f"retrospective threshold n={int(n_conv)}"
+            if n_conv is not None
+            else "no retrospective threshold crossing"
+        )
+        lab_plot = f"{lab} — {assessment['label']}; {crossing}"
         ax.plot(n_grid, trend_all, label=lab_plot)
         if n_conv is not None:
             ax.axvline(int(n_conv), linestyle=":", linewidth=1.0, alpha=0.35)
@@ -3406,40 +5450,111 @@ def plot_production_comparison_results(
     ax.set_xlabel("number of boxes")
     ax.set_ylabel("max(ratio / tolerance)")
     ax.set_yscale("log")
-    ax.set_title("Production convergence trend")
+    ax.set_title("Retrospective production convergence diagnostic")
     ax.legend()
+    ax.text(
+        0.02,
+        0.02,
+        "Threshold crossings are diagnostics, not ensemble stopping decisions.",
+        transform=ax.transAxes,
+        va="bottom",
+        ha="left",
+    )
     fig.suptitle(str(title) if title is not None else "vitriflow production comparison")
     pages.append(("convergence_comparison", fig))
 
     # Density page mirrors plot-production's density histogram, with overlaid datasets.
     pages.append(("density", _overlay_histogram_page("density", page_title="Density across boxes", xlabel=density_ylabel)))
 
-    if common_ring_keys:
+    if comparison_ring_keys:
         pages.append(("rings", _ring_fraction_page()))
 
-    has_common_ring_mean = bool(
+    has_comparison_ring_mean = bool(
         datasets
-        and all(
+        and any(
             bool(ds["spec"].get("ring_has_mean_size", False))
-            or _scalar_values(ds, "ring_mean_size").size > 0
+            or "ring_mean_size" in _declared_scalar_metric_keys(ds)
             for ds in datasets
         )
     )
-    if has_common_ring_mean:
+    if has_comparison_ring_mean:
         pages.append(("ring_mean", _overlay_histogram_page("ring_mean_size", page_title="Mean ring size across boxes", xlabel="mean ring size")))
 
-    for name in common_bond_names:
-        pages.append((name, _curve_overlay_page("bondlen", str(name), xlabel=f"r [{dist_unit}]", ylabel="probability density")))
-    for name in common_angle_names:
-        pages.append((name, _curve_overlay_page("angle", str(name), xlabel="θ [deg]", ylabel="probability density")))
-    for name in common_coord_names:
-        pages.append((name, _curve_overlay_page("coord", str(name), xlabel="k", ylabel="probability mass")))
-    for name in common_void_names:
-        pages.append((name, _curve_overlay_page("void", str(name), xlabel=f"clearance r [{dist_unit}]", ylabel="probability density")))
-    for name in common_gr_labels:
-        pages.append((name, _curve_overlay_page("gr", str(name), xlabel=f"r [{dist_unit}]", ylabel="g(r)")))
-    for name in common_sq_labels:
-        pages.append((name, _curve_overlay_page("sq", str(name), xlabel=f"q [1/{dist_unit}]", ylabel="S(q)")))
+    for key in comparison_metric_keys:
+        pages.append(
+            (
+                f"scalar_{key}",
+                _overlay_histogram_page(
+                    str(key),
+                    page_title=_clean_name(str(key)),
+                    xlabel=_clean_name(str(key)),
+                ),
+            )
+        )
+
+    sweep_by_dataset = [
+        _coordination_sweep_matrices(ds["boxes"]) for ds in datasets
+    ]
+    comparison_sweep_names = sorted(
+        set.union(*[set(sweeps) for sweeps in sweep_by_dataset])
+        if sweep_by_dataset
+        else set()
+    )
+    for name in comparison_sweep_names:
+        fig, ax = plt.subplots(figsize=(6.5, 4.0))
+        for ds, sweeps in zip(datasets, sweep_by_dataset):
+            if name not in sweeps:
+                ax.plot(
+                    [],
+                    [],
+                    linestyle="None",
+                    marker="x",
+                    label=f"{ds['label']}: unavailable (not emitted)",
+                )
+                continue
+            delta_r, matrix = sweeps[name]
+            mu = np.mean(matrix, axis=0)
+            if matrix.shape[0] >= 2:
+                crit, _crit_method = _critical_value(
+                    int(matrix.shape[0]),
+                    _alpha_for_dataset(ds),
+                )
+                half = (
+                    float(crit)
+                    * np.std(matrix, axis=0, ddof=1)
+                    / math.sqrt(float(matrix.shape[0]))
+                )
+            else:
+                half = np.full_like(mu, np.nan, dtype=float)
+            _overlay_line_with_band(
+                ax,
+                delta_r,
+                mu,
+                half,
+                label=str(ds["label"]),
+            )
+        ax.set_xlabel(f"cutoff shift [{dist_unit}]")
+        ax.set_ylabel("coordination-defect fraction")
+        ax.set_title(f"Coordination cutoff sensitivity: {_clean_name(name)}")
+        ax.legend()
+        fig.suptitle(
+            (str(title) + " | " if title else "")
+            + f"Coordination cutoff sensitivity: {_clean_name(name)}"
+        )
+        pages.append((f"coordination_sweep_{name}", fig))
+
+    for name in comparison_bond_names:
+        pages.append((name, _curve_overlay_page("bondlen", str(name), spec_key="bondlen_names", xlabel=f"r [{dist_unit}]", ylabel="probability density")))
+    for name in comparison_angle_names:
+        pages.append((name, _curve_overlay_page("angle", str(name), spec_key="angle_names", xlabel="θ [deg]", ylabel="probability density")))
+    for name in comparison_coord_names:
+        pages.append((name, _curve_overlay_page("coord", str(name), spec_key="coord_names", xlabel="k", ylabel="probability mass")))
+    for name in comparison_void_names:
+        pages.append((name, _curve_overlay_page("void", str(name), spec_key="void_names", xlabel=f"clearance r [{dist_unit}]", ylabel="probability density")))
+    for name in comparison_gr_labels:
+        pages.append((name, _curve_overlay_page("gr", str(name), spec_key="gr_labels", xlabel=f"r [{dist_unit}]", ylabel="g(r)")))
+    for name in comparison_sq_labels:
+        pages.append((name, _curve_overlay_page("sq", str(name), spec_key="sq_labels", xlabel=f"q [1/{dist_unit}]", ylabel="S(q)")))
 
     if max_pages is not None and int(max_pages) > 0:
         keep = 1 + int(max_pages)
@@ -3449,12 +5564,9 @@ def plot_production_comparison_results(
 
 
 def _length_unit_label(units_style: str) -> str:
-    u = str(units_style).strip().lower()
-    if u in ("metal", "real", "electron"):
-        return "Å"
-    if u in ("si",):
-        return "m"
-    return "(distance units)"
+    # Analysis frames, void points, and exported EXTXYZ are canonicalised by
+    # every supported reader before reaching the plotting layer.
+    return "Å"
 
 
 def _cell_corners0(cell: np.ndarray) -> np.ndarray:
@@ -3622,6 +5734,19 @@ def plot_voids_map(
 ) -> None:
     """Voids map."""
 
+    n_samples = _require_positive_integer(n_samples, context="n_samples")
+    k_nearest = _require_positive_integer(k_nearest, context="k_nearest")
+    top_n = _require_positive_integer(top_n, context="top_n")
+    dpi = _require_positive_integer(dpi, context="dpi")
+    if not (np.isfinite(float(default_radius)) and float(default_radius) >= 0.0):
+        raise ValueError("default_radius must be finite and >= 0")
+    if min_clearance is not None and not np.isfinite(float(min_clearance)):
+        raise ValueError("min_clearance must be finite when provided")
+    for species, radius in dict(radii_by_species or {}).items():
+        if not (np.isfinite(float(radius)) and float(radius) >= 0.0):
+            raise ValueError(
+                f"radius for species {species!r} must be finite and >= 0"
+            )
     stage_dir = Path(stage_dir)
     out_path = Path(out_path)
 
@@ -3632,7 +5757,15 @@ def plot_voids_map(
     if traj is None or not Path(traj).exists():
         raise FileNotFoundError(f"No trajectory found in stage directory: {stage_dir}")
 
-    frames = read_frames_auto(Path(traj), last_n=1)
+    frames = read_frames_auto(
+        Path(traj),
+        last_n=1,
+        units_style=(
+            None
+            if units_style is None or not str(units_style).strip()
+            else str(units_style)
+        ),
+    )
     if not frames:
         raise ValueError(f"No frames parsed from trajectory: {traj}")
     fr = frames[-1]
@@ -3651,6 +5784,10 @@ def plot_voids_map(
     # selection extxyz threshold
     rad = np.asarray(rad, dtype=float)
     pts = np.asarray(pts, dtype=float)
+    if rad.ndim != 1 or pts.ndim != 2 or pts.shape != (rad.size, 3):
+        raise ValueError("Void sampler returned inconsistent point/clearance arrays")
+    if rad.size == 0 or not np.any(np.isfinite(rad)):
+        raise ValueError("Void sampler returned no finite clearance values")
     m = np.isfinite(rad)
     if min_clearance is not None and np.isfinite(float(min_clearance)):
         m &= rad >= float(min_clearance)
@@ -3767,6 +5904,7 @@ def plot_elastic_screen(
 ) -> None:
     """Elastic screen."""
 
+    dpi = _require_positive_integer(dpi, context="dpi")
     screen_dir = Path(screen_dir)
     if (screen_dir / "elastic_screen.json").exists():
         elastic_dir = screen_dir
@@ -3783,26 +5921,93 @@ def plot_elastic_screen(
     _apply_publication_style()
 
     summary = json.loads((elastic_dir / "elastic_screen.json").read_text())
+    if not isinstance(summary, Mapping):
+        raise ValueError("elastic_screen.json root must be an object")
+    if not isinstance(summary.get("units", {}), Mapping):
+        raise ValueError("elastic_screen.json units must be an object")
     if str(summary.get("status", "")) != "ok":
         raise ValueError(f"Elastic screen is not usable: status={summary.get('status')!r}")
 
-    stress_csv = elastic_dir / "local_stress.csv"
+    stress_csv = elastic_dir / "virial_proxy.csv"
     if not stress_csv.exists():
-        raise FileNotFoundError(f"Missing local_stress.csv in {elastic_dir}")
+        # Read-only compatibility for pre-hardening artifacts.  New output is
+        # deliberately named virial_proxy.csv to avoid implying a uniquely
+        # partitioned local Cauchy stress.
+        stress_csv = elastic_dir / "local_stress.csv"
+    if not stress_csv.exists():
+        raise FileNotFoundError(
+            f"Missing virial_proxy.csv (or legacy local_stress.csv) in {elastic_dir}"
+        )
     dat = np.genfromtxt(stress_csv, delimiter=",", names=True, dtype=float)
     if dat.size == 0:
         raise ValueError(f"No local-stress rows found in {stress_csv}")
     if dat.ndim == 0:
         dat = np.asarray([dat], dtype=dat.dtype)
 
-    x = np.asarray(dat["x"], dtype=float)
-    y = np.asarray(dat["y"], dtype=float)
-    hydro = np.asarray(dat["hydrostatic_native"], dtype=float)
-    vm = np.asarray(dat["von_mises_native"], dtype=float)
+    names = set(dat.dtype.names or ())
+    if {
+        "x_A",
+        "y_A",
+        "hydrostatic_virial_proxy_GPa",
+        "von_mises_virial_proxy_GPa",
+    }.issubset(names):
+        x = np.asarray(dat["x_A"], dtype=float)
+        y = np.asarray(dat["y_A"], dtype=float)
+        hydro = np.asarray(dat["hydrostatic_virial_proxy_GPa"], dtype=float)
+        vm = np.asarray(dat["von_mises_virial_proxy_GPa"], dtype=float)
+        xy_label = "Å"
+        hydro_label = "GPa"
+        stress_label = "von Mises (GPa)"
+    elif {"x_A", "y_A", "hydrostatic_GPa", "von_mises_GPa"}.issubset(names):
+        # Compatibility with the brief pre-release canonical-column format.
+        x = np.asarray(dat["x_A"], dtype=float)
+        y = np.asarray(dat["y_A"], dtype=float)
+        hydro = np.asarray(dat["hydrostatic_GPa"], dtype=float)
+        vm = np.asarray(dat["von_mises_GPa"], dtype=float)
+        xy_label = "Å"
+        hydro_label = "GPa"
+        stress_label = "von Mises virial proxy (GPa)"
+    else:
+        # Legacy release files stored native values.  Convert before applying a
+        # GPa label; never relabel unconverted bar/atm/etc. as GPa.
+        x = np.asarray(dat["x"], dtype=float)
+        y = np.asarray(dat["y"], dtype=float)
+        hydro = np.asarray(dat["hydrostatic_native"], dtype=float)
+        vm = np.asarray(dat["von_mises_native"], dtype=float)
+        p_fac = summary.get("units", {}).get("pressure_to_GPa_factor", None)
+        l_fac = summary.get("units", {}).get("length_native_to_A_factor", None)
+        if p_fac is not None:
+            hydro = hydro * float(p_fac)
+            vm = vm * float(p_fac)
+            hydro_label = "GPa"
+            stress_label = "von Mises (GPa)"
+        else:
+            hydro_label = str(summary.get("units", {}).get("pressure_native", "native"))
+            stress_label = f"von Mises ({hydro_label})"
+        if l_fac is not None:
+            x = x * float(l_fac)
+            y = y * float(l_fac)
+            xy_label = "Å"
+        else:
+            xy_label = str(summary.get("units", {}).get("length_native", "native"))
+
+    if not (
+        x.ndim == y.ndim == hydro.ndim == vm.ndim == 1
+        and x.size > 0
+        and x.size == y.size == hydro.size == vm.size
+        and np.all(np.isfinite(x))
+        and np.all(np.isfinite(y))
+        and np.all(np.isfinite(hydro))
+        and np.all(np.isfinite(vm))
+    ):
+        raise ValueError(
+            "Elastic virial-proxy table must contain matching finite x/y/hydrostatic/von-Mises columns"
+        )
 
     C = np.asarray(summary.get("born_matrix_GPa") if summary.get("born_matrix_GPa") is not None else summary.get("born_matrix_native"), dtype=float)
-    c_label = "Born matrix (GPa)" if summary.get("born_matrix_GPa") is not None else f"Born matrix ({summary.get('units', {}).get('pressure_native', 'native')})"
-    stress_label = "von Mises (GPa)" if summary.get("units", {}).get("pressure_to_GPa_factor", None) is not None else f"von Mises ({summary.get('units', {}).get('pressure_native', 'native')})"
+    if C.shape != (6, 6) or not np.all(np.isfinite(C)):
+        raise ValueError("Elastic screen Born matrix must be a finite 6x6 array")
+    c_label = "Affine Born curvature (GPa)" if summary.get("born_matrix_GPa") is not None else f"Affine Born curvature ({summary.get('units', {}).get('pressure_native', 'native')})"
 
     fig, axes = plt.subplots(2, 2, figsize=(8.4, 6.8))
 
@@ -3815,9 +6020,9 @@ def plot_elastic_screen(
 
     ax = axes[0, 1]
     sc = ax.scatter(x, y, c=vm, s=14.0, alpha=0.8)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title("Local stress hotspot map (XY)")
+    ax.set_xlabel(f"x ({xy_label})")
+    ax.set_ylabel(f"y ({xy_label})")
+    ax.set_title("Mean-volume virial-proxy map (XY)")
     ax.set_aspect("equal", adjustable="box")
     fig.colorbar(sc, ax=ax, shrink=0.8, label=stress_label)
 
@@ -3825,33 +6030,48 @@ def plot_elastic_screen(
     hf = hydro[np.isfinite(hydro)]
     if hf.size > 0:
         ax.hist(hf, bins=40)
-    ax.set_xlabel(f"hydrostatic ({summary.get('units', {}).get('pressure_native', 'native')})")
+    ax.set_xlabel(f"hydrostatic virial proxy ({hydro_label})")
     ax.set_ylabel("count")
-    ax.set_title("Local hydrostatic stress")
+    ax.set_title("Mean-volume-normalized virial proxy")
 
     ax = axes[1, 1]
     ax.axis("off")
     flags = summary.get("flags", []) or []
-    vm_summary = ((summary.get("local_stress_summary", {}) or {}).get("von_mises_native", {}) or {})
+    proxy_summary = summary.get("average_volume_normalized_virial_proxy_summary", {}) or {}
+    vm_summary = proxy_summary.get("von_mises_proxy_native", {}) or {}
+    if not vm_summary:
+        # Pre-hardening summary compatibility; plot wording remains explicit
+        # about the physical interpretation of the legacy numbers.
+        vm_summary = ((summary.get("local_stress_summary", {}) or {}).get("von_mises_native", {}) or {})
     vm_ratio = float(vm_summary.get("max_over_median", float("nan")))
     txt = [
         f"isotropy residual: {float(summary.get('isotropy_residual', float('nan'))):.3g}",
         f"normal-shear coupling: {float(summary.get('normal_shear_coupling_norm', float('nan'))):.3g}",
-        f"K_V: {float(summary.get('voigt_bulk_modulus_GPa', summary.get('voigt_bulk_modulus_native', float('nan')))):.3g}",
-        f"G_V: {float(summary.get('voigt_shear_modulus_GPa', summary.get('voigt_shear_modulus_native', float('nan')))):.3g}",
-        f"local vm max/median: {vm_ratio:.3g}",
+        f"K_V Born response: {float(summary.get('voigt_born_bulk_response_GPa', summary.get('voigt_born_bulk_response_native', summary.get('voigt_bulk_modulus_GPa', summary.get('voigt_bulk_modulus_native', float('nan')))))):.3g}",
+        f"G_V Born response: {float(summary.get('voigt_born_shear_response_GPa', summary.get('voigt_born_shear_response_native', summary.get('voigt_shear_modulus_GPa', summary.get('voigt_shear_modulus_native', float('nan')))))):.3g}",
+        "single affine snapshot; not a thermodynamic modulus",
+        "per-atom virial / (V/N); no atomic-volume partition",
+        f"virial-proxy VM max/median: {vm_ratio:.3g}",
         f"flags: {', '.join(str(f) for f in flags) if flags else 'none'}",
     ]
     affine = summary.get("affine_isotropization", None)
     if isinstance(affine, dict):
         txt.append("")
         txt.append("force_isotropic affine remap")
-        txt.append(f"target L: {float(affine.get('target_cubic_length', float('nan'))):.4g}")
+        txt.append(
+            f"target L: {float(affine.get('target_cubic_length', float('nan'))):.4g} "
+            f"{affine.get('length_unit', summary.get('units', {}).get('length_native', 'native'))}"
+        )
         txt.append(f"strain ||eps||_F: {float(affine.get('frobenius_norm', float('nan'))):.3g}")
     ax.text(0.0, 1.0, "\n".join(txt), va="top", ha="left")
 
     if title is None:
-        title = f"Elastic screen: {elastic_dir}"
+        # Output roots differ between reference/reproduction passes.  A
+        # filesystem path in the default title made otherwise identical
+        # elastic results produce different pixels and therefore different
+        # PNG bytes.  The plot already carries all scientific context in its
+        # panels and companion JSON, so use a path-independent default.
+        title = "Elastic screen"
     fig.suptitle(str(title))
     out_path = Path(out_path)
     _style_and_save_figure(fig, out_path, dpi=int(dpi))

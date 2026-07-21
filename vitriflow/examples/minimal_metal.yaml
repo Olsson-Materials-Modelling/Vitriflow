@@ -1,4 +1,4 @@
-# Serial aluminium melt-quench example.
+# Aluminium melt-quench example configured for eight MPI ranks.
 kim:
   model: EAM_Dynamo_ErcolessiAdams_1994_Al__MO_123629422045_005
   interactions:
@@ -29,16 +29,16 @@ autotune:
   preflight:
     enabled: true
   tm_scan:
-    t_min: 800.0
-    t_max: 1400.0
+    t_min: 400.0
+    t_max: 2000.0
     dT: 200.0
     equil_steps: 5000
     sample_steps: 20000
     msd_every: 100
-    replicates_per_temp: 20
+    replicates_per_temp: 1
   highT:
     margin: 200.0
-    replicates: 20
+    replicates: 1
     chunk_steps: 50000
     min_total_steps: 100000
     rms_multiple: 3.0
@@ -49,10 +49,7 @@ autotune:
     rates_K_per_ps:
     - 100.0
     - 50.0
-    - 25.0
-    - 10.0
-    - 1.0
-    replicates_per_rate: 20
+    replicates_per_rate: 1
   size:
     enabled: false
   metrics:
@@ -154,9 +151,9 @@ autotune:
       - 1.5
   production:
     enabled: true
-    min_boxes: 20
-    max_boxes: 20
-    batch_boxes: 20
+    min_boxes: 2
+    max_boxes: 2
+    batch_boxes: 2
     dump_trajectory: true
     dump_every_steps: 1000
     check_convergence: true
@@ -200,5 +197,5 @@ autotune:
     zscore: 1.96
 lammps:
   lammps_cmd: lmp
-  mpi_cmd: null
-  nprocs: 1
+  mpi_cmd: mpirun
+  nprocs: 8

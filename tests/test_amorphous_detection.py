@@ -46,6 +46,9 @@ def _install_fake_ase(monkeypatch):
             else:
                 self._pbc = np.asarray(list(pbc), dtype=bool)
 
+        def get_pbc(self):
+            return self._pbc.copy()
+
         def get_chemical_symbols(self):
             return list(self._symbols)
 
@@ -104,6 +107,7 @@ def _install_fake_mp(monkeypatch, *, docs, capture: dict[str, object] | None = N
 
     class SummaryRester:
         def search(self, **kwargs):
+            capture["search_count"] = int(capture.get("search_count", 0)) + 1
             capture["search_kwargs"] = dict(kwargs)
             return list(docs)
 
@@ -474,6 +478,80 @@ def test_build_materials_project_reference_library_filters_candidates(tmp_path: 
     manifest = json.loads((cache_dir / "reference_manifest.json").read_text())
     assert manifest["used"] is True
     assert len(manifest["references"]) == 2
+    assert all(len(ref["structure_file_identity"]["sha256"]) == 64 for ref in manifest["references"])
+    assert (cache_dir / "reference_manifest.identity.json").is_file()
+
+    # Disk cache reuse is content-verified. A same-size mutation of a cached
+    # structure must force reconstruction instead of silently reusing it.
+    first_ref = cache_dir / manifest["references"][0]["structure_file"]
+    original = first_ref.read_bytes()
+    first_ref.write_bytes(b"X" + original[1:])
+    assert len(first_ref.read_bytes()) == len(original)
+    am.build_materials_project_reference_library(
+        cache_dir=cache_dir,
+        formula="Sm2O3",
+        type_to_species=["Sm", "O"],
+        cutoffs={(1, 1): 2.5, (1, 2): 2.5, (2, 2): 2.5},
+        metrics_cfg=metrics_eff,
+    )
+    assert seen["search_count"] == 2
+
+    # The in-memory cache must not conceal a same-size manifest mutation.
+    manifest_path = cache_dir / "reference_manifest.json"
+    manifest_text = manifest_path.read_text()
+    assert "mp-good-1" in manifest_text
+    manifest_path.write_text(manifest_text.replace("mp-good-1", "mp-evil-1", 1))
+    am.build_materials_project_reference_library(
+        cache_dir=cache_dir,
+        formula="Sm2O3",
+        type_to_species=["Sm", "O"],
+        cutoffs={(1, 1): 2.5, (1, 2): 2.5, (2, 2): 2.5},
+        metrics_cfg=metrics_eff,
+    )
+    assert seen["search_count"] == 3
+
+
+def test_required_reference_does_not_reuse_optional_negative_cache(tmp_path: Path, monkeypatch):
+    import vitriflow.analysis.amorphous as am
+
+    monkeypatch.setattr(am, "_resolve_mp_api_key", lambda ref_cfg: None)
+    am._REFERENCE_LIBRARY_CACHE.clear()
+
+    optional = _minimal_run_config(
+        {
+            "enabled": True,
+            "amorphous": {
+                "enabled": True,
+                "reference": {"enabled": True, "required": False},
+            },
+        }
+    ).autotune.metrics
+    result = am.build_materials_project_reference_library(
+        cache_dir=tmp_path / "refs",
+        formula="Sm2O3",
+        type_to_species=["Sm", "O"],
+        cutoffs={(1, 2): 2.5},
+        metrics_cfg=optional,
+    )
+    assert result["used"] is False
+
+    required = _minimal_run_config(
+        {
+            "enabled": True,
+            "amorphous": {
+                "enabled": True,
+                "reference": {"enabled": True, "required": True},
+            },
+        }
+    ).autotune.metrics
+    with pytest.raises(ValueError, match="API key not available"):
+        am.build_materials_project_reference_library(
+            cache_dir=tmp_path / "refs",
+            formula="Sm2O3",
+            type_to_species=["Sm", "O"],
+            cutoffs={(1, 2): 2.5},
+            metrics_cfg=required,
+        )
 
 
 
@@ -559,6 +637,17 @@ def test_analyse_production_box_rejects_non_amorphous_box(tmp_path: Path, monkey
     assert cut_map == {(1, 1): 2.1}
     assert entry["is_amorphous"] is False
     assert entry["metrics"]["amorphous_crystalline_fraction"] == 0.45
+    assert entry["lattice"]["cell"] == [[5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 5.0]]
+    assert entry["lattice"]["origin"] == [0.0, 0.0, 0.0]
+    assert entry["lattice"]["volume"] == pytest.approx(125.0)
+    assert entry["lattice"]["vectors_are_rows"] is True
+    assert entry["lattice"]["units"] == "angstrom"
+    assert entry["structure"]["schema"] == "vitriflow.structure_snapshot.v1"
+    assert entry["structure"]["n_atoms"] == 2
+    assert entry["structure"]["type_to_species"] == ["Sm"]
+    assert entry["structure"]["species"] == ["Sm", "Sm"]
+    assert entry["structure"]["positions"] == [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]]
+    assert entry["structure"]["lattice"] == entry["lattice"]
     assert entry["reject"]["reason"] == "non_amorphous"
     assert (relax_dir / "amorphous_state.json").exists()
     assert (rejects_dir / "box_001" / "amorphous_state.json").exists()
@@ -1283,6 +1372,126 @@ def test_analyse_amorphous_state_time_averages_local_order_over_tail_frames(monk
     assert report["local_order"]["aggregation"]["crystalline_fraction_per_frame"] == [0.0, 1.0]
 
 
+def test_analyse_amorphous_state_rejects_nonfinite_sq_as_missing_evidence(monkeypatch):
+    import vitriflow.analysis.amorphous as am
+
+    cfg = _minimal_run_config(
+        {
+            "enabled": True,
+            "rings": {"enabled": False},
+            "gr": [],
+            "sq": [
+                {
+                    "pair": None,
+                    "q_max": 12.0,
+                    "nq": 64,
+                    "r_max": 6.0,
+                    "nbins": 64,
+                }
+            ],
+            "amorphous": {
+                "enabled": True,
+                "reference": {"enabled": False},
+            },
+        }
+    )
+    frame = am.DumpFrame(
+        timestep=0,
+        ids=np.asarray([1, 2], dtype=int),
+        types=np.asarray([1, 1], dtype=int),
+        positions=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
+        cell=np.eye(3, dtype=float) * 5.0,
+        origin=np.zeros((3,), dtype=float),
+    )
+    monkeypatch.setattr(
+        am,
+        "compute_sq",
+        lambda *args, **kwargs: (
+            np.asarray([0.0, 1.0, 2.0]),
+            np.asarray([1.0, np.nan, 1.0]),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="missing evidence.*zero crystallinity"):
+        am.analyse_amorphous_state(
+            [frame],
+            metrics_cfg=cfg.autotune.metrics,
+            cutoffs={(1, 1): 2.1},
+            type_to_species=["Sm"],
+            cache_dir=Path("dummy-cache"),
+            formula_override="Sm",
+        )
+
+
+def test_analyse_amorphous_state_persists_sq_representation_metadata(monkeypatch):
+    import vitriflow.analysis.amorphous as am
+
+    cfg = _minimal_run_config(
+        {
+            "enabled": True,
+            "rings": {"enabled": False},
+            "gr": [],
+            "sq": [
+                {
+                    "pair": None,
+                    "q_max": 12.0,
+                    "nq": 64,
+                    "r_max": 6.0,
+                    "nbins": 64,
+                }
+            ],
+            "amorphous": {
+                "enabled": True,
+                "max_bragg_sharpness": 10.0,
+                "max_crystalline_fraction": 1.0,
+                "max_largest_cluster_fraction": 1.0,
+                "reference": {"enabled": False},
+            },
+        }
+    )
+    frame = am.DumpFrame(
+        timestep=0,
+        ids=np.asarray([1, 2], dtype=int),
+        types=np.asarray([1, 1], dtype=int),
+        positions=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float),
+        cell=np.eye(3, dtype=float) * 5.0,
+        origin=np.zeros((3,), dtype=float),
+    )
+    representation = {
+        "schema": "vitriflow.sq_representation.v1",
+        "normalization": "unweighted_number_number_total",
+    }
+    monkeypatch.setattr(
+        am,
+        "compute_sq",
+        lambda *args, **kwargs: (
+            np.asarray([0.0, 1.0, 2.0]),
+            np.asarray([1.0, 1.1, 1.0]),
+            representation,
+        ),
+    )
+    monkeypatch.setattr(am, "_sq_peak_features", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        am,
+        "_local_order_analysis",
+        lambda *args, **kwargs: {
+            "crystalline_fraction": 0.0,
+            "largest_cluster_fraction": 0.0,
+            "qbar": {},
+        },
+    )
+
+    report = am.analyse_amorphous_state(
+        [frame],
+        metrics_cfg=cfg.autotune.metrics,
+        cutoffs={(1, 1): 2.1},
+        type_to_species=["Sm"],
+        cache_dir=Path("dummy-cache"),
+        formula_override="Sm",
+    )
+    assert report["sq"]["representation"] == representation
+
+
 def test_collect_rate_scan_cutoff_reference_frames_pools_all_rates(tmp_path: Path, monkeypatch):
     from vitriflow.workflows import autotune as at
 
@@ -1296,7 +1505,8 @@ def test_collect_rate_scan_cutoff_reference_frames_pools_all_rates(tmp_path: Pat
 
     seen: list[Path] = []
 
-    def _fake_read(path, n_tail, *, type_to_species=None):
+    def _fake_read(path, n_tail, *, type_to_species=None, units_style="metal"):
+        assert units_style == "metal"
         seen.append(Path(path))
         return [Path(path).parent.name]
 

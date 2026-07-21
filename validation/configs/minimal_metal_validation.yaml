@@ -1,0 +1,260 @@
+# Validation-only aluminium workflow.  Stage lengths are deliberately tiny;
+# the purpose is deterministic end-to-end plumbing coverage, not materials data.
+engine: lammps
+
+kim:
+  model: EAM_Dynamo_ErcolessiAdams_1994_Al__MO_123629422045_005
+  interactions: [Al]
+  user_units: metal
+
+structure:
+  lammps_data: al_fcc_3x3x3.data
+
+md:
+  timestep: 0.001
+  atom_style: atomic
+  ensemble: npt
+  temperature: 300.0
+  pressure: 0.0
+  thermo_every: 1
+  dump_every: 1
+  stage_continuity: continuous
+  neighbor_skin: 2.5
+  neighbor_skin_autotune: true
+  neighbor_skin_step: 0.5
+  neighbor_skin_max: 5.0
+  thermostat:
+    style: nose-hoover
+    tdamp: 0.1
+  barostat:
+    style: nose-hoover
+    pdamp: 1.0
+    mode: iso
+
+random_seed: 431001
+
+autotune:
+  preflight:
+    enabled: true
+    ensembles: [npt]
+    allow_nvt_fallback: false
+    allow_implicit_dt_fallback: false
+    dt_candidates: [0.001]
+    tdamp_factors: [100.0]
+    pdamp_factors: [1000.0]
+    min_pdamp_ps_highT: 1.0
+    T_low: 300.0
+    T_high: 2000.0
+    equil_steps: 2
+    run_steps: 5
+    tail_window: 3
+    temp_rel_tol: 1.0
+    max_temp_factor: 10.0
+    confirm_equil_steps: 0
+    confirm_run_steps: 5
+    confirm_topk: 1
+    confirm_temps: [400.0, 2000.0]
+    timeout_sec: 180.0
+
+  tm_scan:
+    t_min: 400.0
+    t_max: 2000.0
+    dT: 400.0
+    ensemble: npt
+    equil_steps: 500
+    sample_steps: 5000
+    msd_every: 1
+    replicates_per_temp: 3
+    sample_in_nvt: true
+    highT_mode: liquid
+    gr:
+      enabled: true
+      nbins: 120
+      r_max: 5.0
+      frames: 6
+      stride: 1
+      smooth: 5
+      pair: [Al, Al]
+
+  highT:
+    margin: 400.0
+    replicates: 3
+    # NVT diffusion run = max_total_steps - min_total_steps must be long enough
+    # to cross the disordering threshold (~10000 steps); NPT equil = min_total_steps.
+    chunk_steps: 11000
+    max_chunks: 1
+    min_total_steps: 1000
+    rms_multiple: 0.1
+    stationarity_tol: 1.0
+    enforce_stationarity: false
+
+  quench:
+    t_final: 300.0
+    relax_steps: 10
+    enforce_rate_bounds: false
+    rates_K_per_ps: [200.0, 100.0, 50.0]
+    replicates_per_rate: 3
+
+  metrics:
+    enabled: true
+    type_to_species: [Al]
+    # Six of the ten stored relaxation frames feed every time-averaged
+    # descriptor, so the convergence input is a strict majority rather than
+    # a half-trajectory edge case.
+    time_average_frames: 6
+    time_average_stride: 1
+    collect_during_production_stages: true
+    stage_timeseries_frame_stride: 1
+    stage_timeseries_max_frames: 12
+    stage_timeseries_make_plot: true
+    quench_tail_min_frames: 3
+    quench_tail_focus_fraction: 0.8
+    quench_tail_fallback_fraction: 0.4
+    elastic:
+      enabled: true
+      run_on_relax: true
+      run_on_highT_when_force_isotropic: true
+      strict_when_force_isotropic: true
+      collect_during_production_stages: true
+      stage_timeseries_frame_stride: 1
+      stage_timeseries_max_frames: 1
+      stage_timeseries_make_plot: true
+      quench_tail_min_frames: 1
+      quench_tail_focus_fraction: 0.8
+      quench_tail_fallback_fraction: 0.4
+      diffusion_freeze_threshold_A2_per_ps: 1000000000.0
+      born_delta: 1.0e-5
+      make_plot: true
+    pairs:
+      - pair: [Al, Al]
+        cutoff: 3.5
+    coordinations:
+      - central: Al
+        neighbor: Al
+        cutoff: 3.5
+        expected: 12
+        defect_frac_tol: 1.0
+    coordination_sweep:
+      enabled: true
+      dr: 0.02
+      n_below: 2
+      n_above: 2
+      strained_delta: 0.1
+    angles:
+      - triplet: [Al, Al, Al]
+    rings:
+      enabled: true
+      mode: bond_graph
+      algorithm: cycle_basis
+      nodes: [Al]
+      bond_pairs:
+        - pair: [Al, Al]
+          cutoff: 3.5
+      max_cycle_size: 8
+      max_paths_per_edge: 4
+    gr:
+      - pair: null
+        r_max: 5.0
+        nbins: 120
+      - pair: [Al, Al]
+        r_max: 5.0
+        nbins: 120
+    sq:
+      - pair: null
+        q_max: 16.0
+        nq: 120
+        r_max: 5.0
+        nbins: 160
+      - pair: [Al, Al]
+        q_max: 16.0
+        nq: 120
+        r_max: 5.0
+        nbins: 160
+    voids:
+      enabled: true
+      n_samples: 256
+      n_samples_timeseries: 32
+      sampler: sobol
+      seed: 0
+      k_nearest: 12
+      default_radius: 0.0
+      r_max: 4.0
+      cdf_points: 64
+      probe_radii: [0.5, 1.0, 1.5]
+    amorphous:
+      enabled: true
+      enforce_during_rate_scan: false
+      enforce_during_production: false
+      q_max: 16.0
+      nq: 64
+      r_max: 5.0
+      nbins: 100
+      peak_search: [0.5, 8.0]
+      reference:
+        enabled: false
+
+  production:
+    enabled: true
+    min_boxes: 6
+    batch_boxes: 4
+    max_boxes: 10
+    warmup_start_temperature: 300.0
+    warmup_duration_ps: 0.001
+    dump_trajectory: true
+    dump_every_steps: 1
+    check_convergence: true
+    consecutive_converged_checks: 2
+    bondlen_cdf_points: 64
+    angle_cdf_points: 72
+    store_distributions: true
+    embed_structures: true
+    exclude_coordination_defects: false
+
+  # Deliberately permissive thresholds make both adaptive checks pass.  With
+  # min=6, batch=4 and two consecutive checks, convergence can occur only at
+  # exactly ten accepted boxes, while still exercising CI and stability code.
+  convergence:
+    mode: both
+    density_rel_tol: 1000000000.0
+    density_abs_tol: 1000000000.0
+    coord_rel_tol: 1000000000.0
+    coord_abs_tol: 1000000000.0
+    bondlen_rel_tol: 1000000000.0
+    bondlen_abs_tol: 1000000000.0
+    angle_rel_tol: 1000000000.0
+    angle_abs_tol: 1000000000.0
+    ring_rel_tol: 1000000000.0
+    ring_abs_tol: 1000000000.0
+    ring_size_rel_tol: 1000000000.0
+    ring_size_abs_tol: 1000000000.0
+    gr_peak_r_rel_tol: 1000000000.0
+    gr_peak_r_abs_tol: 1000000000.0
+    gr_peak_height_rel_tol: 1000000000.0
+    gr_peak_height_abs_tol: 1000000000.0
+    gr_peak_fwhm_rel_tol: 1000000000.0
+    gr_peak_fwhm_abs_tol: 1000000000.0
+    bondlen_cdf_rel_tol: 1000000000.0
+    bondlen_cdf_abs_tol: 1000000000.0
+    angle_cdf_rel_tol: 1000000000.0
+    angle_cdf_abs_tol: 1000000000.0
+    coord_cdf_rel_tol: 1000000000.0
+    coord_cdf_abs_tol: 1000000000.0
+    gr_curve_rel_tol: 1000000000.0
+    gr_curve_abs_tol: 1000000000.0
+    sq_curve_rel_tol: 1000000000.0
+    sq_curve_abs_tol: 1000000000.0
+    void_cdf_rel_tol: 1000000000.0
+    void_cdf_abs_tol: 1000000000.0
+    bounded_ci_method: t
+    familywise: bonferroni
+    stability_split: half
+    stability_distance: wasserstein
+    stability_bootstrap: 16
+    stability_quantile: 0.95
+
+lammps:
+  lammps_cmd: lmp
+  mpi_cmd: mpirun
+  nprocs: 2
+  timeout_sec: 600.0
+  kill_grace_sec: 5.0

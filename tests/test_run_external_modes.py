@@ -4,6 +4,11 @@ import importlib
 import sys
 import types
 from pathlib import Path
+import json
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("mock_engine_build_identities")
 
 
 def _config():
@@ -150,12 +155,48 @@ def test_run_full_run_external_dispatches_parallel_limit(monkeypatch, tmp_path: 
 
     def _fake_full(**kwargs):
         called.update(kwargs)
+        entries = []
+        for box in (1, 2):
+            source = Path(kwargs["outdir"]) / "production" / f"box_{box:03d}" / "relax.data"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(f"box-{box}\n")
+            snapshot = source.parent / "structure_snapshot.json"
+            manifest_path = source.parent / "structure_manifest.json"
+            snapshot.write_text(json.dumps({"schema": "vitriflow.structure_snapshot.v1", "n_atoms": 1}))
+            manifest = {"structure_hash": f"structure-{box}"}
+            manifest_path.write_text(
+                json.dumps({"schema": "vitriflow.structure_manifest.v2", "structures": [manifest]})
+            )
+            entries.append(
+                {
+                    "box": box,
+                    "metrics": {},
+                    "distributions": {},
+                    "paths": {
+                        "relax_data": str(source.relative_to(kwargs["outdir"])),
+                        "structure_snapshot": str(snapshot.relative_to(kwargs["outdir"])),
+                        "structure_manifest": str(manifest_path.relative_to(kwargs["outdir"])),
+                    },
+                    "structure_manifest": manifest,
+                }
+            )
         return {
             "enabled": True,
             "status": "ok",
             "converged": True,
+            "converged_md": True,
+            "check_convergence": True,
+            "resumable": True,
+            "convergence_streak": 1,
+            "required_convergence_streak": 1,
+            "last_convergence_evaluated_n_boxes_total": 2,
+            "last_convergence_evaluated_n_boxes_accepted": 2,
+            "min_boxes": 2,
             "n_boxes": 2,
-            "boxes": [{"box": 1, "metrics": {}, "distributions": {}}, {"box": 2, "metrics": {}, "distributions": {}}],
+            "n_boxes_accepted": 2,
+            "n_boxes_rejected": 0,
+            "n_boxes_total": 2,
+            "boxes": entries,
             "rejected_boxes": [],
             "execution": {"mode": "full-run", "planned_boxes": 2, "max_parallel_boxes": kwargs["max_parallel_boxes"]},
         }

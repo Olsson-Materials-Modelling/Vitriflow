@@ -343,7 +343,7 @@ def test_prepare_initial_structure_invalidates_cache_when_structure_spec_changes
 
     monkeypatch.setattr(structuregen_mod, "generate_atoms", _fake_generate_atoms)
 
-    def _fake_write_lammps_data(path, atoms, *, specorder=None, atom_style="atomic"):
+    def _fake_write_lammps_data(path, atoms, *, specorder=None, atom_style="atomic", units_style="metal"):
         Path(path).write_text(f"Atoms # {atom_style}\n")
 
     monkeypatch.setattr(structuregen_mod, "write_lammps_data", _fake_write_lammps_data)
@@ -387,5 +387,18 @@ def test_prepare_initial_structure_invalidates_cache_when_structure_spec_changes
     assert "Atoms # charge" in txt
     assert calls["count"] == 2
 
+    # An unchanged, content-verified artifact is reusable.
+    assert structuregen_mod.prepare_initial_structure(cfg_charge, tmp_path) == data_charge
+    assert calls["count"] == 2
+
+    # Size-preserving tampering must invalidate the cache; mtime/size checks
+    # alone are insufficient for a scientific input artifact.
+    Path(data_charge).write_text(txt.replace("charge", "chxrge"))
+    assert Path(data_charge).stat().st_size == len(txt.encode())
+    structuregen_mod.prepare_initial_structure(cfg_charge, tmp_path)
+    assert calls["count"] == 3
+    assert "Atoms # charge" in Path(data_charge).read_text()
+
     meta = json.loads((tmp_path / "structure" / "structure_provenance.json").read_text())
     assert meta["_cache_spec"]["atom_style"] == "charge"
+    assert len(meta["initial_data_identity"]["sha256"]) == 64

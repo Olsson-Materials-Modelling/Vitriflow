@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -17,17 +18,427 @@ from ..config import (
     ProductionEnsembleConfig,
     ConvergenceConfig,
 )
-from ..kim import ensure_model_installed
+from ..kim import ensure_model_installed, ensure_potential_model_installed
+from ..engine_identity import (
+    assert_engine_build_identity_bundle_unchanged,
+    deferred_engine_build_identities,
+    query_engine_build_identities,
+    validate_engine_build_identity_bundle,
+)
+from ..potential import (
+    stage_validated_tabulated_core_for_replay,
+    validated_tabulated_core_path,
+)
 from ..runner import Cp2kRunner, LammpsRunner
 from ..structuregen import prepare_initial_structure
-from ..utils import ensure_dir
+from ..utils import ensure_dir, stable_file_identity
 from .metrics_policy import resolve_effective_metrics_config
 from .preflight import run_preflight
 from .progress import CondensedProgressLog, atomic_write_json
+from .workflow_lock import locked_output_workflow, workflow_payload_entries
 import importlib
 from .quench_rates import quench_steps_for_rate, resolve_quench_rates_K_per_time
 from .step_counts import extend_highT_steps_for_force_isotropic, resolve_lammps_units_style, resolve_md_pressure
 from .elastic_screen import build_elastic_sampling_hint
+from .resume_integrity import (
+    attach_production_state_integrity as _attach_production_state_integrity,
+    is_zero_committed_active_resume_state,
+    potential_command_file_paths,
+    prepare_release_resume_migration,
+    resolve_result_path as _resolve_result_path,
+    seal_release_resume_migration,
+    validate_release_resume_migration,
+    validate_production_resume_state as _validate_production_resume_state,
+)
+from ..runtime_identity import runtime_identity
+
+
+_RUN_RESUME_FINGERPRINT_SCHEMA = "vitriflow.run.resume_fingerprint.v5"
+_RUN_SEED_SCHEME = "stateful_stage_seed_stream_v1"
+_RUN_RESUME_POLICY = "explicit_state_required_clean_restart_v1"
+
+
+def _resolve_run_resume_mode(
+    *,
+    outdir: Path,
+    results_path: Path,
+    resume: bool | None,
+) -> bool:
+    """Resolve run restart semantics without ever mixing trusted and stale state.
+
+    ``None`` retains the documented auto-resume behavior.  An explicit
+    ``--resume`` requires the protected result bundle to exist; an explicit
+    ``--no-resume`` requires a clean output directory.  Starting without a
+    result bundle in a non-empty directory is rejected because stage files
+    alone do not carry enough provenance to decide whether they belong to the
+    requested calculation.
+    """
+
+    result_path = Path(results_path)
+    if result_path.is_symlink():
+        raise RuntimeError(
+            "Cannot trust run_results.json for resume because it is a symbolic link"
+        )
+    exists = result_path.is_file()
+    if resume is True:
+        if not exists:
+            raise RuntimeError(
+                "Cannot resume: --resume was requested but run_results.json is missing; "
+                "use a fresh empty output directory with --no-resume to start a new run"
+            )
+        return True
+    if resume is False and exists:
+        raise RuntimeError(
+            "Cannot start with --no-resume: run_results.json already exists in the output "
+            "directory; choose a fresh empty output directory"
+        )
+    if exists:
+        return True
+    leftovers = sorted(path.name for path in workflow_payload_entries(outdir))
+    if leftovers:
+        preview = ", ".join(leftovers[:8])
+        suffix = " ..." if len(leftovers) > 8 else ""
+        raise RuntimeError(
+            "Cannot safely start run without a protected run_results.json in a non-empty "
+            f"output directory ({preview}{suffix}); choose a fresh empty output directory"
+        )
+    return False
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    return str(stable_file_identity(Path(path))["sha256"])
+
+
+def _resume_file_identity(path: Path, *, configured_path: str) -> dict[str, Any]:
+    p = Path(path)
+    identity = stable_file_identity(p)
+    return {
+        "configured_path": str(configured_path),
+        "filename": p.name,
+        "size_bytes": int(identity["size_bytes"]),
+        "sha256": str(identity["sha256"]),
+    }
+
+
+def _resolve_resume_dependency(value: Any, *, base_dir: Path) -> Path:
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = Path(base_dir) / path
+    return path.resolve(strict=False)
+
+
+def _build_run_resume_fingerprint(
+    *,
+    config: RunConfig,
+    production_plan: Mapping[str, Any],
+    outdir: Path,
+    external_mode: str,
+    job_template: Optional[Path] = None,
+    engine_build_identities: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Bind resumable run state to its scientific and execution inputs."""
+
+    outdir = Path(outdir).expanduser().resolve(strict=False)
+
+    plan = json.loads(json.dumps(dict(production_plan), allow_nan=False))
+    structure_value = plan.get("structure_data", None)
+    if structure_value is None or not str(structure_value).strip():
+        raise ValueError("Production plan has no structure_data for resume fingerprinting")
+    structure_path = _resolve_resume_dependency(structure_value, base_dir=outdir)
+
+    potential = plan.get("potential_config", None)
+    potential_source: Mapping[str, Any]
+    if isinstance(potential, Mapping) and len(potential) > 0:
+        potential_source = potential
+    else:
+        potential_source = _model_dump_jsonlike(getattr(config, "kim", None))
+    potential_files: list[Any] = []
+    if isinstance(potential_source, Mapping):
+        potential_files.extend(list(potential_source.get("files", []) or []))
+
+    dependency_identities: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in potential_files:
+        path = _resolve_resume_dependency(value, base_dir=outdir)
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        dependency_identities.append(
+            _resume_file_identity(path, configured_path=str(value))
+        )
+
+    command_file_identities: list[dict[str, Any]] = []
+    for candidate in potential_command_file_paths(
+        potential=potential_source,
+        plan=plan,
+        declared_values=potential_files,
+        base_dir=outdir,
+    ):
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        command_file_identities.append(
+            _resume_file_identity(candidate, configured_path=str(candidate))
+        )
+
+    generated_potential_identities: list[dict[str, Any]] = []
+    generated_table = validated_tabulated_core_path(
+        plan.get("potential_lines"), root=outdir
+    )
+    if generated_table is not None:
+        generated_potential_identities.append(
+            _resume_file_identity(
+                generated_table,
+                configured_path=str(generated_table.relative_to(outdir)),
+            )
+        )
+
+    engine = str(plan.get("engine", getattr(config, "engine", "lammps"))).strip().lower()
+    if engine == "cp2k":
+        execution_config = _model_dump_jsonlike(getattr(config, "cp2k", None))
+    else:
+        execution_config = _model_dump_jsonlike(getattr(config, "lammps", None))
+
+    cp2k_data_identities: list[dict[str, Any]] = []
+    plan_prod_cfg = plan.get("production_cfg", {})
+    plan_dft_cfg = plan_prod_cfg.get("dft_opt", {}) if isinstance(plan_prod_cfg, Mapping) else {}
+    uses_cp2k = engine == "cp2k" or (
+        isinstance(plan_dft_cfg, Mapping) and bool(plan_dft_cfg.get("enabled", False))
+    )
+    cp2k_execution_config: Optional[dict[str, Any]] = None
+    if uses_cp2k:
+        cp2k_cfg = getattr(config, "cp2k", None)
+        if cp2k_cfg is None:
+            raise RuntimeError("CP2K execution/refinement requires a cp2k configuration")
+        cp2k_execution_config = _model_dump_jsonlike(cp2k_cfg)
+        resolved = Cp2kRunner(cp2k_cfg).resolved_data_files(outdir, require=True)
+        for role in sorted(resolved):
+            item = resolved[role]
+            path = Path(item["resolved_path"])
+            cp2k_data_identities.append(
+                {
+                    "role": str(role),
+                    "configured_name": str(item["configured_name"]),
+                    **_resume_file_identity(path, configured_path=str(path)),
+                }
+            )
+
+    runtime = runtime_identity()
+
+    job_template_identity: Optional[dict[str, Any]] = None
+    if job_template is not None:
+        if str(external_mode).strip().lower() == "local":
+            raise ValueError("job_template is meaningful only for external dry-run/full-run execution")
+        template_path = Path(job_template).expanduser().resolve(strict=False)
+        job_template_identity = _resume_file_identity(
+            template_path,
+            configured_path=str(job_template),
+        )
+
+    payload = {
+        "schema": _RUN_RESUME_FINGERPRINT_SCHEMA,
+        "workflow": "run_meltquench",
+        "vitriflow_version": str(runtime["vitriflow_version"]),
+        "runtime": runtime,
+        "external_mode": str(external_mode),
+        "seed_scheme": _RUN_SEED_SCHEME,
+        "resume_policy": _RUN_RESUME_POLICY,
+        "production_plan": plan,
+        "execution_config": execution_config,
+        "cp2k_execution_config": cp2k_execution_config,
+        # Public workflow entry points always provide a verified local bundle
+        # or an explicit external-worker deferral marker.  The fallback keeps
+        # this internal builder backwards-compatible for callers that only
+        # compare non-execution fingerprint fields.
+        "engine_build_identities": (
+            dict(engine_build_identities)
+            if engine_build_identities is not None
+            else {
+                "status": "not_supplied_to_internal_builder",
+                "primary_engine": engine,
+            }
+        ),
+        "job_template": job_template_identity,
+        "fallback_potential_config": (
+            _model_dump_jsonlike(getattr(config, "kim", None))
+            if not isinstance(potential, Mapping) or len(potential) == 0
+            else None
+        ),
+        "input_identities": {
+            "structure_data": _resume_file_identity(
+                structure_path,
+                configured_path=str(structure_value),
+            ),
+            "potential_files": dependency_identities,
+            "potential_command_files": command_file_identities,
+            "generated_potential_files": generated_potential_identities,
+            "cp2k_data_files": cp2k_data_identities,
+        },
+    }
+    return {
+        "schema": _RUN_RESUME_FINGERPRINT_SCHEMA,
+        "algorithm": "sha256:c14n-json:v1",
+        "sha256": _canonical_json_sha256(payload),
+        "payload": payload,
+    }
+
+
+def _migrate_0_4_35_1_run_resume_fingerprint(
+    previous: Mapping[str, Any],
+    stored: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    outdir: Path,
+) -> dict[str, Any] | None:
+    """Authenticate the exact first-box 0.4.35.1 plotting-hotfix resume."""
+
+    prepared = prepare_release_resume_migration(
+        stored,
+        current,
+        workflow="run_meltquench",
+    )
+    if prepared is None or not is_zero_committed_active_resume_state(previous):
+        return None
+    normalized_stored, normalized_current, record = prepared
+    canonicalized: list[str] = []
+
+    old_plan = normalized_stored.get("production_plan")
+    new_plan = normalized_current.get("production_plan")
+    if not isinstance(old_plan, Mapping) or not isinstance(new_plan, Mapping):
+        return None
+    old_structure = old_plan.get("structure_data")
+    new_structure = new_plan.get("structure_data")
+    if old_structure is None or new_structure is None:
+        return None
+    if _resolve_result_path(old_structure, outdir=outdir) != _resolve_result_path(
+        new_structure,
+        outdir=outdir,
+    ):
+        return None
+    normalized_old_plan = dict(old_plan)
+    normalized_old_plan["structure_data"] = str(new_structure)
+    normalized_stored["production_plan"] = normalized_old_plan
+    if str(old_structure) != str(new_structure):
+        canonicalized.append("production_plan.structure_data")
+
+    old_inputs = normalized_stored.get("input_identities")
+    new_inputs = normalized_current.get("input_identities")
+    if not isinstance(old_inputs, Mapping) or not isinstance(new_inputs, Mapping):
+        return None
+    old_identity = old_inputs.get("structure_data")
+    new_identity = new_inputs.get("structure_data")
+    if not isinstance(old_identity, Mapping) or not isinstance(new_identity, Mapping):
+        return None
+    old_without_path = dict(old_identity)
+    new_without_path = dict(new_identity)
+    old_identity_path = old_without_path.pop("configured_path", None)
+    new_identity_path = new_without_path.pop("configured_path", None)
+    if (
+        old_identity_path is None
+        or new_identity_path is None
+        or old_without_path != new_without_path
+        or _resolve_result_path(old_identity_path, outdir=outdir)
+        != _resolve_result_path(new_identity_path, outdir=outdir)
+    ):
+        return None
+    normalized_old_inputs = dict(old_inputs)
+    normalized_old_inputs["structure_data"] = {
+        **dict(old_identity),
+        "configured_path": str(new_identity_path),
+    }
+    normalized_stored["input_identities"] = normalized_old_inputs
+    if str(old_identity_path) != str(new_identity_path):
+        canonicalized.append("input_identities.structure_data.configured_path")
+
+    if _canonical_json_sha256(normalized_stored) != _canonical_json_sha256(
+        normalized_current
+    ):
+        return None
+    record["canonicalized_path_fields"] = canonicalized
+    return seal_release_resume_migration(record)
+
+
+def _validate_run_resume_fingerprint(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    allow_dry_run_to_full_run: bool = False,
+    outdir: Path | None = None,
+) -> dict[str, Any] | None:
+    stored = previous.get("resume_fingerprint", None)
+    if not isinstance(stored, Mapping):
+        raise RuntimeError(
+            "Cannot safely resume: run_results.json has no run resume fingerprint. "
+            "Use a fresh output directory for pre-fingerprint results."
+        )
+    if stored.get("schema") != _RUN_RESUME_FINGERPRINT_SCHEMA:
+        raise RuntimeError("Cannot safely resume: unsupported run resume fingerprint schema")
+    stored_payload = stored.get("payload", None)
+    if not isinstance(stored_payload, Mapping):
+        raise RuntimeError("Cannot safely resume: malformed run resume fingerprint payload")
+    stored_sha = str(stored.get("sha256", "")).strip().lower()
+    if stored_sha != _canonical_json_sha256(dict(stored_payload)):
+        raise RuntimeError("Cannot safely resume: stored run resume fingerprint is internally inconsistent")
+    current_payload = current.get("payload", None)
+    if not isinstance(current_payload, Mapping):
+        raise RuntimeError("Cannot safely resume: current run resume fingerprint is malformed")
+    current_sha = str(current.get("sha256", "")).strip().lower()
+    if current_sha != _canonical_json_sha256(dict(current_payload)):
+        raise RuntimeError("Cannot safely resume: current run resume fingerprint is internally inconsistent")
+    if stored_sha != current_sha:
+        if outdir is not None:
+            migrated = _migrate_0_4_35_1_run_resume_fingerprint(
+                previous,
+                stored,
+                current,
+                outdir=Path(outdir),
+            )
+            if migrated is not None:
+                return migrated
+        previous_prod = previous.get("production", {})
+        stored_without_mode = dict(stored_payload)
+        current_without_mode = dict(current_payload)
+        stored_mode = str(stored_without_mode.pop("external_mode", "")).strip().lower()
+        current_mode = str(current_without_mode.pop("external_mode", "")).strip().lower()
+        valid_materialisation_transition = (
+            allow_dry_run_to_full_run
+            and stored_mode == "dry-run"
+            and current_mode == "full-run"
+            and _canonical_json_sha256(stored_without_mode)
+            == _canonical_json_sha256(current_without_mode)
+            and isinstance(previous_prod, Mapping)
+            and str(previous.get("status", "")).strip().lower() == "planned"
+            and str(previous.get("execution_status", "")).strip().lower() == "planned"
+            and str(previous_prod.get("status", "")).strip().lower() == "planned"
+            and str(previous_prod.get("execution_status", "")).strip().lower() == "planned"
+            and int(previous_prod.get("n_boxes_total", -1)) == 0
+            and int(previous_prod.get("n_boxes_accepted", -1)) == 0
+            and int(previous_prod.get("n_boxes_rejected", -1)) == 0
+            and bool(previous_prod.get("resumable", False))
+            and isinstance(previous_prod.get("execution"), Mapping)
+            and str(previous_prod.get("execution", {}).get("mode", "")).strip().lower()
+            == "dry-run"
+        )
+        if valid_materialisation_transition:
+            return None
+        raise RuntimeError(
+            "Cannot safely resume: production plan, execution configuration, package version, "
+            "or input file contents differ from the existing run"
+        )
+    return None
 
 
 def _get_type_to_species(config: RunConfig) -> Optional[list[str]]:
@@ -58,7 +469,7 @@ def _production_common_module():
 def _run_production_executor(**kwargs):
     # Routes through `production_common.run_production_ensemble`, which is a
     # TRANSITIONAL SHIM that lazy-imports `autotune._run_production_ensemble`.
-    # This is NOT an architecture fix for CLAUDE.md's run/autotune/run-schedule
+    # This is NOT an architecture fix for the project design guide's run/autotune/run-schedule
     # separation rule -- the cross-runner dependency still exists, just
     # renamed. The finding is intentionally left open; see the docstring on
     # `production_common.run_production_ensemble` for why we kept the shim
@@ -197,6 +608,7 @@ def _legacy_rate_and_structure(config: RunConfig, source: Mapping[str, Any], bas
     return structure_path, dict(rec), dict(production), _resolve_path_from_source(size_scan.get("base_data", None), base_dir=base_dir)
 
 
+@locked_output_workflow("run melt-quench workflow")
 def run_meltquench(
     config: RunConfig,
     outdir: Path,
@@ -211,6 +623,12 @@ def run_meltquench(
     resume: bool | None = None,
 ) -> dict[str, Any]:
     ensure_dir(outdir)
+    results_path = outdir / "run_results.json"
+    do_resume = _resolve_run_resume_mode(
+        outdir=outdir,
+        results_path=results_path,
+        resume=resume,
+    )
     progress = CondensedProgressLog(outdir / "condensed.log")
     progress.info("run", "initialising melt-quench workflow")
 
@@ -232,19 +650,33 @@ def run_meltquench(
         raise ValueError(f"Unsupported external_mode={external_mode!r}; expected one of local, dry-run, full-run")
 
     source = production_source if production_source is not None else recommendation
+    requested_source = source
+    requested_source_base_dir = recommendation_base_dir
     production_common = _production_common_module()
     resume_state: Optional[dict[str, Any]] = None
-    results_path = outdir / "run_results.json"
-    do_resume = results_path.exists() if resume is None else (bool(resume) and results_path.exists())
+    previous_results: Optional[dict[str, Any]] = None
+    previous_complete = False
+    release_resume_migrations: list[dict[str, Any]] = []
     if do_resume:
         prev = json.loads(results_path.read_text())
+        if not isinstance(prev, dict):
+            raise RuntimeError("Cannot resume: run_results.json does not contain a JSON object")
+        previous_results = prev
+        previous_migrations = prev.get("release_resume_migrations", [])
+        if not isinstance(previous_migrations, list) or not all(
+            isinstance(item, Mapping) for item in previous_migrations
+        ):
+            raise RuntimeError(
+                "Cannot safely resume: release-resume migration history is malformed"
+            )
+        release_resume_migrations = [dict(item) for item in previous_migrations]
+        for migration_record in release_resume_migrations:
+            validate_release_resume_migration(migration_record)
         prev_prod = prev.get("production", None)
         if not isinstance(prev_prod, Mapping):
             raise RuntimeError("Cannot resume: existing run_results.json has no 'production' state")
         prev_status = str(prev_prod.get("status", prev.get("status", "")) or "").strip().lower()
-        if prev_status == "ok":
-            progress.info("run", "existing run_results.json is already complete; returning cached summary")
-            return dict(prev)
+        previous_complete = prev_status == "ok"
         resume_state = dict(prev_prod)
         if isinstance(prev.get("metric_warnings", None), list):
             metric_warnings.extend(str(x) for x in prev.get("metric_warnings", []) or [])
@@ -252,6 +684,31 @@ def run_meltquench(
             run_warnings.extend(str(x) for x in prev.get("run_warnings", []) or [])
         prev_plan = production_common.production_plan_from_source(prev, base_dir=outdir)
         if prev_plan is not None:
+            if requested_source is not None:
+                requested_plan = production_common.production_plan_from_source(
+                    requested_source,
+                    base_dir=requested_source_base_dir,
+                )
+                if requested_plan is None:
+                    raise RuntimeError(
+                        "Cannot safely resume: the supplied --use-autotune source does not "
+                        "contain a complete production plan"
+                    )
+                protected_plan_payload = production_common.production_plan_to_dict(
+                    prev_plan,
+                    relative_to=None,
+                )
+                requested_plan_payload = production_common.production_plan_to_dict(
+                    requested_plan,
+                    relative_to=None,
+                )
+                if _canonical_json_sha256(protected_plan_payload) != _canonical_json_sha256(
+                    requested_plan_payload
+                ):
+                    raise RuntimeError(
+                        "Cannot safely resume: the supplied --use-autotune production plan "
+                        "differs from the plan protected by run_results.json"
+                    )
             source = prev
             recommendation_base_dir = outdir
             progress.info(
@@ -260,10 +717,9 @@ def run_meltquench(
                 f"({int(prev_prod.get('n_boxes_total', 0) or 0)} boxes already attempted)",
             )
         else:
-            progress.warn(
-                "run",
-                "existing run_results.json has no stored production_plan; "
-                "resuming with the current config/source",
+            raise RuntimeError(
+                "Cannot safely resume: existing run_results.json has no stored production_plan. "
+                "Use a fresh output directory rather than mixing an unverified plan with prior boxes."
             )
 
     plan = (
@@ -309,6 +765,11 @@ def run_meltquench(
             config.autotune.metrics,
             structure_data=Path(structure_data),
             type_to_species=type_to_species,
+            lammps_units_style=(
+                str(getattr(config.kim, "user_units", "") or "")
+                if engine == "lammps"
+                else None
+            ),
             warn_fn=_warn_metric,
             context="run production",
         )
@@ -413,6 +874,89 @@ def run_meltquench(
     if plan is None:
         raise RuntimeError("failed to construct a production plan")
 
+    # A protected autocore table is a realized numerical artifact, not merely
+    # a set of analytic parameters.  Portable --use-autotune replay copies and
+    # authenticates that exact table before fingerprinting or task creation.
+    if plan.potential_lines is not None:
+        table_source_root = (
+            Path(recommendation_base_dir)
+            if recommendation_base_dir is not None
+            else Path(outdir)
+        )
+        stage_validated_tabulated_core_for_replay(
+            plan.potential_lines,
+            source_root=table_source_root,
+            target_root=outdir,
+        )
+
+    plan_for_fingerprint = production_common.production_plan_to_dict(plan, relative_to=outdir)
+    plan_prod_for_identity = plan_for_fingerprint.get("production_cfg", {})
+    plan_dft_for_identity = (
+        plan_prod_for_identity.get("dft_opt", {})
+        if isinstance(plan_prod_for_identity, Mapping)
+        else {}
+    )
+    if external_mode_norm == "local":
+        engine_build_identities = query_engine_build_identities(
+            config,
+            workdir=outdir,
+            primary_engine=str(plan.engine),
+            include_cp2k_refinement=bool(
+                isinstance(plan_dft_for_identity, Mapping)
+                and plan_dft_for_identity.get("enabled", False)
+            ),
+        )
+        validate_engine_build_identity_bundle(engine_build_identities)
+    else:
+        # A planning/login node is not required to expose the compute-node
+        # engine.  Every executed task records and authenticates the concrete
+        # worker identity, which the external collector checks for homogeneity.
+        engine_build_identities = deferred_engine_build_identities(str(plan.engine))
+    resume_fingerprint = _build_run_resume_fingerprint(
+        config=config,
+        production_plan=plan_for_fingerprint,
+        outdir=outdir,
+        external_mode=external_mode_norm,
+        job_template=job_template,
+        engine_build_identities=engine_build_identities,
+    )
+    if previous_results is not None:
+        release_resume_migration = _validate_run_resume_fingerprint(
+            previous_results,
+            resume_fingerprint,
+            allow_dry_run_to_full_run=(external_mode_norm == "full-run"),
+            outdir=outdir,
+        )
+        assert resume_state is not None
+        _validate_production_resume_state(resume_state, outdir=outdir)
+        if str(previous_results.get("status", "")).strip().lower() != str(
+            resume_state.get("status", "")
+        ).strip().lower():
+            raise RuntimeError("Cannot safely resume: top-level and production statuses disagree")
+        if str(previous_results.get("execution_status", "")).strip().lower() != str(
+            resume_state.get("execution_status", "")
+        ).strip().lower():
+            raise RuntimeError(
+                "Cannot safely resume: top-level and production execution statuses disagree"
+            )
+        if release_resume_migration is not None:
+            release_resume_migrations.append(dict(release_resume_migration))
+            progress.info(
+                "run",
+                "authenticated exact 0.4.35.1→0.4.36.0 zero-box checkpoint migration",
+            )
+        terminal_non_resumable = (
+            str(resume_state.get("status", "")).strip().lower()
+            in {"incomplete", "not_converged"}
+            and not bool(resume_state.get("resumable", True))
+        )
+        if previous_complete or terminal_non_resumable:
+            progress.info(
+                "run",
+                "existing terminal run result and its resume fingerprint are valid; returning cached summary",
+            )
+            return dict(previous_results)
+
     engine = str(plan.engine).strip().lower()
     # Resolve pot_cfg from the plan first so a replayed production matches the
     # original potential regardless of engine. The previous "pot_cfg = config.kim"
@@ -429,8 +973,10 @@ def run_meltquench(
             runner = Cp2kRunner(config.cp2k)  # type: ignore[arg-type]
     else:
         if external_mode_norm == "local":
-            if pot_cfg is not None:
-                ensure_model_installed(getattr(pot_cfg, "model", ""))
+            ensure_potential_model_installed(
+                pot_cfg,
+                installer=ensure_model_installed,
+            )
             runner = LammpsRunner(config.lammps)
 
     if bool(getattr(md_use, "force_isotropic", False)) and engine != "lammps":
@@ -445,12 +991,23 @@ def run_meltquench(
     q_cfg_exec = config.autotune.quench.model_copy(update={"t_final": float(plan.t_final), "relax_steps": int(plan.relax_steps)})
     tm_cfg_exec = config.autotune.tm_scan.model_copy(update={"msd_every": int(plan.msd_every)})
     store_distributions = bool(getattr(prod_cfg_override, "store_distributions", True))
+    integrity_file_cache: dict[str, tuple[int, int, int, int, int, str]] = {}
 
     def _build_summary(prod_state: dict[str, Any]) -> dict[str, Any]:
+        prod_status = str(prod_state.get("status", "incomplete"))
+        terminal = prod_status in {"ok", "incomplete", "not_converged"}
+        prod_state.setdefault("execution_status", "completed" if terminal else prod_status)
+        prod_state = _attach_production_state_integrity(
+            prod_state,
+            outdir=outdir,
+            identity_cache=integrity_file_cache,
+            force_rehash=terminal,
+        )
         all_entries = list(prod_state.get("boxes", [])) + list(prod_state.get("rejected_boxes", []))
         rep_entries = all_entries if store_distributions else _strip_distributions(all_entries)
         return {
-            "status": str(prod_state.get("status", "ok")),
+            "status": prod_status,
+            "execution_status": "completed" if terminal else prod_status,
             "parameters": {
                 "engine": str(engine),
                 "lammps_units": resolve_lammps_units_style(config, pot_cfg=pot_cfg, default="metal"),
@@ -472,12 +1029,23 @@ def run_meltquench(
             },
             "replicates": rep_entries,
             "production": prod_state,
+            "graph_outputs": dict((prod_state.get("graph_outputs", {}) if isinstance(prod_state, Mapping) else {}) or {}),
             "cutoffs": list(plan.preferred_cutoffs),
             "metric_warnings": list(metric_warnings),
             "run_warnings": list(run_warnings),
             "effective_metrics": dict(plan.effective_metrics or {}),
             "production_plan": production_common.production_plan_to_dict(plan, relative_to=outdir),
-            "paths": {"condensed_log": "condensed.log", "run_results": "run_results.json"},
+            "resume_fingerprint": dict(resume_fingerprint),
+            **(
+                {"release_resume_migrations": list(release_resume_migrations)}
+                if release_resume_migrations
+                else {}
+            ),
+            "paths": {
+                "condensed_log": "condensed.log",
+                "run_results": "run_results.json",
+                **dict((prod_state.get("graph_outputs", {}) if isinstance(prod_state, Mapping) else {}) or {}),
+            },
         }
 
     def _checkpoint(prod_state: dict[str, Any]) -> None:
@@ -538,8 +1106,45 @@ def run_meltquench(
                 job_template=job_template,
                 max_parallel_boxes=max(1, int(max_parallel_boxes)),
                 progress=progress,
+                resume_state=resume_state,
+                checkpoint_cb=_checkpoint,
             )
 
+    terminal_engine_build_identities = engine_build_identities
+    if external_mode_norm == "local":
+        final_engine_build_identities = query_engine_build_identities(
+            config,
+            workdir=outdir,
+            primary_engine=str(plan.engine),
+            include_cp2k_refinement=bool(
+                isinstance(plan_dft_for_identity, Mapping)
+                and plan_dft_for_identity.get("enabled", False)
+            ),
+        )
+        assert_engine_build_identity_bundle_unchanged(
+            engine_build_identities,
+            final_engine_build_identities,
+            context="during local run execution",
+        )
+        terminal_engine_build_identities = final_engine_build_identities
+    terminal_fingerprint = _build_run_resume_fingerprint(
+        config=config,
+        production_plan=production_common.production_plan_to_dict(
+            plan, relative_to=outdir
+        ),
+        outdir=outdir,
+        external_mode=external_mode_norm,
+        job_template=job_template,
+        engine_build_identities=terminal_engine_build_identities,
+    )
+    if str(terminal_fingerprint.get("sha256", "")) != str(
+        resume_fingerprint.get("sha256", "")
+    ):
+        raise RuntimeError(
+            "Run configuration or scientific input bytes changed during execution; "
+            "refusing to write a terminal result that could combine different "
+            "structures, potentials, command includes, or CP2K data"
+        )
     summary = _build_summary(dict(production))
     atomic_write_json(outdir / "run_results.json", summary)
     progress.info("run", "workflow complete; wrote run_results.json")

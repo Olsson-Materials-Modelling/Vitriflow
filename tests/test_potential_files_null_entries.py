@@ -1,6 +1,6 @@
 """potential.files null entries must raise, not silently drop.
 
-Targeted regression for ultrareview finding #5. PyYAML parses ``null``,
+Targeted regression for review finding #5. PyYAML parses ``null``,
 ``~``, and trailing ``-`` (with no value) into Python ``None``. The
 earlier from_yaml fix dropped those entries silently while normalising
 paths, leaving the loaded config diverging from the YAML the user wrote.
@@ -196,36 +196,15 @@ def test_empty_files_list_is_unaffected(tmp_path: Path):
     assert files == []
 
 
-def test_null_error_is_not_swallowed_by_path_rewrite_exception_block(tmp_path: Path):
-    """Source-level pin: the null check sits OUTSIDE the
-    `except _PATH_REWRITE_EXC` swallow in from_yaml. If a future edit moves
-    the check inside that try block, the error would be silently caught and
-    we would regress to the original "silently drop" behavior. ValueError
-    is in _PATH_REWRITE_EXC, so location matters more than exception type.
-    """
+def test_path_rewrite_has_no_exception_swallow_and_null_still_propagates(tmp_path: Path):
+    """Path ambiguity and malformed entries must never be caught and ignored."""
     import inspect
 
     from vitriflow.config import RunConfig
 
     src = inspect.getsource(RunConfig.from_yaml)
+    assert "_PATH_REWRITE_EXC" not in src
 
-    # Locate the marker we put before the null check, the null check
-    # raise, and the broad except. Ensure the raise comes before the except.
-    marker = src.find("potential.files: reject null entries up front")
-    raise_pos = src.find('raise ValueError', marker)
-    except_pos = src.find('except _PATH_REWRITE_EXC', raise_pos)
-
-    assert marker != -1, "null-rejection block was renamed/removed"
-    assert raise_pos != -1, "null-rejection raise was removed"
-    assert except_pos != -1, "trailing path-rewrite except was removed"
-
-    # The next try statement after the raise must be the path-rewrite block.
-    # If someone later wraps the null check itself in a try, they would have
-    # to introduce a new `try:` between marker and raise -- which this check
-    # forbids.
-    inter_try = src.find("try:", marker, raise_pos)
-    assert inter_try == -1, (
-        "null-rejection raise must not be wrapped in a try block; otherwise "
-        "the broad except _PATH_REWRITE_EXC would swallow ValueError and the "
-        "silently-drop bug returns."
-    )
+    cfg_path = _write_cfg(tmp_path, [None])
+    with pytest.raises(ValueError, match=r"potential\.files.*index 0.*null"):
+        RunConfig.from_yaml(cfg_path)

@@ -15,8 +15,12 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 from ..config import AtomSelector
-from .dump import DumpFrame
-from .common import resolve_selector as _resolve_selector, wrap_frac as _wrap_frac, mic_distances as _mic_distances
+from .dump import DumpFrame, frame_pbc
+from .common import (
+    canonical_unique_mic_pairs as _canonical_unique_mic_pairs,
+    resolve_selector as _resolve_selector,
+    wrap_frac as _wrap_frac,
+)
 
 
 
@@ -27,6 +31,62 @@ class GrResult:
     peak_r: float
     peak_height: float
     peak_fwhm: float
+
+
+def _shortest_lattice_translation(
+    cell: np.ndarray,
+    *,
+    pbc: Sequence[bool] = (True, True, True),
+) -> float:
+    """Return the shortest non-zero lattice-vector length.
+
+    The smallest basis-vector norm is not invariant under a change of lattice
+    basis and can overestimate the unique-image RDF radius in a skew cell.  A
+    singular-value bound makes the finite integer search exhaustive.
+    """
+    h = np.asarray(cell, dtype=float)
+    if h.shape != (3, 3) or not np.all(np.isfinite(h)):
+        raise ValueError("cell must be a finite 3x3 lattice matrix")
+    periodic = tuple(bool(x) for x in pbc)
+    if len(periodic) != 3:
+        raise ValueError("pbc must contain exactly three flags")
+    periodic_axes = [i for i, enabled in enumerate(periodic) if enabled]
+    if not periodic_axes:
+        return float("inf")
+    periodic_basis = h[np.asarray(periodic_axes, dtype=int), :]
+    singular = np.linalg.svd(periodic_basis, compute_uv=False)
+    sigma_min = float(np.min(singular))
+    basis_upper = float(min(np.linalg.norm(h[i]) for i in periodic_axes))
+    if not (sigma_min > 0.0 and math.isfinite(basis_upper) and basis_upper > 0.0):
+        raise ValueError("cell lattice is singular")
+    # ||n H|| >= sigma_min ||n||.  No vector with ||n|| larger than this
+    # bound can improve on the shortest basis vector already known.
+    bound = int(math.ceil(basis_upper / sigma_min))
+    bound = max(1, bound)
+    if bound > 64:
+        raise ValueError(
+            "cell is too ill-conditioned for an exhaustive unique-image RDF cutoff; "
+            f"integer search bound={bound}"
+        )
+    best = basis_upper
+    ranges = [
+        range(-bound, bound + 1) if periodic[axis] else (0,)
+        for axis in range(3)
+    ]
+    for i in ranges[0]:
+        for j in ranges[1]:
+            for k in ranges[2]:
+                if i == 0 and j == 0 and k == 0:
+                    continue
+                n = np.asarray([i, j, k], dtype=float)
+                # A candidate whose integer norm cannot beat the current best
+                # is eliminated by the same singular-value lower bound.
+                if sigma_min * float(np.linalg.norm(n)) > best + 1.0e-12:
+                    continue
+                length = float(np.linalg.norm(n @ h))
+                if length < best:
+                    best = length
+    return float(best)
 
 
 def compute_gr(
@@ -40,10 +100,16 @@ def compute_gr(
     """Gr."""
     if not frames:
         raise ValueError("compute_gr requires at least one frame")
-    if r_max <= 0:
-        raise ValueError("r_max must be > 0")
-    if nbins < 10:
+    if not (math.isfinite(float(r_max)) and float(r_max) > 0.0):
+        raise ValueError("r_max must be finite and > 0")
+    if isinstance(nbins, bool) or int(nbins) != nbins or int(nbins) < 10:
         raise ValueError("nbins must be >= 10")
+    for index, frame in enumerate(frames):
+        if not all(frame_pbc(frame)):
+            raise ValueError(
+                "normalized periodic g(r) currently requires PBC in all three directions; "
+                f"frame {index} has pbc={list(frame_pbc(frame))}"
+            )
 
     # pair based requested
     A_types: Optional[set[int]] = None
@@ -60,9 +126,11 @@ def compute_gr(
     # smallest box consistent
     half_lengths = []
     mean_spacings = []
-    for fr in frames:
-        lens = [float(np.linalg.norm(fr.cell[i])) for i in range(3)]
-        half_lengths.append(0.5 * min(lens))
+    for frame_index, fr in enumerate(frames):
+        shortest = _shortest_lattice_translation(fr.cell, pbc=frame_pbc(fr))
+        # Exclude the Wigner--Seitz boundary itself: at exactly half a lattice
+        # translation, two equidistant periodic images can both be emitted.
+        half_lengths.append(float(np.nextafter(0.5 * shortest, 0.0)))
         V = abs(float(np.linalg.det(fr.cell)))
         if fr.n_atoms > 0 and V > 0:
             rho = fr.n_atoms / V
@@ -75,24 +143,27 @@ def compute_gr(
 
     edges = np.linspace(0.0, r_max_eff, int(nbins) + 1)
     centers = 0.5 * (edges[:-1] + edges[1:])
-    dr = float(edges[1] - edges[0])
+    shell_vol = (4.0 * math.pi / 3.0) * (
+        edges[1:] ** 3 - edges[:-1] ** 3
+    )
 
     g_frames: list[np.ndarray] = []
 
-    for fr in frames:
+    for frame_index, fr in enumerate(frames):
+        pbc = frame_pbc(fr)
         invH = np.linalg.inv(fr.cell)
-        frac = _wrap_frac((fr.positions - fr.origin) @ invH)
+        frac = _wrap_frac((fr.positions - fr.origin) @ invH, pbc=pbc)
         posw = fr.origin + frac @ fr.cell
 
-        # update shortest box
-        lens = [float(np.linalg.norm(fr.cell[i])) for i in range(3)]
-        rcut = min(r_max_eff, 0.5 * min(lens))
+        # The half-shortest-translation sphere contains at most one periodic
+        # image of each unordered atom pair.
+        rcut = min(r_max_eff, float(half_lengths[frame_index]))
 
-        atoms = Atoms(numbers=np.ones(fr.n_atoms, dtype=int), positions=posw, cell=fr.cell, pbc=True)
+        atoms = Atoms(numbers=np.ones(fr.n_atoms, dtype=int), positions=posw, cell=fr.cell, pbc=pbc)
         ii, jj = neighbor_list("ij", atoms, rcut)
-        m = ii < jj
-        ii = ii[m]
-        jj = jj[m]
+        ii, jj, _vec, dist = _canonical_unique_mic_pairs(
+            frac, fr.cell, ii, jj, cutoff=float(rcut), pbc=pbc
+        )
 
         if pair is not None and A_types is not None and B_types is not None:
             ti = fr.types[ii]
@@ -105,17 +176,7 @@ def compute_gr(
                 )
             ii = ii[want]
             jj = jj[want]
-
-        if ii.size == 0:
-            g_frames.append(np.full((centers.size,), np.nan, dtype=float))
-            continue
-
-        dist = _mic_distances(frac, fr.cell, ii, jj)
-        dist = dist[np.isfinite(dist)]
-        dist = dist[(dist > 1e-8) & (dist <= r_max_eff)]
-
-        counts, _ = np.histogram(dist, bins=edges)
-        counts = counts.astype(float)
+            dist = dist[want]
 
         V = abs(float(np.linalg.det(fr.cell)))
         if V <= 0 or fr.n_atoms < 2:
@@ -139,12 +200,21 @@ def compute_gr(
             g_frames.append(np.full((centers.size,), np.nan, dtype=float))
             continue
 
-        shell_vol = 4.0 * math.pi * (centers**2) * dr
+        if ii.size:
+            dist = dist[np.isfinite(dist)]
+            dist = dist[(dist > 1e-8) & (dist <= r_max_eff)]
+            radial_counts, _ = np.histogram(dist, bins=edges)
+            radial_counts = radial_counts.astype(float)
+        else:
+            # No observed events is a measured zero RDF for a pair population,
+            # not missing data.  Only n_pairs<=0 is mathematically undefined.
+            radial_counts = np.zeros_like(centers, dtype=float)
+
         ideal = (n_pairs / V) * shell_vol
 
         g = np.full_like(centers, np.nan, dtype=float)
         m2 = ideal > 0
-        g[m2] = counts[m2] / ideal[m2]
+        g[m2] = radial_counts[m2] / ideal[m2]
         g_frames.append(g)
 
     g_stack = np.vstack([g for g in g_frames if g.size == centers.size])
@@ -184,16 +254,26 @@ def first_peak_features(
         raise ValueError("r and g must be 1D arrays of equal length")
     if r.size < 10:
         return float("nan"), float("nan"), float("nan")
+    if not np.all(np.isfinite(r)) or not np.all(np.diff(r) > 0.0):
+        raise ValueError("r grid must be finite and strictly increasing")
 
     # smooth
     w = int(smooth)
     if w < 1:
         w = 1
+    # ``numpy.convolve(..., mode='same')`` returns the length of the longer
+    # operand.  Cap the window before convolution so an oversized user window
+    # cannot produce an array longer than the RDF grid.
+    w = min(w, int(r.size))
     if w % 2 == 0:
-        w += 1
+        w = max(1, w - 1)
     if w > 1:
-        ker = np.ones(w, dtype=float) / float(w)
-        g_s = np.convolve(np.nan_to_num(g, nan=0.0), ker, mode="same")
+        ker = np.ones(w, dtype=float)
+        finite = np.isfinite(g)
+        numerator = np.convolve(np.where(finite, g, 0.0), ker, mode="same")
+        denominator = np.convolve(finite.astype(float), ker, mode="same")
+        g_s = np.full_like(g, np.nan, dtype=float)
+        np.divide(numerator, denominator, out=g_s, where=denominator > 0.0)
     else:
         g_s = np.array(g, dtype=float)
 
@@ -220,6 +300,10 @@ def first_peak_features(
     # baseline minimum peak
     m_pre = (r >= r_ignore) & (r <= r_peak) & np.isfinite(g_s)
     baseline = float(np.min(g_s[m_pre])) if np.any(m_pre) else 0.0
+    prominence = h - baseline
+    scale = max(1.0, abs(h), abs(baseline))
+    if not (math.isfinite(prominence) and prominence > 32.0 * np.finfo(float).eps * scale):
+        return float("nan"), float("nan"), float("nan")
     half = baseline + 0.5 * (h - baseline)
 
     # crossing

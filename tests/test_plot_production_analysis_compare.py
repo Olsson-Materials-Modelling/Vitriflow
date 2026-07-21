@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from vitriflow.plotting import (
     plot_production_comparison_results,
@@ -132,7 +133,7 @@ def _make_analysis_results(path: Path, *, offset: float) -> Path:
             "n_boxes": len(boxes),
             "familywise": {
                 "method": "bonferroni",
-                "alpha_family": 0.95,
+                "alpha_family": 0.05,
                 "m_tests": 4,
                 "alpha_per_test": 0.05,
                 "crit": 1.96,
@@ -248,10 +249,112 @@ def test_plot_production_accepts_analysis_results_json(tmp_path: Path) -> None:
     analysis_json = _make_analysis_results(tmp_path / "analysis_results.json", offset=0.0)
     out_pdf = tmp_path / "production_single.pdf"
 
-    plot_production_results(analysis_json, out_pdf)
+    plot_production_results(analysis_json, out_pdf, dpi=80)
 
     assert out_pdf.exists()
     assert out_pdf.stat().st_size > 0
+
+
+def test_plot_production_accepts_native_zero_based_box_identifier(
+    tmp_path: Path,
+) -> None:
+    """Custom/run schedules serialize their first production box as zero."""
+
+    analysis_json = _make_analysis_results(tmp_path / "analysis_results.json", offset=0.0)
+    payload = json.loads(analysis_json.read_text())
+    payload["boxes"][0]["box"] = 0
+    analysis_json.write_text(json.dumps(payload))
+    out_pdf = tmp_path / "production_zero_based.pdf"
+
+    plot_production_results(analysis_json, out_pdf, dpi=80)
+
+    assert out_pdf.exists()
+    assert out_pdf.stat().st_size > 0
+
+
+@pytest.mark.parametrize("invalid", [True, -1, 0.5, float("nan"), float("inf")])
+def test_plot_production_rejects_invalid_box_identifiers(
+    tmp_path: Path,
+    invalid,
+) -> None:
+    analysis_json = _make_analysis_results(tmp_path / "analysis_results.json", offset=0.0)
+    payload = json.loads(analysis_json.read_text())
+    payload["boxes"][0]["box"] = invalid
+    analysis_json.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="box identifier"):
+        plot_production_results(
+            analysis_json,
+            tmp_path / "invalid.pdf",
+            dpi=80,
+        )
+
+
+def test_plot_production_rejects_duplicate_box_identifiers(tmp_path: Path) -> None:
+    analysis_json = _make_analysis_results(tmp_path / "analysis_results.json", offset=0.0)
+    payload = json.loads(analysis_json.read_text())
+    payload["boxes"][1]["box"] = payload["boxes"][0]["box"]
+    analysis_json.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="duplicate box identifier"):
+        plot_production_results(
+            analysis_json,
+            tmp_path / "duplicate.pdf",
+            dpi=80,
+        )
+
+
+def test_plot_production_preserves_distinct_integer_ids_above_float_precision(
+    tmp_path: Path,
+) -> None:
+    analysis_json = _make_analysis_results(tmp_path / "analysis_results.json", offset=0.0)
+    payload = json.loads(analysis_json.read_text())
+    payload["boxes"][0]["box"] = 2**53
+    payload["boxes"][1]["box"] = 2**53 + 1
+    analysis_json.write_text(json.dumps(payload))
+    output = tmp_path / "large_ids.pdf"
+
+    plot_production_results(analysis_json, output, dpi=80)
+
+    assert output.is_file() and output.stat().st_size > 0
+
+
+def test_plot_production_emits_dft_pages_for_native_box_identifiers(
+    tmp_path: Path,
+) -> None:
+    """Autotune stores ``box``; plotting must not require synthetic ``box_id``."""
+
+    source = _make_analysis_results(tmp_path / "analysis_results.json", offset=0.0)
+    analysis = json.loads(source.read_text())
+    boxes = analysis["boxes"]
+    for entry in boxes:
+        assert "box" in entry and "box_id" not in entry
+        entry["dft_opt"] = {
+            "status": "ok",
+            "density": float(entry["density"]) + 0.05,
+            "metrics": dict(entry["metrics"]),
+            "distributions": dict(entry["distributions"]),
+        }
+    production = dict(analysis)
+    production.update(
+        {
+            "enabled": True,
+            "boxes": boxes,
+            "boxes_dft_final": [1, 2, 3, 4],
+            "convergence_md": dict(analysis["convergence"]),
+            "convergence_dft": dict(analysis["convergence"]),
+        }
+    )
+    result_path = tmp_path / "autotune_results.json"
+    result_path.write_text(json.dumps({"production": production}))
+    out_dir = tmp_path / "plots"
+
+    plot_production_results(result_path, out_dir, dpi=80)
+
+    generated_names = {path.name for path in out_dir.glob("*.png")}
+    assert any("MD_vs_DFT:_density" in name for name in generated_names)
+    assert any("MD_vs_DFT:_bondlen" in name for name in generated_names)
+    assert any("MD_vs_DFT:_g(r)" in name for name in generated_names)
 
 
 def test_plot_production_compare_multiple_analysis_results(tmp_path: Path) -> None:
@@ -264,7 +367,34 @@ def test_plot_production_compare_multiple_analysis_results(tmp_path: Path) -> No
         [md, pbe, hse],
         out_pdf,
         labels=["MD", "PBE", "HSE06"],
+        dpi=80,
+        max_pages=3,
     )
 
     assert out_pdf.exists()
     assert out_pdf.stat().st_size > 0
+
+
+def test_plot_production_analysis_results_without_convergence_familywise(tmp_path: Path) -> None:
+    analysis_json = _make_analysis_results(tmp_path / "analysis_results_no_conv.json", offset=0.0)
+    payload = json.loads(analysis_json.read_text())
+    payload["schema"] = "vitriflow.analysis_results.v2"
+    payload["converged"] = False
+    payload["convergence"] = {
+        "schema": "vitriflow.analysis_descriptor_convergence.v1",
+        "advisory": True,
+        "status": "not_evaluated",
+        "reason": "legacy analysis output without production familywise convergence report",
+        "groups": {
+            "short": {"status": "not_evaluated", "passed": None, "items": ["bondlen_cdf:bondlen_A-B"]},
+            "medium": {"status": "not_evaluated", "passed": None, "items": ["ring_mean_size", "ring_frac_3"]},
+            "long": {"status": "not_evaluated", "passed": None, "items": ["density", "gr_curve:gr_all"]},
+        },
+    }
+    analysis_json.write_text(json.dumps(payload))
+    out_dir = tmp_path / "plots"
+
+    plot_production_results(analysis_json, out_dir, dpi=80, max_pages=4)
+
+    assert out_dir.exists()
+    assert any(p.suffix == ".png" and p.stat().st_size > 0 for p in out_dir.iterdir())

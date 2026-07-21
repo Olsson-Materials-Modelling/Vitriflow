@@ -1,6 +1,6 @@
 """Pin the production-runner shim's status as TRANSITIONAL, not resolved.
 
-Targeted regression for ultrareview finding #4. The earlier patch added
+Targeted regression for review finding #4. The earlier patch added
 ``production_common.run_production_ensemble`` as a thin wrapper around
 ``autotune._run_production_ensemble`` so ``run.py`` would stop importing
 autotune internals directly. That move is **not** an architecture fix --
@@ -49,7 +49,7 @@ def test_shim_docstring_states_open_finding():
 
 
 def test_shim_docstring_does_not_overclaim_compliance():
-    """The docstring must not claim CLAUDE.md's separation rule is satisfied."""
+    """The docstring must not claim the project design guide's separation rule is satisfied."""
     from vitriflow.workflows import production_common
 
     fn = production_common.run_production_ensemble
@@ -65,7 +65,7 @@ def test_shim_docstring_does_not_overclaim_compliance():
     ]
     for needle in forbidden:
         assert needle.lower() not in doc, (
-            f"docstring contains {needle!r}, which overclaims CLAUDE.md "
+            f"docstring contains {needle!r}, which overclaims the project design guide "
             "compliance. Finding #4 explicitly forbids this framing."
         )
 
@@ -74,7 +74,7 @@ def test_implementation_still_lives_in_autotune():
     """The runner class is still defined in autotune; pin the open finding.
 
     If this test ever fails, it means someone moved the implementation. In
-    that case: delete this test and the shim, and update CLAUDE.md to mark
+    that case: delete this test and the shim, and update the project design guide to mark
     the finding closed. Do NOT silently weaken this assertion.
     """
     from vitriflow.workflows import autotune

@@ -1,6 +1,6 @@
 """Preflight: CP2K stages must reject incomplete type_to_species mappings.
 
-Targeted regression for ultrareview finding #1: an input structure carrying
+Targeted regression for review finding #1: an input structure carrying
 species that do not appear in ``type_to_species`` used to slip through to the
 best-effort artifact materializer where they became LAMMPS ``type=0``. The
 check has been hoisted to a hard preflight that runs before any CP2K

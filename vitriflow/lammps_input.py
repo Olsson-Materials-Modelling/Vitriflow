@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import re
 from typing import Literal, Optional, Sequence
 
 from .config import MDConfig, PotentialConfig
 from .potential import potential_default_lines, potential_init_lines, potential_interactions_list
+from .lammps_units import mass_from_amu_factor
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,31 @@ class StageSpec:
     # potential lines
     potential_lines: Optional[Sequence[str]] = None
 
+    def __post_init__(self) -> None:
+        validate_stage_name(self.name, context="StageSpec.name")
+
+
+_SAFE_STAGE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def validate_stage_name(value: object, *, context: str = "stage name") -> str:
+    """Validate a stage identifier used as a LAMMPS id/file-name prefix."""
+
+    raw_name = str(value)
+    name = raw_name.strip()
+    if (
+        not name
+        or raw_name != name
+        or name in {".", ".."}
+        or Path(name).name != name
+        or _SAFE_STAGE_NAME_RE.fullmatch(name) is None
+    ):
+        raise ValueError(
+            f"{context}={raw_name!r} is not path-safe; use one basename made from "
+            "letters, digits, '_', '-' or '.' (not '.' or '..')"
+        )
+    return name
+
 
 
 def _force_isotropic_block(stage: StageSpec) -> str:
@@ -68,7 +95,11 @@ def _force_isotropic_block(stage: StageSpec) -> str:
 
 
 def _mass_lines_from_interactions(
-    interactions: Sequence[str], *, md: MDConfig, datafile: Optional[Path] = None
+    interactions: Sequence[str],
+    *,
+    md: MDConfig,
+    datafile: Optional[Path] = None,
+    units_style: str = "metal",
 ) -> str:
     """Mass lines from."""
     if not interactions:
@@ -93,6 +124,7 @@ def _mass_lines_from_interactions(
     except Exception:  # pragma: no cover
         return ""
 
+    mass_factor = float(mass_from_amu_factor(units_style))
     lines: list[str] = []
     for t, sp in enumerate(list(interactions), start=1):
         sym = str(sp)
@@ -101,7 +133,7 @@ def _mass_lines_from_interactions(
         Z = int(atomic_numbers[sym])
         m = float(atomic_masses[Z])
         if m > 0:
-            lines.append(f"mass {t} {m:.6f}")
+            lines.append(f"mass {t} {m * mass_factor:.16g}")
     return "\n".join(lines)
 
 def _style_name(value: object) -> str:
@@ -192,6 +224,21 @@ def _lammps_integration_block(
     return "\n".join(lines), "\n".join(cleanup)
 
 
+def _sampling_run_command(stage: StageSpec, steps: int, *, split_ramp: bool) -> str:
+    """Render a sampling run while preserving one global thermostat ramp.
+
+    LAMMPS fixes interpolate their target over each ``run`` command unless
+    ``start``/``stop`` identify the enclosing run interval.  Tail dumping
+    splits a stage into two runs, so a nonconstant temperature stage must give
+    both commands the same global interval.
+    """
+
+    n = int(steps)
+    if split_ramp and float(stage.temperature_start) != float(stage.temperature_stop):
+        return f"run {n} start 0 stop {int(stage.run_steps)}"
+    return f"run {n}"
+
+
 def render_stage(pot: PotentialConfig, md: MDConfig, stage: StageSpec) -> str:
     """Stage."""
     dump_every = stage.dump_every if stage.dump_every is not None else md.dump_every
@@ -225,14 +272,24 @@ def render_stage(pot: PotentialConfig, md: MDConfig, stage: StageSpec) -> str:
     vel_mode = str(getattr(stage, "velocity_mode", "create")).strip().lower()
     if vel_mode == "preserve":
         velocity_line = "# initial velocities: preserved from input.data"
-    else:
+    elif vel_mode == "create":
         velocity_line = (
             f"velocity all create {stage.temperature_start} {stage.seed} mom yes rot yes dist gaussian"
+        )
+    else:
+        raise ValueError(
+            f"Unknown velocity_mode for stage {stage.name!r}: "
+            f"{getattr(stage, 'velocity_mode', None)!r}"
         )
 
     default_lines = potential_default_lines(pot)
     interactions = potential_interactions_list(pot)
-    mass_block = _mass_lines_from_interactions(interactions, md=md, datafile=stage.input_data)
+    mass_block = _mass_lines_from_interactions(
+        interactions,
+        md=md,
+        datafile=stage.input_data,
+        units_style=str(getattr(pot, "user_units", "metal") or "metal"),
+    )
     mass_section = ""
     if mass_block:
         mode = str(getattr(md, 'mass_mode', 'auto')).strip().lower()
@@ -261,14 +318,9 @@ def render_stage(pot: PotentialConfig, md: MDConfig, stage: StageSpec) -> str:
                 stride = max(1, int(dump_every))
             tail_steps = int(frames * stride)
             if stage.run_steps <= tail_steps:
-                # Run is shorter than the requested tail window; dump throughout.
-                # `first yes` is added as a robustness measure so step 0 is
-                # always emitted as a frame -- without it, very short runs
-                # whose stride exceeds run_steps could yield zero frames at
-                # all. It is NOT a frame-count guarantee: the actual number
-                # of frames depends on stride_eff and run_steps and may
-                # overshoot the requested {frames} by one (e.g. run_steps=10,
-                # frames=5 -> stride_eff=2 -> frames at 0,2,4,6,8,10 = 6).
+                # Dump throughout the interval. ``first yes`` guarantees at
+                # least the initial frame; it does not guarantee an exact
+                # requested frame count.
                 stride_eff = max(1, int(math.ceil(stage.run_steps / max(1, frames))))
                 dump_lines = f"""
 # trajectory dump disabled
@@ -281,10 +333,10 @@ dump d1 all custom {stride_eff} {stage.name}.lammpstrj id type xu yu zu
                 dump_lines = f"""
 # trajectory tail
 # pre dump
-run {pre_steps}
+{_sampling_run_command(stage, pre_steps, split_ramp=True)}
 dump d1 all custom {stride} {stage.name}.lammpstrj id type xu yu zu
  dump_modify d1 sort id
-run {tail_steps}
+{_sampling_run_command(stage, tail_steps, split_ramp=True)}
 undump d1
 """.rstrip()
                 run_lines = ""  # included inside dump
@@ -389,11 +441,7 @@ def _render_dump_and_run(
             stride = max(1, int(dump_every))
         tail_steps = int(frames * stride)
         if stage.run_steps <= tail_steps:
-            # See render_stage(): `first yes` is robustness-only -- it
-            # guarantees step 0 is a frame so very short runs are not silently
-            # left with zero dumps. The frame count is NOT pinned to the
-            # requested {frames}; it can overshoot by one when run_steps does
-            # not divide cleanly by stride_eff.
+            # Keep short-run semantics identical to render_stage.
             stride_eff = max(1, int(math.ceil(stage.run_steps / max(1, frames))))
             dump_lines = f"""
 # trajectory dump disabled
@@ -406,10 +454,10 @@ dump d1 all custom {stride_eff} {dump_filename} id type xu yu zu
             dump_lines = f"""
 # trajectory tail
 # pre dump
-run {pre_steps}
+{_sampling_run_command(stage, pre_steps, split_ramp=True)}
 dump d1 all custom {stride} {dump_filename} id type xu yu zu
  dump_modify d1 sort id
-run {tail_steps}
+{_sampling_run_command(stage, tail_steps, split_ramp=True)}
 undump d1
 """.rstrip()
             run_lines = ""  # included inside dump
@@ -437,6 +485,19 @@ def render_continuous_stages(
 
     if not stages:
         raise ValueError("render_continuous_stages: no stages provided")
+
+    stage_names = [
+        validate_stage_name(stage.name, context=f"stages[{index}].name")
+        for index, stage in enumerate(stages)
+    ]
+    if len(set(stage_names)) != len(stage_names):
+        duplicates = sorted(
+            {name for name in stage_names if stage_names.count(name) > 1}
+        )
+        raise ValueError(
+            "Continuous LAMMPS pipeline requires unique stage names; duplicate(s): "
+            + ", ".join(repr(name) for name in duplicates)
+        )
 
     # guard
     # directories exist
@@ -467,7 +528,12 @@ def render_continuous_stages(
             )
 
     interactions = potential_interactions_list(pot)
-    mass_block = _mass_lines_from_interactions(interactions, md=md, datafile=stages[0].input_data)
+    mass_block = _mass_lines_from_interactions(
+        interactions,
+        md=md,
+        datafile=stages[0].input_data,
+        units_style=str(getattr(pot, "user_units", "metal") or "metal"),
+    )
     mass_section = ""
     if mass_block:
         mode = str(getattr(md, "mass_mode", "auto")).strip().lower()
@@ -494,6 +560,11 @@ def render_continuous_stages(
 
     # blocks
     stage_blocks: list[str] = []
+    final_dump_fields = (
+        "id type q xu yu zu"
+        if str(md.atom_style).strip().lower() == "charge"
+        else "id type xu yu zu"
+    )
     for st in stages:
         sdir = str(stage_dir_prefixes[str(st.name)])
         dump_file = f"{sdir}/{st.name}.lammpstrj"
@@ -545,7 +616,7 @@ fix msd_out all ave/time {st.msd_every} 1 {st.msd_every} c_msd_all[4] file {sdir
 {run_lines}
 
 # snapshot output materialization
-write_dump all custom {sdir}/{st.name}.final.lammpstrj id type xu yu zu modify sort id
+write_dump all custom {sdir}/{st.name}.final.lammpstrj {final_dump_fields} modify sort id
 
 # cleanup
 unfix msd_out
@@ -610,7 +681,12 @@ def render_elastic_screen(
 
     default_lines = potential_default_lines(pot)
     interactions = potential_interactions_list(pot)
-    mass_block = _mass_lines_from_interactions(interactions, md=md, datafile=input_data)
+    mass_block = _mass_lines_from_interactions(
+        interactions,
+        md=md,
+        datafile=input_data,
+        units_style=str(getattr(pot, "user_units", "metal") or "metal"),
+    )
     mass_section = ""
     if mass_block:
         mode = str(getattr(md, 'mass_mode', 'auto')).strip().lower()

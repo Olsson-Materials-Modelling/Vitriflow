@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 
 pytest.importorskip("ase")
+pytestmark = pytest.mark.usefixtures("mock_engine_build_identities")
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 
 def test_run_meltquench_reports_replicate_convergence(monkeypatch, tmp_path: Path):
@@ -63,14 +65,46 @@ def test_run_meltquench_reports_replicate_convergence(monkeypatch, tmp_path: Pat
                 },
             },
         )
+        boxes = []
+        for box, density in ((1, 2.21), (2, 2.20)):
+            bdir = Path(kwargs["outdir"]) / "production" / f"box_{box:03d}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            (bdir / "relax.data").write_text(f"box-{box}\n")
+            (bdir / "structure_snapshot.json").write_text(
+                json.dumps({"schema": "vitriflow.structure_snapshot.v1", "n_atoms": 1})
+            )
+            manifest = {"structure_hash": f"structure-{box}"}
+            (bdir / "structure_manifest.json").write_text(
+                json.dumps({"schema": "vitriflow.structure_manifest.v2", "structures": [manifest]})
+            )
+            boxes.append({
+                "box": box,
+                "density": density,
+                "distributions": {},
+                "metrics": {},
+                "paths": {
+                    "relax_data": str((bdir / "relax.data").relative_to(kwargs["outdir"])),
+                    "structure_snapshot": str((bdir / "structure_snapshot.json").relative_to(kwargs["outdir"])),
+                    "structure_manifest": str((bdir / "structure_manifest.json").relative_to(kwargs["outdir"])),
+                },
+                "structure_manifest": manifest,
+            })
         return {
-            "status": "ok",
-            "converged": True,
+                "status": "ok",
+                "converged": True,
+                "converged_md": True,
+                "check_convergence": True,
+                "resumable": True,
+                "convergence_streak": 1,
+                "required_convergence_streak": 1,
+                "last_convergence_evaluated_n_boxes_total": 2,
+                "last_convergence_evaluated_n_boxes_accepted": 2,
+            "min_boxes": 2,
+            "n_boxes": 2,
+            "n_boxes_accepted": 2,
+            "n_boxes_rejected": 0,
             "n_boxes_total": 2,
-            "boxes": [
-                {"box": 1, "density": 2.21, "distributions": {}, "metrics": {}},
-                {"box": 2, "density": 2.20, "distributions": {}, "metrics": {}},
-            ],
+            "boxes": boxes,
             "rejected_boxes": [],
             "convergence": {"passed": True},
             "cutoffs": [{"pair": [1, 2], "cutoff": 2.5}],

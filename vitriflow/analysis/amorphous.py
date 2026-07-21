@@ -11,6 +11,7 @@ quenching. The implementation combines:
 - optional crystal-reference peak fingerprints from Materials Project structures.
 """
 
+import importlib.util
 import json
 import math
 import os
@@ -33,10 +34,15 @@ except Exception:  # pragma: no cover - SciPy >= 1.15 compatibility
         # signature theta azimuth
         return _sph_harm_y(n, m, phi, theta)
 
-from .dump import DumpFrame
+from .dump import DumpFrame, frame_pbc
+from .common import (
+    canonical_unique_mic_pairs as _canonical_unique_mic_pairs,
+    wrap_frac as _wrap_frac_common,
+)
 from .sq import compute_sq
 from .trajectory import _atoms_to_dumpframe
 from .motif_summary import summarize_production_crystal_motifs as _summarize_production_crystal_motifs
+from .provenance import file_identity, file_identity_matches, write_json_strict
 
 _REFERENCE_LIBRARY_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
@@ -73,11 +79,6 @@ def _require_ase():
 
 def _pair_key(a: int, b: int) -> tuple[int, int]:
     return (a, b) if int(a) <= int(b) else (b, a)
-
-
-def _wrap_frac(frac: np.ndarray) -> np.ndarray:
-    x = np.asarray(frac, dtype=float)
-    return x - np.floor(x)
 
 
 def _reduce_counts(counts: Mapping[str, int]) -> dict[str, int]:
@@ -210,13 +211,73 @@ def _scalar_or_nan(x: Any) -> float:
 
 def _smooth_signal(y: np.ndarray, w: int) -> np.ndarray:
     arr = np.asarray(y, dtype=float)
-    ww = int(max(1, w))
+    if arr.ndim != 1 or not np.all(np.isfinite(arr)):
+        raise ValueError("S(q) signal must be a finite one-dimensional array")
+    if isinstance(w, (bool, np.bool_)):
+        raise ValueError("S(q) smoothing width must be an integer >= 1")
+    try:
+        numeric = float(w)
+        ww = int(w)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("S(q) smoothing width must be an integer >= 1") from exc
+    if not math.isfinite(numeric) or numeric != float(ww) or ww < 1:
+        raise ValueError("S(q) smoothing width must be an integer >= 1")
     if ww % 2 == 0:
         ww += 1
     if ww <= 1 or arr.size < ww:
         return arr.copy()
     ker = np.ones(ww, dtype=float) / float(ww)
-    return np.convolve(np.nan_to_num(arr, nan=0.0), ker, mode="same")
+    return np.convolve(arr, ker, mode="same")
+
+
+def _validated_sq_evidence(
+    q: Any,
+    s: Any,
+    *,
+    context: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate that crystallinity classification has actual finite evidence."""
+
+    try:
+        q_arr = np.asarray(q, dtype=float)
+        s_arr = np.asarray(s, dtype=float)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{context} S(q) evidence is not numeric") from exc
+    if (
+        q_arr.ndim != 1
+        or s_arr.ndim != 1
+        or q_arr.size != s_arr.size
+        or q_arr.size < 2
+    ):
+        raise ValueError(
+            f"{context} S(q) evidence must contain equal one-dimensional q/S arrays of length >= 2"
+        )
+    if not np.all(np.isfinite(q_arr)) or not np.all(np.isfinite(s_arr)):
+        raise ValueError(
+            f"{context} S(q) evidence contains non-finite values; missing evidence "
+            "cannot be interpreted as zero crystallinity"
+        )
+    if float(q_arr[0]) < 0.0 or not np.all(np.diff(q_arr) > 0.0):
+        raise ValueError(f"{context} q grid must be nonnegative and strictly increasing")
+    return q_arr, s_arr
+
+
+def _unpack_sq_result(
+    result: Any,
+    *,
+    context: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Unpack the metadata-aware API, tolerating two-value test doubles."""
+
+    if not isinstance(result, (tuple, list)) or len(result) not in {2, 3}:
+        raise ValueError(f"{context} S(q) computation returned an invalid result")
+    q, s = _validated_sq_evidence(result[0], result[1], context=context)
+    if len(result) == 2:
+        return q, s, {}
+    metadata = result[2]
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"{context} S(q) representation metadata is not a mapping")
+    return q, s, dict(metadata)
 
 
 def _sq_peak_features(
@@ -228,20 +289,48 @@ def _sq_peak_features(
     prominence_min: float,
     height_min: float,
 ) -> list[dict[str, float]]:
-    q = np.asarray(q, dtype=float)
-    s = np.asarray(s, dtype=float)
-    if q.ndim != 1 or s.ndim != 1 or q.size != s.size or q.size < 8:
+    q, s = _validated_sq_evidence(q, s, context="amorphous classification")
+    # Valid production configurations contain at least 64 q points.  A shorter
+    # finite array can only arise from a lightweight caller/test double; it has
+    # evidence, but not enough samples to resolve a peak, so report no peaks.
+    if q.size < 8:
         return []
-    if not np.all(np.diff(q) > 0):
-        return []
-    ss = _smooth_signal(s, int(smooth))
-    q0, q1 = float(peak_search[0]), float(peak_search[1])
-    mask = (q >= q0) & (q <= q1) & np.isfinite(ss)
+    ss = _smooth_signal(s, smooth)
+    if (
+        not isinstance(peak_search, Sequence)
+        or isinstance(peak_search, (str, bytes, bytearray))
+        or len(peak_search) != 2
+        or any(isinstance(x, (bool, np.bool_)) for x in peak_search)
+    ):
+        raise ValueError("S(q) peak_search must contain two finite bounds")
+    try:
+        q0, q1 = float(peak_search[0]), float(peak_search[1])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("S(q) peak_search must contain two finite bounds") from exc
+    if not (
+        math.isfinite(q0)
+        and math.isfinite(q1)
+        and float(q[0]) <= q0 < q1 <= float(q[-1])
+    ):
+        raise ValueError("S(q) peak_search must lie within the computed q grid")
+    for name, value in (
+        ("prominence_min", prominence_min),
+        ("height_min", height_min),
+    ):
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(f"S(q) {name} must be finite and >= 0")
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"S(q) {name} must be finite and >= 0") from exc
+        if not (math.isfinite(threshold) and threshold >= 0.0):
+            raise ValueError(f"S(q) {name} must be finite and >= 0")
+    mask = (q >= q0) & (q <= q1)
     if not np.any(mask):
-        return []
+        raise ValueError("S(q) peak_search contains no computed q samples")
     idxs = np.where(mask)[0]
     work = np.asarray(ss[idxs], dtype=float)
-    peaks, props = find_peaks(work, prominence=float(prominence_min), height=float(height_min))
+    peaks, _props = find_peaks(work, prominence=float(prominence_min), height=float(height_min))
     if peaks.size == 0:
         return []
     prom = peak_prominences(work, peaks)[0]
@@ -589,6 +678,49 @@ def summarize_production_crystal_motifs(
     return _summarize_production_crystal_motifs(accepted_boxes, rejected_boxes=rejected_boxes)
 
 
+def _legacy_graph_rule_json(cutoffs: Mapping[Tuple[int, int], float]) -> dict[str, Any]:
+    """Graph provenance for legacy amorphous/local-order cutoffs."""
+
+    rows = [
+        {"pair": [int(a), int(b)], "cutoff": float(c)}
+        for (a, b), c in sorted(dict(cutoffs or {}).items())
+    ]
+    return {
+        "name": "legacy_single_cutoff",
+        "kind": "hard_cutoff",
+        "parameters": {
+            "cutoffs": rows,
+            "legacy": True,
+            "single_rule_output": True,
+        },
+        "provenance": {
+            "source": "legacy_cutoffs",
+            "note": "Backward-compatible graph rule used by amorphous/local-order analysis.",
+        },
+    }
+
+
+def _structure_hash_or_none(frame: DumpFrame, *, type_to_species: Optional[Sequence[str]]) -> Optional[str]:
+    """Return the canonical graph manifest hash for ``frame``.
+
+    Delegates to :func:`graph.structure_hash` so the digest is byte-identical to
+    the one recorded in the graph provenance and manifest — namely over
+    ``(cell, species, positions, pbc)``. A local reimplementation previously
+    omitted ``pbc`` and produced a *different* hash, silently desynchronising the
+    amorphous ``structure_hash`` from the graph/manifest provenance. ``graph``
+    imports ASE lazily (only inside ``_require_ase``), so this does not force an
+    ASE dependency; the import is function-local to avoid any import-time cycle.
+    Returns ``None`` on any failure so amorphous reporting degrades gracefully.
+    """
+
+    try:
+        from .graph import structure_hash as _graph_structure_hash
+
+        return _graph_structure_hash(frame, type_to_species=type_to_species)
+    except Exception:
+        return None
+
+
 def _directed_neighbors(
 
     frame: DumpFrame,
@@ -597,24 +729,19 @@ def _directed_neighbors(
 ) -> tuple[list[list[int]], list[list[np.ndarray]], list[tuple[int, int]]]:
     if not cutoffs:
         return [[] for _ in range(frame.n_atoms)], [[] for _ in range(frame.n_atoms)], []
+    pbc = frame_pbc(frame)
     invH = np.linalg.inv(frame.cell)
-    frac = _wrap_frac((frame.positions - frame.origin) @ invH)
+    frac = _wrap_frac_common((frame.positions - frame.origin) @ invH, pbc=pbc)
     posw = frame.origin + frac @ frame.cell
     max_cut = float(max(float(v) for v in cutoffs.values()))
     ASEAtoms, _ase_write, neighbor_list = _require_ase()
-    atoms = ASEAtoms(numbers=np.ones(frame.n_atoms, dtype=int), positions=posw, cell=frame.cell, pbc=True)
+    atoms = ASEAtoms(numbers=np.ones(frame.n_atoms, dtype=int), positions=posw, cell=frame.cell, pbc=pbc)
     ii, jj = neighbor_list("ij", atoms, max_cut)
+    ii, jj, dvec, dist = _canonical_unique_mic_pairs(
+        frac, frame.cell, ii, jj, cutoff=float(max_cut), pbc=pbc
+    )
     if ii.size == 0:
         return [[] for _ in range(frame.n_atoms)], [[] for _ in range(frame.n_atoms)], []
-    m = ii < jj
-    ii = ii[m]
-    jj = jj[m]
-    if ii.size == 0:
-        return [[] for _ in range(frame.n_atoms)], [[] for _ in range(frame.n_atoms)], []
-    dfrac = frac[jj] - frac[ii]
-    dfrac -= np.round(dfrac)
-    dvec = dfrac @ frame.cell
-    dist = np.linalg.norm(dvec, axis=1)
     nbr_ids: list[list[int]] = [[] for _ in range(frame.n_atoms)]
     nbr_vecs: list[list[np.ndarray]] = [[] for _ in range(frame.n_atoms)]
     edges: list[tuple[int, int]] = []
@@ -831,8 +958,14 @@ def _local_order_analysis(
 
     crystalline_fraction = float(np.sum(ordered)) / float(n_atoms) if n_atoms > 0 else float("nan")
     largest_cluster_fraction = float(largest_cluster) / float(n_atoms) if n_atoms > 0 else float("nan")
+    graph_rule = _legacy_graph_rule_json(cutoffs)
     return {
         "n_atoms": int(n_atoms),
+        "graph_rule": graph_rule,
+        "graph_rule_name": str(graph_rule.get("name", "")),
+        "graph_rule_kind": str(graph_rule.get("kind", "")),
+        "graph_rule_parameters": dict(graph_rule.get("parameters", {}) or {}),
+        "graph_rule_provenance": graph_rule.get("provenance", None),
         "degrees_mean": float(np.mean(degrees)) if degrees.size > 0 else float("nan"),
         "degrees_median": float(np.median(degrees)) if degrees.size > 0 else float("nan"),
         "solid_like_bonds": int(len(solid_edges)),
@@ -985,6 +1118,7 @@ def _resolve_sq_params(metrics_cfg, amorph_cfg) -> dict[str, Any]:
                 "window": str(getattr(sm, "window", "lorch")),
                 "smooth": int(getattr(sm, "smooth", getattr(amorph_cfg, "smooth", 7))),
                 "peak_search": tuple(getattr(sm, "peak_search", getattr(amorph_cfg, "peak_search", (0.5, 12.0)))),
+                "representation_schema": "vitriflow.sq_representation.v1",
             }
     return {
         "q_max": float(getattr(amorph_cfg, "q_max", 20.0)),
@@ -994,6 +1128,7 @@ def _resolve_sq_params(metrics_cfg, amorph_cfg) -> dict[str, Any]:
         "window": str(getattr(amorph_cfg, "window", "lorch")),
         "smooth": int(getattr(amorph_cfg, "smooth", 7)),
         "peak_search": tuple(getattr(amorph_cfg, "peak_search", (0.5, 12.0))),
+        "representation_schema": "vitriflow.sq_representation.v1",
     }
 
 
@@ -1058,7 +1193,34 @@ def _reference_cache_key(cache_dir: Path, spec: Mapping[str, Any]) -> tuple[str,
     return (str(cache_dir.resolve()), json.dumps(spec, sort_keys=True))
 
 
+def _reference_manifest_identity_path(manifest_path: Path) -> Path:
+    return Path(manifest_path).with_name("reference_manifest.identity.json")
+
+
+def _write_reference_manifest(manifest_path: Path, payload: Mapping[str, Any]) -> None:
+    write_json_strict(manifest_path, payload)
+    identity = file_identity(manifest_path, recorded_path=str(Path(manifest_path).name))
+    write_json_strict(
+        _reference_manifest_identity_path(manifest_path),
+        {
+            "schema": "vitriflow.amorphous_reference_manifest_identity.v1",
+            "manifest_file_identity": identity,
+        },
+    )
+
+
 def _load_library_from_manifest(manifest_path: Path, spec: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    try:
+        identity_payload = json.loads(_reference_manifest_identity_path(manifest_path).read_text())
+    except Exception:
+        return None
+    manifest_identity = (
+        identity_payload.get("manifest_file_identity", {})
+        if isinstance(identity_payload, Mapping)
+        else {}
+    )
+    if not isinstance(manifest_identity, Mapping) or not file_identity_matches(manifest_path, manifest_identity):
+        return None
     try:
         data = json.loads(manifest_path.read_text())
     except Exception:
@@ -1074,7 +1236,8 @@ def _load_library_from_manifest(manifest_path: Path, spec: Mapping[str, Any]) ->
         if not isinstance(ref, Mapping):
             return None
         p = Path(manifest_path.parent) / Path(str(ref.get("structure_file", "")))
-        if not p.exists():
+        identity = ref.get("structure_file_identity")
+        if not isinstance(identity, Mapping) or not file_identity_matches(p, identity):
             return None
     return dict(data)
 
@@ -1100,6 +1263,19 @@ def build_materials_project_reference_library(
         raise ValueError(f"Could not parse reduced formula for crystal references: {formula!r}")
 
     sq_params = _resolve_sq_params(metrics_cfg, amorph_cfg)
+    api_key = _resolve_mp_api_key(ref_cfg)
+    explicit_key = bool(str(getattr(ref_cfg, "mp_api_key", "") or "").strip())
+    api_key_env = str(getattr(ref_cfg, "mp_api_key_env", "") or "").strip()
+    if explicit_key:
+        api_key_source = "explicit_config"
+    elif api_key_env and bool(os.environ.get(api_key_env, "").strip()):
+        api_key_source = f"environment:{api_key_env}"
+    else:
+        api_key_source = "unavailable"
+    try:
+        mp_api_available = importlib.util.find_spec("mp_api") is not None
+    except (ImportError, ValueError):
+        mp_api_available = False
     spec = {
         "formula": str(_formula_from_counts(target_comp)),
         "composition": {str(k): int(v) for k, v in sorted(target_comp.items())},
@@ -1117,27 +1293,37 @@ def build_materials_project_reference_library(
             "use_conventional_cell": bool(getattr(ref_cfg, "use_conventional_cell", True)),
             "min_supercell_length_A": float(getattr(ref_cfg, "min_supercell_length_A", 15.0)),
             "min_supercell_atoms": int(getattr(ref_cfg, "min_supercell_atoms", 256)),
+            "required": bool(getattr(ref_cfg, "required", False)),
+            "api_key_available": bool(api_key is not None),
+            "api_key_source": api_key_source,
+            "mp_api_available": bool(mp_api_available),
         },
     }
     cache_key = _reference_cache_key(Path(cache_dir), spec)
-    if cache_key in _REFERENCE_LIBRARY_CACHE:
-        return dict(_REFERENCE_LIBRARY_CACHE[cache_key])
-
     cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = cache_dir / "reference_manifest.json"
+    if cache_key in _REFERENCE_LIBRARY_CACHE:
+        # Memory is only an acceleration layer.  Revalidate the persisted
+        # manifest and every referenced structure on each hit so same-process
+        # file mutation cannot bypass the disk identity contract.
+        cached_memory_validated = _load_library_from_manifest(manifest_path, spec)
+        if cached_memory_validated is not None:
+            _REFERENCE_LIBRARY_CACHE[cache_key] = dict(cached_memory_validated)
+            return dict(cached_memory_validated)
+        _REFERENCE_LIBRARY_CACHE.pop(cache_key, None)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
     cached = _load_library_from_manifest(manifest_path, spec)
     if cached is not None:
         _REFERENCE_LIBRARY_CACHE[cache_key] = dict(cached)
         return dict(cached)
 
-    api_key = _resolve_mp_api_key(ref_cfg)
     if api_key is None:
         msg = "Materials Project API key not available for amorphous crystal references"
         if bool(getattr(ref_cfg, "required", False)):
             raise ValueError(msg)
         lib = {"enabled": True, "used": False, "references": [], "reason": msg, "spec": dict(spec)}
-        manifest_path.write_text(json.dumps(lib, indent=2))
+        _write_reference_manifest(manifest_path, lib)
         _REFERENCE_LIBRARY_CACHE[cache_key] = dict(lib)
         return lib
 
@@ -1148,7 +1334,7 @@ def build_materials_project_reference_library(
             raise ImportError("amorphous reference detection requires the optional 'mp-api' package") from exc
         msg = "mp-api package not available for Materials Project crystal references"
         lib = {"enabled": True, "used": False, "references": [], "reason": msg, "spec": dict(spec)}
-        manifest_path.write_text(json.dumps(lib, indent=2))
+        _write_reference_manifest(manifest_path, lib)
         _REFERENCE_LIBRARY_CACHE[cache_key] = dict(lib)
         return lib
 
@@ -1223,7 +1409,7 @@ def build_materials_project_reference_library(
         if bool(getattr(ref_cfg, "required", False)):
             raise ValueError(msg)
         lib = {"enabled": True, "used": False, "references": [], "reason": msg, "spec": dict(spec)}
-        manifest_path.write_text(json.dumps(lib, indent=2))
+        _write_reference_manifest(manifest_path, lib)
         _REFERENCE_LIBRARY_CACHE[cache_key] = dict(lib)
         return lib
 
@@ -1239,7 +1425,7 @@ def build_materials_project_reference_library(
             min_atoms=int(getattr(ref_cfg, "min_supercell_atoms", 256)),
         )
         fr = _atoms_to_reference_frame(atoms_rep, type_to_species=type_to_species)
-        q, s = compute_sq(
+        sq_result = compute_sq(
             [fr],
             q_max=float(sq_params["q_max"]),
             nq=int(sq_params["nq"]),
@@ -1248,6 +1434,11 @@ def build_materials_project_reference_library(
             pair=None,
             type_to_species=type_to_species,
             window=str(sq_params["window"]),
+            return_metadata=True,
+        )
+        q, s, sq_representation = _unpack_sq_result(
+            sq_result,
+            context=f"crystalline reference {cand['material_id']}",
         )
         peaks = _sq_peak_features(
             q,
@@ -1260,7 +1451,8 @@ def build_materials_project_reference_library(
         local = _local_order_analysis(fr, cutoffs=cutoffs, amorph_cfg=amorph_cfg)
         fn = f"reference_{idx:02d}_{str(cand['material_id']).replace('/', '_')}.extxyz"
         _ASEAtoms, ase_write, _neighbor_list = _require_ase()
-        ase_write(str(cache_dir / fn), atoms_rep)
+        structure_path = cache_dir / fn
+        ase_write(str(structure_path), atoms_rep)
         refs.append(
             {
                 "material_id": str(cand["material_id"]),
@@ -1268,12 +1460,21 @@ def build_materials_project_reference_library(
                 "energy_above_hull": cand.get("energy_above_hull", None),
                 "is_stable": bool(cand.get("is_stable", False)),
                 "structure_file": str(fn),
+                "structure_file_identity": file_identity(
+                    structure_path,
+                    recorded_path=str(fn),
+                ),
                 "supercell_repeat": [int(x) for x in reps],
                 "n_atoms": int(len(atoms_rep)),
                 "sq": {
                     "q": [float(x) for x in np.asarray(q, dtype=float).tolist()],
                     "s": [float(x) for x in np.asarray(s, dtype=float).tolist()],
                     "peaks": [{str(k): float(v) for k, v in pk.items()} for pk in peaks],
+                    **(
+                        {"representation": dict(sq_representation)}
+                        if sq_representation
+                        else {}
+                    ),
                 },
                 "local_order": {
                     "crystalline_fraction": float(local.get("crystalline_fraction", float("nan"))),
@@ -1291,7 +1492,7 @@ def build_materials_project_reference_library(
         "references": refs,
         "spec": dict(spec),
     }
-    manifest_path.write_text(json.dumps(lib, indent=2))
+    _write_reference_manifest(manifest_path, lib)
     _REFERENCE_LIBRARY_CACHE[cache_key] = dict(lib)
     _message(progress, "info", f"prepared {len(refs)} crystal reference fingerprint(s) for {lib['formula']}")
     return lib
@@ -1314,7 +1515,7 @@ def analyse_amorphous_state(
         raise ValueError("analyse_amorphous_state requires at least one frame")
 
     sq_params = _resolve_sq_params(metrics_cfg, amorph_cfg)
-    q, s = compute_sq(
+    sq_result = compute_sq(
         frames,
         q_max=float(sq_params["q_max"]),
         nq=int(sq_params["nq"]),
@@ -1323,6 +1524,11 @@ def analyse_amorphous_state(
         pair=None,
         type_to_species=type_to_species,
         window=str(sq_params["window"]),
+        return_metadata=True,
+    )
+    q, s, sq_representation = _unpack_sq_result(
+        sq_result,
+        context="amorphous classification",
     )
     peaks = _sq_peak_features(
         q,
@@ -1359,6 +1565,15 @@ def analyse_amorphous_state(
         refs = [dict(x) for x in list(lib.get("references", []) or []) if isinstance(x, Mapping)]
 
     local = _local_order_analysis_timeavg(frames, cutoffs=cutoffs, amorph_cfg=amorph_cfg, reference_refs=refs)
+    graph_rule = _legacy_graph_rule_json(cutoffs)
+    structure_hash_value = _structure_hash_or_none(frames[-1], type_to_species=type_to_species)
+    local.setdefault("graph_rule", graph_rule)
+    local.setdefault("graph_rule_name", str(graph_rule.get("name", "")))
+    local.setdefault("graph_rule_kind", str(graph_rule.get("kind", "")))
+    local.setdefault("graph_rule_parameters", dict(graph_rule.get("parameters", {}) or {}))
+    local.setdefault("graph_rule_provenance", graph_rule.get("provenance", None))
+    if structure_hash_value is not None:
+        local.setdefault("structure_hash", structure_hash_value)
     crystalline_fraction = float(local.get("crystalline_fraction", float("nan")))
     largest_cluster_fraction = float(local.get("largest_cluster_fraction", float("nan")))
 
@@ -1374,6 +1589,8 @@ def analyse_amorphous_state(
         "used": bool(reference_report.get("used", False)),
         "formula": str(lib.get("formula", formula)) if formula is not None else None,
         "reason": lib.get("reason", None),
+        "graph_rule": graph_rule,
+        "structure_hash": structure_hash_value,
         "thresholds": {},
         "top_matches": [],
         "candidate_matches": [],
@@ -1433,7 +1650,16 @@ def analyse_amorphous_state(
     }
     for name, (val, thr) in crit.items():
         passed = bool(math.isfinite(val) and val <= thr)
-        criteria[name] = {"value": float(val), "threshold": float(thr), "passed": passed}
+        crit_entry = {"value": float(val), "threshold": float(thr), "passed": passed}
+        if name in {"crystalline_fraction", "largest_cluster_fraction"}:
+            crit_entry.update(
+                {
+                    "graph_rule": graph_rule,
+                    "structure_hash": structure_hash_value,
+                    "legacy_single_cutoff": True,
+                }
+            )
+        criteria[name] = crit_entry
         checks.append(passed)
     if reference_report.get("used", False):
         thr = float(getattr(amorph_cfg, "max_reference_peak_overlap", 0.65))
@@ -1504,12 +1730,23 @@ def analyse_amorphous_state(
     return {
         "enabled": True,
         "passed": bool(all(checks)),
+        "structure_hash": structure_hash_value,
+        "graph_rule": graph_rule,
+        "graph_rule_name": str(graph_rule.get("name", "")),
+        "graph_rule_kind": str(graph_rule.get("kind", "")),
+        "graph_rule_parameters": dict(graph_rule.get("parameters", {}) or {}),
+        "graph_rule_provenance": graph_rule.get("provenance", None),
         "criteria": criteria,
         "scalar_metrics": scalar_metrics,
         "sq": {
             "q": [float(x) for x in np.asarray(q, dtype=float).tolist()],
             "s": [float(x) for x in np.asarray(s, dtype=float).tolist()],
             "peaks": [{str(k): float(v) for k, v in pk.items()} for pk in peaks],
+            **(
+                {"representation": dict(sq_representation)}
+                if sq_representation
+                else {}
+            ),
         },
         "local_order": local,
         "reference": reference_report,

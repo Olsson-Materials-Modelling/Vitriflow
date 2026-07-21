@@ -28,6 +28,14 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 from .config import RunConfig, StructureGenerateConfig
+from .analysis.provenance import file_identity, file_identity_matches, write_json_strict
+from .io.ase_compat import ase_read_lammps_data
+from .lammps_units import (
+    charge_from_elementary_factor,
+    length_from_angstrom_factor,
+    mass_from_amu_factor,
+    normalize_lammps_units_style,
+)
 from .utils import ensure_dir
 
 
@@ -849,8 +857,19 @@ def write_lammps_data(
     *,
     specorder: Optional[Sequence[str]] = None,
     atom_style: str = "atomic",
+    units_style: str = "metal",
 ) -> None:
-    """Lammps data."""
+    """Write ASE atoms in the dimensions selected by ``units_style``.
+
+    LAMMPS data files do not contain a unit declaration; values are interpreted
+    by the preceding ``units`` command.  ASE coordinates are Angstrom, masses
+    are atomic-mass units, and initial charges are multiples of ``e``, so each
+    field must be converted before serialization for non-metal/real styles.
+    """
+    units = normalize_lammps_units_style(units_style)
+    length_factor = length_from_angstrom_factor(units)
+    mass_factor = mass_from_amu_factor(units)
+    charge_factor = charge_from_elementary_factor(units)
     spec = list(specorder) if specorder is not None else []
     if len(spec) == 0:
         # fallback
@@ -865,11 +884,16 @@ def write_lammps_data(
     ntypes = len(spec)
 
     # lammps cell decomposition
-    cell = np.asarray(atoms.get_cell().array, dtype=float)
-    B = cell.T  # columns lattice vectors
-    # handle degenerate cells
-    if B.shape != (3, 3) or abs(np.linalg.det(B)) < 1.0e-12:
+    cell_angstrom = np.asarray(atoms.get_cell().array, dtype=float)
+    if cell_angstrom.shape != (3, 3) or not np.all(np.isfinite(cell_angstrom)):
+        raise ValueError("Invalid or non-finite cell for LAMMPS data output")
+    singular_values = np.linalg.svd(cell_angstrom, compute_uv=False)
+    if singular_values.size != 3 or float(singular_values[-1]) <= (
+        np.finfo(float).eps * max(1.0, float(singular_values[0])) * 16.0
+    ):
         raise ValueError("Invalid or degenerate cell for LAMMPS data output")
+    cell = cell_angstrom * float(length_factor)
+    B = cell.T  # columns lattice vectors
 
     Q, R = np.linalg.qr(B)
     # enforce positive diagonal
@@ -879,7 +903,7 @@ def write_lammps_data(
             Q[:, i] *= -1.0
 
     # rotated positions rows
-    pos = np.asarray(atoms.get_positions(), dtype=float)
+    pos = np.asarray(atoms.get_positions(), dtype=float) * float(length_factor)
     pos_rot = pos @ Q
 
     # cell coordinates respect
@@ -901,10 +925,10 @@ def write_lammps_data(
     for sym in spec:
         Z = atomic_numbers.get(str(sym))
         if Z is None:
-            masses.append(1.0)
+            masses.append(1.0 * float(mass_factor))
         else:
             m = float(atomic_masses[int(Z)])
-            masses.append(m if m > 0 else 1.0)
+            masses.append((m if m > 0 else 1.0) * float(mass_factor))
 
     # charges
     use_charge = str(atom_style).lower() == "charge"
@@ -919,7 +943,7 @@ def write_lammps_data(
 
     # lines
     lines: list[str] = []
-    lines.append("(written by vitriflow)")
+    lines.append(f"(written by vitriflow; LAMMPS units {units})")
     lines.append("")
     lines.append(f"{len(pos_wrap)} atoms")
     lines.append(f"{ntypes} atom types")
@@ -934,7 +958,7 @@ def write_lammps_data(
     lines.append("Masses")
     lines.append("")
     for t, m in enumerate(masses, start=1):
-        lines.append(f"{t} {m:.8f}")
+        lines.append(f"{t} {m:.16g}")
     lines.append("")
 
     style_tag = "charge" if use_charge else "atomic"
@@ -945,8 +969,8 @@ def write_lammps_data(
         if t is None:
             raise ValueError(f"Symbol '{sym}' not present in specorder mapping")
         if use_charge:
-            q = float(charges[i - 1])
-            lines.append(f"{i} {t} {q:.8f} {r[0]:.16g} {r[1]:.16g} {r[2]:.16g}")
+            q = float(charges[i - 1]) * float(charge_factor)
+            lines.append(f"{i} {t} {q:.16g} {r[0]:.16g} {r[1]:.16g} {r[2]:.16g}")
         else:
             lines.append(f"{i} {t} {r[0]:.16g} {r[1]:.16g} {r[2]:.16g}")
 
@@ -976,12 +1000,22 @@ def _initial_structure_cache_spec(config: RunConfig) -> dict[str, object]:
     except Exception:
         kim_interactions = None
 
+    source_files: dict[str, object] = {}
+    if gen is not None and getattr(gen, "poscar_path", None) is not None:
+        poscar_path = Path(gen.poscar_path)
+        source_files["poscar_path"] = file_identity(
+            poscar_path,
+            recorded_path=str(poscar_path),
+        )
+
     return {
         "structure_generate": gen_spec,
         "structure_charges": charges,
         "atom_style": str(config.md.atom_style),
         "type_to_species": type_to_species,
         "kim_interactions": kim_interactions,
+        "lammps_units_style": str(getattr(config.kim, "user_units", "metal") or "metal").strip().lower(),
+        "source_files": source_files,
     }
 
 
@@ -1004,9 +1038,15 @@ def prepare_initial_structure(config: RunConfig, outdir: Path) -> Path:
     if data_path.exists() and meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text())
-            if isinstance(meta, dict) and meta.get("_cache_spec") == cache_spec and data_path.stat().st_size > 0:
+            cached_identity = meta.get("initial_data_identity") if isinstance(meta, dict) else None
+            if (
+                isinstance(meta, dict)
+                and meta.get("_cache_spec") == cache_spec
+                and isinstance(cached_identity, dict)
+                and file_identity_matches(data_path, cached_identity)
+            ):
                 return data_path
-        except Exception:
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
 
     atoms, prov = generate_atoms(gen, outdir=struct_dir)
@@ -1027,11 +1067,22 @@ def prepare_initial_structure(config: RunConfig, outdir: Path) -> Path:
         atoms.set_initial_charges([0.0] * len(atoms))
 
     specorder = _infer_specorder(config, atoms)
-    write_lammps_data(data_path, atoms, specorder=specorder, atom_style=atom_style)
+    units_style = str(getattr(config.kim, "user_units", "metal") or "metal").strip().lower()
+    write_lammps_data(
+        data_path,
+        atoms,
+        specorder=specorder,
+        atom_style=atom_style,
+        units_style=units_style,
+    )
 
     meta = dict(asdict(prov))
     meta["_cache_spec"] = cache_spec
-    meta_path.write_text(json.dumps(meta, indent=2))
+    meta["initial_data_identity"] = file_identity(
+        data_path,
+        recorded_path=str(data_path.name),
+    )
+    write_json_strict(meta_path, meta)
     return data_path
 
 
@@ -1051,6 +1102,7 @@ def prepare_size_scan_base_structure(
     meta_path = struct_dir / "size_base_meta.json"
 
     atom_style = str(config.md.atom_style)
+    units_style = str(getattr(config.kim, "user_units", "metal") or "metal").strip().lower()
 
     # specorder ase chemical
     specorder = None
@@ -1065,19 +1117,33 @@ def prepare_size_scan_base_structure(
     # ase version differences
     def _read_atoms(path: Path) -> Atoms:
         try:
-            return read(str(path), format="lammps-data", style=str(atom_style), specorder=specorder)
+            return ase_read_lammps_data(
+                path,
+                atom_style=str(atom_style),
+                specorder=specorder,
+                units=units_style,
+            )
         except Exception:
             try:
-                return read(str(path), format="lammps-data", style=str(atom_style))
+                return ase_read_lammps_data(
+                    path,
+                    atom_style=str(atom_style),
+                    units=units_style,
+                )
             except Exception:
                 try:
-                    return read(str(path), format="lammps-data")
+                    return read(str(path), format="lammps-data", units=units_style)
                 except Exception as e:
                     # fallback parser
                     try:
                         from .io.lammps_data_minimal import read_lammps_data_minimal
 
-                        return read_lammps_data_minimal(Path(path), atom_style=str(atom_style), specorder=specorder)
+                        return read_lammps_data_minimal(
+                            Path(path),
+                            atom_style=str(atom_style),
+                            specorder=specorder,
+                            units_style=units_style,
+                        )
                     except Exception:
                         raise RuntimeError(f"Failed to read LAMMPS data file: {path}") from e
 
@@ -1202,7 +1268,13 @@ def prepare_size_scan_base_structure(
         if spec is None or len(spec) == 0:
             # fallback
             spec = _infer_specorder(config, reduced)
-        write_lammps_data(base_data, reduced, specorder=spec, atom_style=atom_style)
+        write_lammps_data(
+            base_data,
+            reduced,
+            specorder=spec,
+            atom_style=atom_style,
+            units_style=units_style,
+        )
     except Exception:
         # resort copy original
         try:

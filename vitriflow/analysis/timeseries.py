@@ -80,8 +80,9 @@ def compute_metrics_timeseries(
     quench_tail_fraction: float = 0.67,
     quench_tail_min_frames: int = 8,
     quench_tail_fallback_fraction: float = 0.40,
+    trajectory_lammps_units_style: Optional[str] = "metal",
 ) -> MetricsTimeSeries:
-    """Metrics timeseries."""
+    """Metrics timeseries with ``md_timestep`` expressed in canonical ps."""
 
     if int(frame_stride) < 1:
         raise ValueError("frame_stride must be >= 1")
@@ -94,7 +95,9 @@ def compute_metrics_timeseries(
     if traj is None or not Path(traj).exists():
         raise FileNotFoundError(f"No trajectory found in stage directory: {stage_dir}")
 
-    frames_all = list(read_frames_auto(Path(traj)))
+    frames_all = list(
+        read_frames_auto(Path(traj), units_style=trajectory_lammps_units_style)
+    )
     if not frames_all:
         raise ValueError(f"No frames parsed from trajectory: {traj}")
 
@@ -259,4 +262,13 @@ def compute_metrics_timeseries(
     metric_cols = sorted([c for c in rows[0].keys() if c not in set(base_cols + thermo_cols)])
     cols = base_cols + thermo_cols + metric_cols
     data = np.asarray([[float(r.get(c, float("nan"))) for c in cols] for r in rows], dtype=float)
-    return MetricsTimeSeries(columns=cols, data=data, metadata=dict(selection_meta))
+    metadata = dict(selection_meta)
+    metadata.update(
+        {
+            "reporting_contract": "vitriflow.canonical_physical_units.v1",
+            "time_unit": "ps",
+            "length_unit": "angstrom",
+            "trajectory_lammps_units_style": str(trajectory_lammps_units_style),
+        }
+    )
+    return MetricsTimeSeries(columns=cols, data=data, metadata=metadata)

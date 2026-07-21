@@ -16,12 +16,22 @@ from ..config import (
 WarnFn = Callable[[str], None]
 
 
-def _unique_type_selectors(*, structure_data: Optional[Path], type_to_species: Optional[Sequence[str]]) -> list[Any]:
+def _unique_type_selectors(
+    *,
+    structure_data: Optional[Path],
+    type_to_species: Optional[Sequence[str]],
+    lammps_units_style: Optional[str],
+) -> list[Any]:
     if type_to_species is not None and len(type_to_species) > 0:
         return [str(s) for s in type_to_species]
     if structure_data is not None and Path(structure_data).exists():
         try:
-            fr = read_datafile_frame(Path(structure_data))
+            if lammps_units_style in (None, ""):
+                raise ValueError("lammps_units_style is required for raw LAMMPS data")
+            fr = read_datafile_frame(
+                Path(structure_data),
+                units_style=str(lammps_units_style),
+            )
             return [int(t) for t in sorted({int(x) for x in fr.types.tolist()})]
         except Exception:
             pass
@@ -49,6 +59,7 @@ def resolve_effective_metrics_config(
     *,
     structure_data: Optional[Path],
     type_to_species: Optional[Sequence[str]],
+    lammps_units_style: Optional[str] = "metal",
     warn_fn: Optional[WarnFn] = None,
     context: str = "workflow",
 ):
@@ -61,7 +72,11 @@ def resolve_effective_metrics_config(
     cfg = metrics_cfg.model_copy(deep=True)
     warnings: list[str] = []
 
-    selectors = _unique_type_selectors(structure_data=Path(structure_data) if structure_data is not None else None, type_to_species=type_to_species)
+    selectors = _unique_type_selectors(
+        structure_data=Path(structure_data) if structure_data is not None else None,
+        type_to_species=type_to_species,
+        lammps_units_style=lammps_units_style,
+    )
     if len(selectors) == 0:
         selectors = [1]
         msg = f"{context}: could not infer species/type selectors; defaulting to selector [1] for automatic metric setup"

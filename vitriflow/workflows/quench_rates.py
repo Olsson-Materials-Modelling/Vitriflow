@@ -117,9 +117,10 @@ def quench_steps_for_rate(
     if not (math.isfinite(dt) and dt > 0.0):
         raise ValueError('timestep must be finite and > 0')
 
-    if not math.isfinite(dT):
-        raise ValueError('delta_T must be finite')
+    if not (math.isfinite(dT) and dT > 0.0):
+        raise ValueError(
+            'delta_T must be finite and > 0 (quench start temperature must exceed final temperature)'
+        )
 
-    dT_pos = max(0.0, dT)
-    n = int(math.ceil(dT_pos / max(1.0e-12, r * dt)))
+    n = int(math.ceil(dT / (r * dt)))
     return int(max(int(min_steps), n))

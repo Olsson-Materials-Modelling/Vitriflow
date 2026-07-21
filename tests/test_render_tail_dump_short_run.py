@@ -1,6 +1,6 @@
 """Tail-dump short-run path: pin the rendered output and observed frame count.
 
-Targeted regression for ultrareview finding #3. The render adds
+Targeted regression for review finding #3. The render adds
 ``dump_modify ... first yes`` when the requested tail window is longer
 than the run itself. That addition is *robustness only* -- it keeps very
 short runs from emitting zero frames -- it is NOT a guarantee that the

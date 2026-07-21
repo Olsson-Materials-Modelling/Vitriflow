@@ -33,28 +33,17 @@ if [[ -z "$SRC" ]]; then
 fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-copy_found() {
-  local root="$1"
-  local n=0
-  while IFS= read -r -d '' f; do
-    cp -f "$f" "$OUTDIR/$(basename "$f")"
-    n=$((n+1))
-  done < <(find "$root" -type f \( -name 'Carbon_GAP_20U+gr.xml' -o -name 'Carbon_GAP_20U+gr.xml.sparseX.*' \) -print0)
-  echo "$n"
-}
-if [[ -d "$SRC" ]]; then
-  N=$(copy_found "$SRC")
-elif [[ -f "$SRC" ]]; then
-  tar -xf "$SRC" -C "$TMP"
-  N=$(copy_found "$TMP")
-else
+STAGE="$TMP/staged"
+mkdir -p "$STAGE"
+if [[ ! -d "$SRC" && ! -f "$SRC" ]]; then
   echo "ERROR: source not found: $SRC" >&2
   exit 4
 fi
-if [[ "$N" -lt 4 ]]; then
-  echo "ERROR: found/copied only $N GAP-20U+gr files; expected XML + 3 sparseX sidecars." >&2
-  echo "Check that the source is Zenodo record 7463706 complementary_data.tar." >&2
-  exit 5
-fi
-python "$(dirname "$0")/check_gap20ugr_potential_files.py" "$OUTDIR/Carbon_GAP_20U+gr.xml"
+python "$(dirname "$0")/stage_gap20ugr_potential_files.py" "$SRC" "$STAGE" >/dev/null
+# Validate the complete staged set before replacing any working potential.
+python "$(dirname "$0")/check_gap20ugr_potential_files.py" "$STAGE/Carbon_GAP_20U+gr.xml"
+for f in "$STAGE"/Carbon_GAP_20U+gr.xml*; do
+  cp -f -- "$f" "$OUTDIR/$(basename "$f").new"
+  mv -f -- "$OUTDIR/$(basename "$f").new" "$OUTDIR/$(basename "$f")"
+done
 echo "Installed GAP-20U+gr files to $OUTDIR"

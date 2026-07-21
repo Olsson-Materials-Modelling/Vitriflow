@@ -1,0 +1,293 @@
+# Validation-only 192-atom beta-cristobalite workflow using the legacy KIM
+# Buckingham model.  KIM remains authoritative for the fixed species charges;
+# the release audits those runtime charges before building its C2-spliced core.
+engine: lammps
+
+kim:
+  model: Sim_LAMMPS_Buckingham_CarreHorbachIspas_2008_SiO__SM_886641404623_000
+  interactions: [Si, O]
+  user_units: metal
+  core_repulsion:
+    enabled: true
+    style: zbl
+    tabulate: true
+    dt_candidates: [0.0005]
+    r_out_factor: 0.55
+    r_out_min: 0.6
+    r_out_max: 1.6
+    r_in_factor: 0.80
+    max_attempts: 6
+    grow_factor: 1.25
+    test_equil_steps: 0
+    test_run_steps: 5
+    ramp_steps: 1
+    limit_hold_steps: 1
+    table_filename: sio2_kim_validation_core.table
+    table_points: 128000
+    table_points_max: 512000
+    table_verify_points: 50001
+    table_r_min: 0.1
+
+structure:
+  # Charges are intentionally omitted: the KIM model sets them at runtime.
+  generate:
+    method: builtin
+    builtin_name: beta_cristobalite
+    formula: SiO2
+    repeat: [2, 2, 2]
+    target_density_g_cm3: 2.2
+
+md:
+  timestep: 0.0005
+  atom_style: charge
+  ensemble: npt
+  temperature: 300.0
+  pressure: 0.0
+  thermo_every: 1
+  dump_every: 1
+  stage_continuity: continuous
+  neighbor_skin: 2.5
+  neighbor_skin_autotune: true
+  neighbor_skin_step: 0.5
+  neighbor_skin_max: 5.0
+  thermostat:
+    style: nose-hoover
+    tdamp: 0.05
+  barostat:
+    style: nose-hoover
+    pdamp: 0.5
+    mode: iso
+
+random_seed: 431003
+
+autotune:
+  preflight:
+    enabled: true
+    ensembles: [npt]
+    allow_nvt_fallback: false
+    allow_implicit_dt_fallback: false
+    dt_candidates: [0.0005]
+    tdamp_factors: [100.0]
+    pdamp_factors: [1000.0]
+    min_pdamp_ps_highT: 0.5
+    T_low: 300.0
+    T_high: 6000.0
+    equil_steps: 2
+    run_steps: 5
+    tail_window: 3
+    temp_rel_tol: 1.0
+    press_abs_tol: 1000000000.0
+    max_temp_factor: 10.0
+    max_press_abs: 1.0e12
+    max_vol_ratio: 10.0
+    confirm_equil_steps: 0
+    confirm_run_steps: 5
+    confirm_topk: 1
+    confirm_temps: [1000.0, 6000.0]
+    timeout_sec: 240.0
+
+  tm_scan:
+    # KIM (Carre-Horbach-Ispas) melt onset ~5500 K; window brackets the melt for a
+    # well-founded D_scale. 11 regular points 3000..8000 step 500: solid 3000-4500,
+    # onset ~5500, liquid to 8000.
+    t_min: 3000.0
+    t_max: 8000.0
+    dT: 500.0
+    ensemble: npt
+    equil_steps: 500
+    sample_steps: 5000
+    msd_every: 1
+    replicates_per_temp: 3
+    sample_in_nvt: true
+    highT_mode: liquid
+    gr:
+      enabled: true
+      nbins: 120
+      r_max: 6.0
+      frames: 6
+      stride: 1
+      smooth: 5
+      pair: [Si, O]
+
+  highT:
+    margin: 500.0
+    replicates: 3
+    # short NPT equil (stationarity) + long NVT diffusion run (~25000 steps) to
+    # cross the MSD >= lattice-vector disordering gate for the slow SiO2 network.
+    chunk_steps: 26000
+    max_chunks: 1
+    min_total_steps: 1000
+    rms_multiple: 0.1
+    stationarity_tol: 1.0
+    enforce_stationarity: false
+
+  quench:
+    t_final: 300.0
+    relax_steps: 10
+    enforce_rate_bounds: false
+    rates_K_per_ps: [200.0, 100.0, 50.0]
+    replicates_per_rate: 3
+
+  metrics:
+    enabled: true
+    type_to_species: [Si, O]
+    # Exercise time-averaging with a strict majority of the ten stored
+    # relaxation frames.
+    time_average_frames: 6
+    time_average_stride: 1
+    collect_during_production_stages: true
+    stage_timeseries_frame_stride: 1
+    stage_timeseries_max_frames: 12
+    stage_timeseries_make_plot: true
+    quench_tail_min_frames: 3
+    quench_tail_focus_fraction: 0.8
+    quench_tail_fallback_fraction: 0.4
+    elastic:
+      enabled: true
+      run_on_relax: true
+      run_on_highT_when_force_isotropic: true
+      strict_when_force_isotropic: true
+      collect_during_production_stages: true
+      stage_timeseries_frame_stride: 1
+      stage_timeseries_max_frames: 1
+      stage_timeseries_make_plot: true
+      quench_tail_min_frames: 1
+      quench_tail_focus_fraction: 0.8
+      quench_tail_fallback_fraction: 0.4
+      diffusion_freeze_threshold_A2_per_ps: 1000000000.0
+      born_delta: 1.0e-5
+      make_plot: true
+    pairs:
+      # First-neighbour bond length is Si-O only. O-O (~2.62 A) and Si-Si
+      # (~3.08 A) are second-shell distances, not first-shell bonds, so they are
+      # captured by gr/sq below (full pair-distance distributions), not here.
+      # Listing them as bondlen pairs produced non-finite mean/std (no first-
+      # shell incidence) that failed convergence closed.
+      - pair: [Si, O]
+        cutoff: 2.2
+    coordinations:
+      - central: Si
+        neighbor: O
+        cutoff: 2.2
+        expected: 4
+        defect_frac_tol: 1.0
+      - central: O
+        neighbor: Si
+        cutoff: 2.2
+        expected: 2
+        defect_frac_tol: 1.0
+    coordination_sweep:
+      enabled: true
+      dr: 0.02
+      n_below: 2
+      n_above: 2
+      strained_delta: 0.1
+    angles:
+      - triplet: [O, Si, O]
+      - triplet: [Si, O, Si]
+    rings:
+      enabled: true
+      mode: projected
+      algorithm: primitive
+      nodes: [Si]
+      bridge: O
+      bond_pairs:
+        - pair: [Si, O]
+          cutoff: 2.2
+      max_cycle_size: 12
+      max_paths_per_edge: 8
+    gr:
+      - {pair: null, r_max: 6.0, nbins: 120}
+      - {pair: [Si, O], r_max: 6.0, nbins: 120}
+      - {pair: [O, O], r_max: 6.0, nbins: 120}
+      - {pair: [Si, Si], r_max: 6.0, nbins: 120}
+    sq:
+      - {pair: null, q_max: 16.0, nq: 120, r_max: 6.0, nbins: 160}
+      - {pair: [Si, O], q_max: 16.0, nq: 120, r_max: 6.0, nbins: 160}
+      - {pair: [O, O], q_max: 16.0, nq: 120, r_max: 6.0, nbins: 160}
+      - {pair: [Si, Si], q_max: 16.0, nq: 120, r_max: 6.0, nbins: 160}
+    voids:
+      enabled: true
+      n_samples: 256
+      n_samples_timeseries: 32
+      sampler: sobol
+      seed: 0
+      k_nearest: 12
+      default_radius: 0.0
+      r_max: 4.0
+      cdf_points: 64
+      probe_radii: [0.5, 1.0, 1.5]
+    amorphous:
+      enabled: true
+      enforce_during_rate_scan: false
+      enforce_during_production: false
+      q_max: 16.0
+      nq: 64
+      r_max: 6.0
+      nbins: 100
+      peak_search: [0.5, 8.0]
+      reference:
+        enabled: false
+
+  production:
+    enabled: true
+    min_boxes: 6
+    batch_boxes: 4
+    max_boxes: 10
+    warmup_start_temperature: 300.0
+    warmup_duration_ps: 0.0005
+    dump_trajectory: true
+    dump_every_steps: 1
+    check_convergence: true
+    consecutive_converged_checks: 2
+    bondlen_cdf_points: 64
+    angle_cdf_points: 72
+    store_distributions: true
+    embed_structures: true
+    exclude_coordination_defects: false
+
+  convergence: &validation_convergence
+    mode: both
+    density_rel_tol: 1000000000.0
+    density_abs_tol: 1000000000.0
+    coord_rel_tol: 1000000000.0
+    coord_abs_tol: 1000000000.0
+    bondlen_rel_tol: 1000000000.0
+    bondlen_abs_tol: 1000000000.0
+    angle_rel_tol: 1000000000.0
+    angle_abs_tol: 1000000000.0
+    ring_rel_tol: 1000000000.0
+    ring_abs_tol: 1000000000.0
+    ring_size_rel_tol: 1000000000.0
+    ring_size_abs_tol: 1000000000.0
+    gr_peak_r_rel_tol: 1000000000.0
+    gr_peak_r_abs_tol: 1000000000.0
+    gr_peak_height_rel_tol: 1000000000.0
+    gr_peak_height_abs_tol: 1000000000.0
+    gr_peak_fwhm_rel_tol: 1000000000.0
+    gr_peak_fwhm_abs_tol: 1000000000.0
+    bondlen_cdf_rel_tol: 1000000000.0
+    bondlen_cdf_abs_tol: 1000000000.0
+    angle_cdf_rel_tol: 1000000000.0
+    angle_cdf_abs_tol: 1000000000.0
+    coord_cdf_rel_tol: 1000000000.0
+    coord_cdf_abs_tol: 1000000000.0
+    gr_curve_rel_tol: 1000000000.0
+    gr_curve_abs_tol: 1000000000.0
+    sq_curve_rel_tol: 1000000000.0
+    sq_curve_abs_tol: 1000000000.0
+    void_cdf_rel_tol: 1000000000.0
+    void_cdf_abs_tol: 1000000000.0
+    bounded_ci_method: t
+    familywise: bonferroni
+    stability_split: half
+    stability_distance: wasserstein
+    stability_bootstrap: 16
+    stability_quantile: 0.95
+
+lammps:
+  lammps_cmd: lmp
+  mpi_cmd: mpirun
+  nprocs: 2
+  timeout_sec: 604800.0
+  kill_grace_sec: 5.0

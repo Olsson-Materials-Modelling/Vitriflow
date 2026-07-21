@@ -4,6 +4,7 @@ import csv
 import json
 import math
 from pathlib import Path
+import stat
 from typing import Any, Optional
 
 import numpy as np
@@ -35,6 +36,7 @@ from ..lammps_input import render_elastic_screen
 from ..potential import prepare_potential_files
 from ..runner import LammpsRunner
 from ..utils import ExternalCommandError, ensure_dir
+from ..lammps_units import time_to_ps_factor
 
 
 def _relpath_or_str(path: Path, base: Path) -> str:
@@ -51,6 +53,26 @@ def _elastic_cfg(metrics_cfg) -> Any:
         return getattr(metrics_cfg, "elastic")
     except Exception:
         return None
+
+
+def _elastic_fail_closed(metrics_cfg, *, force_isotropic: bool) -> bool:
+    """Return whether a requested elastic diagnostic is release-critical.
+
+    ``enabled=true`` is an explicit user request and must therefore never be
+    reduced to a best-effort diagnostic.  The historical ``auto`` mode remains
+    best effort except when the force-isotropic safety check is configured as
+    strict.
+    """
+
+    cfg = _elastic_cfg(metrics_cfg)
+    if cfg is None:
+        return False
+    if getattr(cfg, "enabled", "auto") is True:
+        return True
+    return bool(
+        force_isotropic
+        and bool(getattr(cfg, "strict_when_force_isotropic", True))
+    )
 
 
 def should_run_elastic_screen(
@@ -81,7 +103,7 @@ def should_run_elastic_screen(
         if bool(getattr(cfg, "run_on_highT_when_force_isotropic", True)):
             run = True
 
-    strict = bool(run and force_isotropic and bool(getattr(cfg, "strict_when_force_isotropic", True)))
+    strict = bool(run and _elastic_fail_closed(metrics_cfg, force_isotropic=force_isotropic))
     return bool(run), bool(strict), cfg
 
 
@@ -109,7 +131,7 @@ def should_collect_elastic_stage_timeseries(
 
     role = str(stage_role or "").strip().lower()
     run = role in {"melt", "quench", "relax"}
-    strict = bool(run and force_isotropic and bool(getattr(cfg, "strict_when_force_isotropic", True)))
+    strict = bool(run and _elastic_fail_closed(metrics_cfg, force_isotropic=force_isotropic))
     return bool(run), bool(strict), cfg
 
 
@@ -169,8 +191,9 @@ def estimate_diffusion_freeze_temperature(
         return float("nan")
     T = T[m]
     D = D[m]
-    if time_unit_ps is not None and math.isfinite(float(time_unit_ps)) and float(time_unit_ps) > 0.0:
-        D = D / float(time_unit_ps)
+    # Stage outcomes and public analysis tables use the canonical diffusivity
+    # contract (A^2/ps).  ``time_unit_ps`` remains accepted for API
+    # compatibility but must not be applied a second time here.
     D = np.maximum(D, 0.0)
     order = np.argsort(T)[::-1]
     T = T[order]
@@ -296,6 +319,7 @@ def run_elastic_screen_lammps(
     """Elastic screen lammps."""
 
     born_delta, make_plot, isotropy_warn_threshold, coupling_warn_threshold, hotspot_warn_multiple = _elastic_cfg_numbers(metrics_cfg)
+    fail_closed = _elastic_fail_closed(metrics_cfg, force_isotropic=force_isotropic)
     if make_plot_override is not None:
         make_plot = bool(make_plot_override)
 
@@ -315,8 +339,34 @@ def run_elastic_screen_lammps(
     dump_name = "local_stress.dump"
     summary_path = elastic_dir / "elastic_screen.json"
     born_csv = elastic_dir / "born_matrix.csv"
-    stress_csv = elastic_dir / "local_stress.csv"
+    stress_csv = elastic_dir / "virial_proxy.csv"
     plot_path = elastic_dir / "elastic_screen.png"
+
+    # A zero-exit LAMMPS invocation that stops before ``print``/``write_dump``
+    # must not make a previous elastic result look current.  Clear both native
+    # required outputs and every derived public artifact before this attempt.
+    for stale in (
+        elastic_dir / raw_name,
+        elastic_dir / dump_name,
+        summary_path,
+        born_csv,
+        stress_csv,
+        plot_path,
+    ):
+        try:
+            stale.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot inspect stale elastic-screen artifact before execution: {stale}"
+            ) from exc
+        try:
+            stale.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot remove stale elastic-screen artifact before execution: {stale}"
+            ) from exc
 
     summary: dict[str, Any]
     try:
@@ -330,6 +380,23 @@ def run_elastic_screen_lammps(
             potential_lines=potential_lines,
         )
         runner.run(script, elastic_dir, log_name=log_name)
+
+        for required in (elastic_dir / raw_name, elastic_dir / dump_name):
+            try:
+                info = required.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"LAMMPS did not create required elastic-screen artifact: {required}"
+                ) from exc
+            if (
+                required.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or int(info.st_nlink) != 1
+            ):
+                raise RuntimeError(
+                    "LAMMPS elastic-screen output must be a direct, single-link "
+                    f"regular file: {required}"
+                )
 
         raw = parse_born_stress_raw(elastic_dir / raw_name)
         dump = read_single_custom_dump(elastic_dir / dump_name)
@@ -365,7 +432,11 @@ def run_elastic_screen_lammps(
         input_cell = None
         if force_isotropic and input_data_for_affine_strain is not None:
             try:
-                input_cell = read_datafile_frame(Path(input_data_for_affine_strain), atom_style=str(md_cfg.atom_style)).cell
+                input_cell = read_datafile_frame(
+                    Path(input_data_for_affine_strain),
+                    atom_style=str(md_cfg.atom_style),
+                    units_style=str(getattr(pot_cfg, "user_units", "metal") or "metal"),
+                ).cell
             except Exception:
                 input_cell = None
 
@@ -392,7 +463,7 @@ def run_elastic_screen_lammps(
         )
         summary["paths"] = {
             "born_csv": str(born_csv.name),
-            "local_stress_csv": str(stress_csv.name),
+            "average_volume_normalized_virial_proxy_csv": str(stress_csv.name),
             "raw": str(raw_name),
             "dump": str(dump_name),
             "plot": str(plot_path.name),
@@ -404,7 +475,9 @@ def run_elastic_screen_lammps(
             np.asarray(summary["born_matrix_native"], dtype=float),
             units_label=pressure_label,
         )
-        stress_native = stress_volume_to_pressure_like(stress_volume, volume=float(volume), n_atoms=int(n_atoms))
+        stress_native = stress_volume_to_pressure_like(
+            stress_volume, volume=float(volume), n_atoms=int(n_atoms)
+        )
         write_local_stress_csv(
             stress_csv,
             ids=ids,
@@ -414,6 +487,8 @@ def run_elastic_screen_lammps(
             stress_native=stress_native,
             hydrostatic_native=hydrostatic_from_stress(stress_native),
             von_mises_native=von_mises_from_stress(stress_native),
+            units_style=units_style,
+            normalization_volume_native_per_atom=float(volume) / float(n_atoms),
         )
     except Exception as exc:
         summary = {
@@ -430,15 +505,40 @@ def run_elastic_screen_lammps(
                 summary["stderr_tail"] = str(exc.context.stderr_tail)
                 summary["stdout_tail"] = str(exc.context.stdout_tail)
 
+    summary["plot_status"] = (
+        "not_requested"
+        if not make_plot
+        else ("pending" if summary.get("status") == "ok" else "skipped_failed_screen")
+    )
     summary_path.write_text(json.dumps(summary, indent=2))
+
+    if summary.get("status") != "ok" and fail_closed:
+        raise RuntimeError(
+            "Requested elastic screen failed; "
+            f"see {summary_path}: {summary.get('error', 'unknown elastic-screen error')}"
+        )
 
     if summary.get("status") == "ok" and make_plot:
         try:
             from ..plotting import plot_elastic_screen
 
             plot_elastic_screen(elastic_dir, plot_path)
-        except Exception:
-            pass
+            if not plot_path.is_file() or plot_path.stat().st_size < 1:
+                raise RuntimeError(
+                    f"elastic plotter did not create a non-empty artifact: {plot_path}"
+                )
+            summary["plot_status"] = "ok"
+        except Exception as exc:
+            summary["status"] = "degraded"
+            summary["plot_status"] = "failed"
+            summary["plot_error"] = str(exc)
+            summary_path.write_text(json.dumps(summary, indent=2))
+            if fail_closed:
+                raise RuntimeError(
+                    f"Requested elastic-screen plot failed; see {summary_path}: {exc}"
+                ) from exc
+        else:
+            summary_path.write_text(json.dumps(summary, indent=2))
 
     base = outdir if outdir is not None else stage_dir.parent
     return {
@@ -458,10 +558,10 @@ def _write_elastic_timeseries_csv(path: Path, rows: list[dict[str, Any]]) -> Non
         "flag_count",
         "isotropy_residual",
         "normal_shear_coupling_norm",
-        "voigt_bulk_modulus_native",
-        "voigt_shear_modulus_native",
-        "local_vm_p95",
-        "local_vm_max_over_median",
+        "voigt_born_bulk_response_native",
+        "voigt_born_shear_response_native",
+        "virial_proxy_vm_p95",
+        "virial_proxy_vm_max_over_median",
     ]
     with Path(path).open("w", newline="") as fh:
         w = csv.writer(fh)
@@ -501,14 +601,14 @@ def _plot_elastic_timeseries(csv_path: Path, out_path: Path, *, title: str, dpi:
     ax.set_ylabel("normal-shear coupling")
 
     ax = axes[1, 0]
-    ax.plot(x, np.asarray(dat["local_vm_max_over_median"], dtype=float))
-    ax.set_ylabel("local vm max/median")
+    ax.plot(x, np.asarray(dat["virial_proxy_vm_max_over_median"], dtype=float))
+    ax.set_ylabel("virial-proxy VM max/median")
     ax.set_xlabel("time")
 
     ax = axes[1, 1]
-    ax.plot(x, np.asarray(dat["voigt_bulk_modulus_native"], dtype=float), label="K")
-    ax.plot(x, np.asarray(dat["voigt_shear_modulus_native"], dtype=float), label="G")
-    ax.set_ylabel("Born moduli (native)")
+    ax.plot(x, np.asarray(dat["voigt_born_bulk_response_native"], dtype=float), label="K Born")
+    ax.plot(x, np.asarray(dat["voigt_born_shear_response_native"], dtype=float), label="G Born")
+    ax.set_ylabel("affine Born response (native)")
     ax.set_xlabel("time")
     ax.legend()
 
@@ -545,6 +645,7 @@ def run_elastic_screen_timeseries_lammps(
     frame_stride = int(getattr(escfg, "stage_timeseries_frame_stride", 1) or 1)
     max_frames = int(getattr(escfg, "stage_timeseries_max_frames", 8) or 8)
     make_plot = bool(getattr(escfg, "stage_timeseries_make_plot", True))
+    fail_closed = _elastic_fail_closed(metrics_cfg, force_isotropic=force_isotropic)
 
     stage_dir = Path(stage_dir)
     stage_output_data = Path(stage_output_data)
@@ -555,7 +656,8 @@ def run_elastic_screen_timeseries_lammps(
     if traj is None or not Path(traj).exists():
         raise FileNotFoundError(f"No trajectory found for elastic timeseries under {stage_dir}")
 
-    frames_all = list(read_frames_auto(Path(traj)))
+    units_style = str(getattr(pot_cfg, "user_units", "metal") or "metal")
+    frames_all = list(read_frames_auto(Path(traj), units_style=units_style))
     if not frames_all:
         raise ValueError(f"No frames parsed from trajectory: {traj}")
     frames, selection_meta = _select_elastic_frames(
@@ -585,6 +687,7 @@ def run_elastic_screen_timeseries_lammps(
             atom_style=str(md_cfg.atom_style),
             masses_by_type=masses_by_type,
             charges_by_id=charges_by_id if str(md_cfg.atom_style).strip().lower() == "charge" else None,
+            canonical_to_lammps_units_style=units_style,
         )
         res = run_elastic_screen_lammps(
             runner,
@@ -603,18 +706,31 @@ def run_elastic_screen_timeseries_lammps(
         summary = load_elastic_screen_summary(summary_path)
         status_ok = 1.0 if str(summary.get("status", "")) == "ok" else 0.0
         any_failed = any_failed or not bool(status_ok)
-        vm_summary = ((summary.get("local_stress_summary", {}) or {}).get("von_mises_native", {}) or {})
+        vm_summary = (
+            (summary.get("average_volume_normalized_virial_proxy_summary", {}) or {}).get(
+                "von_mises_proxy_native", {}
+            )
+            or {}
+        )
         row = {
             "Step": float(fr.timestep),
-            "time": float(fr.timestep) * float(md_cfg.timestep),
+            "time": float(fr.timestep)
+            * float(md_cfg.timestep)
+            * float(time_to_ps_factor(units_style)),
             "status_ok": float(status_ok),
             "flag_count": float(len(summary.get("flags", []) or [])),
             "isotropy_residual": float(summary.get("isotropy_residual", float("nan"))),
             "normal_shear_coupling_norm": float(summary.get("normal_shear_coupling_norm", float("nan"))),
-            "voigt_bulk_modulus_native": float(summary.get("voigt_bulk_modulus_native", float("nan"))),
-            "voigt_shear_modulus_native": float(summary.get("voigt_shear_modulus_native", float("nan"))),
-            "local_vm_p95": float(vm_summary.get("p95", float("nan"))),
-            "local_vm_max_over_median": float(vm_summary.get("max_over_median", float("nan"))),
+            "voigt_born_bulk_response_native": float(
+                summary.get("voigt_born_bulk_response_native", summary.get("voigt_bulk_modulus_native", float("nan")))
+            ),
+            "voigt_born_shear_response_native": float(
+                summary.get("voigt_born_shear_response_native", summary.get("voigt_shear_modulus_native", float("nan")))
+            ),
+            "virial_proxy_vm_p95": float(vm_summary.get("p95", float("nan"))),
+            "virial_proxy_vm_max_over_median": float(
+                vm_summary.get("max_over_median", float("nan"))
+            ),
         }
         rows.append(row)
         base = outdir if outdir is not None else stage_dir.parent
@@ -633,6 +749,7 @@ def run_elastic_screen_timeseries_lammps(
 
     summary = {
         "status": "ok" if not any_failed else "degraded",
+        "plot_status": "not_requested" if not make_plot else "pending",
         "stage_role": str(stage_role),
         "n_frames": int(len(rows)),
         "frame_stride": int(frame_stride),
@@ -645,12 +762,32 @@ def run_elastic_screen_timeseries_lammps(
     summary_path = elastic_ts_dir / "elastic_timeseries.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
+    if any_failed and fail_closed:
+        raise RuntimeError(
+            "Requested elastic timeseries contains failed frame screens; "
+            f"see {summary_path}"
+        )
+
     plot_path = elastic_ts_dir / "elastic_timeseries.png"
     if make_plot:
         try:
             _plot_elastic_timeseries(csv_path, plot_path, title=f"Elastic timeseries: {stage_dir.name}")
-        except Exception:
-            pass
+            if not plot_path.is_file() or plot_path.stat().st_size < 1:
+                raise RuntimeError(
+                    f"elastic-timeseries plotter did not create a non-empty artifact: {plot_path}"
+                )
+            summary["plot_status"] = "ok"
+        except Exception as exc:
+            summary["status"] = "degraded"
+            summary["plot_status"] = "failed"
+            summary["plot_error"] = str(exc)
+            summary_path.write_text(json.dumps(summary, indent=2))
+            if fail_closed:
+                raise RuntimeError(
+                    f"Requested elastic-timeseries plot failed; see {summary_path}: {exc}"
+                ) from exc
+        else:
+            summary_path.write_text(json.dumps(summary, indent=2))
 
     base = outdir if outdir is not None else stage_dir.parent
     return {

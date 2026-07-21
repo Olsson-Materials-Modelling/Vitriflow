@@ -1,20 +1,35 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
+
+from ..analysis.provenance import write_json_strict
 
 
 def atomic_write_json(path: Path, data: Any) -> None:
     """Atomic write json."""
 
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(f".{p.name}.tmp")
-    txt = json.dumps(data, indent=2, sort_keys=False)
-    tmp.write_text(txt)
-    tmp.replace(p)
+    target = Path(path)
+    if isinstance(data, Mapping) and target.name in {
+        "autotune_results.json",
+        "autotune.json",
+        "run_results.json",
+        "analysis_results.json",
+        "output_dataset.json",
+    }:
+        from ..lammps_units import canonical_reporting_units
+
+        payload = dict(data)
+        prior_units = payload.get("units", {})
+        merged_units = dict(prior_units) if isinstance(prior_units, Mapping) else {}
+        # Canonical fields describe reported physical-observable fields
+        # produced by this release; configuration/provenance values keep their
+        # explicitly named source semantics.
+        merged_units.update(canonical_reporting_units())
+        payload["units"] = merged_units
+        data = payload
+    write_json_strict(target, data, indent=2, sort_keys=False)
 
 
 def make_autotune_compact(results: Mapping[str, Any]) -> dict[str, Any]:
@@ -101,7 +116,24 @@ def summarise_convergence_report(report: Mapping[str, Any]) -> dict[str, Any]:
 
     groups = report.get("groups", {})
     if isinstance(groups, Mapping):
-        out["groups"] = {str(k): bool(v) for k, v in groups.items()}
+        group_status: dict[str, bool] = {}
+        for name, payload in groups.items():
+            if isinstance(payload, Mapping):
+                # Current convergence reports store group truth under
+                # ``passed``. Treat a mapping without an explicit truth field
+                # as unknown/failing: bool(non-empty-dict) would incorrectly
+                # report {"passed": False, ...} as a pass.
+                if "passed" in payload:
+                    passed = bool(payload.get("passed"))
+                elif "converged" in payload:
+                    passed = bool(payload.get("converged"))
+                else:
+                    passed = False
+            else:
+                # Preserve the legacy flat ``groups: {name: bool}`` schema.
+                passed = bool(payload)
+            group_status[str(name)] = passed
+        out["groups"] = group_status
 
     metrics: dict[str, bool] = {}
 

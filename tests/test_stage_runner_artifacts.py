@@ -95,6 +95,44 @@ ITEM: ATOMS id type xu yu zu
     )
 
 
+def test_cp2k_authoritative_thermo_serialization_fails_closed_without_placeholder(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A completed CP2K stage must not authenticate invented thermo evidence."""
+
+    import numpy as np
+    import pytest
+
+    from vitriflow.parse import ThermoTable
+    from vitriflow.workflows import stage_runner
+
+    thermo_csv = tmp_path / "thermo.csv"
+
+    def fail_write(*_args, **_kwargs) -> None:
+        raise OSError("simulated canonical thermo write failure")
+
+    monkeypatch.setattr(stage_runner, "write_thermo_csv", fail_write)
+
+    with pytest.raises(
+        stage_runner.ThermoArtifactError,
+        match="Failed to write engine-neutral thermo CSV",
+    ) as excinfo:
+        stage_runner._materialize_thermo_csv_from_table(
+            table=ThermoTable(
+                columns=["Step", "Temp", "Press", "PotEng", "Volume", "Density"],
+                data=np.asarray(
+                    [[0.0, 300.0, 0.0, -10.0, 100.0, 2.0]],
+                    dtype=float,
+                ),
+            ),
+            thermo_csv=thermo_csv,
+        )
+
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert not thermo_csv.exists()
+
+
 def test_run_stage_local_logs_msd_placeholder_on_parse_failure(
     tmp_path: Path,
     monkeypatch,
@@ -149,9 +187,67 @@ def test_run_stage_local_logs_msd_placeholder_on_parse_failure(
     assert arts.msd_csv.exists()
     assert arts.msd_csv.read_text() == ""
     assert arts.thermo_csv.exists()
+    assert arts.manifest_path == stage_dir / "stage_artifacts.json"
+    manifest = __import__("json").loads(arts.manifest_path.read_text())
+    assert manifest["schema"] == "vitriflow.stage_artifacts.v1"
+    assert manifest["engine"] == "lammps"
+    assert manifest["timestep_ps"] == 1.0
+    assert manifest["artifacts"]["thermo_csv"]["available"] is True
+    assert manifest["artifacts"]["msd_csv"]["available"] is False
     assert arts.output_local.exists()
     assert (tmp_path / "requested" / "melt.data").exists()
     assert "Failed to parse MSD series" in caplog.text
+
+
+def test_run_stage_local_removes_stale_unit_manifest_before_engine_attempt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pytest
+
+    from vitriflow.config import LammpsConfig, LammpsPotentialConfig, MDConfig
+    from vitriflow.lammps_input import StageSpec
+    from vitriflow.runner import LammpsRunner
+    from vitriflow.workflows.stage_runner import run_stage_local
+
+    input_data = tmp_path / "input.data"
+    _write_minimal_datafile(input_data)
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+    stale = stage_dir / "stage_artifacts.json"
+    stale.write_text('{"stale": true}\n')
+    stage = StageSpec(
+        name="melt",
+        input_data=input_data,
+        output_data=Path("melt.data"),
+        temperature_start=1000.0,
+        temperature_stop=1000.0,
+        pressure=0.0,
+        equil_steps=0,
+        run_steps=200,
+        seed=7,
+        write_dump=False,
+    )
+
+    def fail_before_outputs(*args, **kwargs):
+        assert not stale.exists()
+        raise RuntimeError("engine failed")
+
+    monkeypatch.setattr(
+        "vitriflow.workflows.stage_runner.run_with_neighbor_skin_autotune",
+        fail_before_outputs,
+    )
+    with pytest.raises(RuntimeError, match="engine failed"):
+        run_stage_local(
+            LammpsRunner(LammpsConfig()),
+            LammpsPotentialConfig(
+                interactions=["X"],
+                commands=["pair_style lj/cut 2.5", "pair_coeff * * 1.0 1.0 2.5"],
+            ),
+            MDConfig(atom_style="atomic"),
+            stage,
+            stage_dir,
+        )
+    assert not stale.exists()
 
 
 def test_run_stage_local_strips_pair_coeff_sections_from_localized_input(tmp_path: Path, monkeypatch) -> None:

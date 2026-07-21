@@ -39,7 +39,12 @@ cp2k:
 
   # quench approximated temperature
   ramp_max_deltaT_K: 100.0
-  ramp_max_segments: 20
+  # The 500--2500 K smoke scan can select T_high=2700 K.  Cooling to 300 K
+  # at 100 K per segment requires 24 segments, so leave explicit headroom.
+  ramp_max_segments: 30
+
+  # A broken launcher or filesystem must not leave an unbounded smoke run.
+  timeout_sec: 600.0
 
   kind_settings:
     Si:
@@ -51,7 +56,7 @@ structure:
     method: builtin
     builtin_name: si_diamond
     formula: Si
-    n_formula_units: 64
+    n_formula_units: 16
 
 md:
   # driver currently isotropic
@@ -110,9 +115,9 @@ autotune:
 
   tm_scan:
     # temperatures estimate operational
-    t_min: 300.0
-    t_max: 900.0
-    dT: 300.0
+    t_min: 500.0
+    t_max: 2500.0
+    dT: 500.0
 
     ensemble: npt
     replicates_per_temp: 1

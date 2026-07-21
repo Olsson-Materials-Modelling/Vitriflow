@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 def test_render_stage_velocity_mode_preserve_omits_velocity_create(tmp_path: Path):
     from vitriflow.config import LammpsPotentialConfig, MDConfig
@@ -46,6 +48,21 @@ def test_render_stage_velocity_mode_preserve_omits_velocity_create(tmp_path: Pat
     txt_preserve = render_stage(pot, md, stage_preserve)
     assert "velocity all create" not in txt_preserve
     assert "initial velocities: preserved" in txt_preserve
+
+    stage_invalid = StageSpec(
+        name="s",
+        input_data=tmp_path / "in.data",
+        output_data=tmp_path / "out.data",
+        temperature_start=1000.0,
+        temperature_stop=1000.0,
+        pressure=0.0,
+        equil_steps=0,
+        run_steps=10,
+        seed=123,
+        velocity_mode="recreate",  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match="Unknown velocity_mode"):
+        render_stage(pot, md, stage_invalid)
 
 
 def test_datafile_velocity_detection_and_frame_parsing(tmp_path: Path):

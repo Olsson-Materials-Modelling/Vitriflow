@@ -257,7 +257,7 @@ def test_stage4_resume_with_changed_schedule_fails_before_mixing_boxes(tmp_path:
     assert "custom_schedule.stages[0].steps" in str(excinfo.value)
 
 
-def test_stage4_docs_and_demo_configs_validate():
+def test_stage4_docs_and_demo_configs_validate(tmp_path: Path):
     from vitriflow.config import RunConfig
     from vitriflow.workflows.custom_schedule import _schedule_from_raw, _schedule_steps, _validate_schedule
 
@@ -266,11 +266,25 @@ def test_stage4_docs_and_demo_configs_validate():
     cfg_paths.extend(sorted((root / "demos" / "hardcarbon_gap20ugr" / "configs").glob("hc_C_GAP20Ugr_hc_custom_*.yaml")))
     assert len(cfg_paths) >= 3
 
-    for cfg_path in cfg_paths:
-        cfg = RunConfig.from_yaml(cfg_path)
+    for cfg_index, cfg_path in enumerate(cfg_paths):
+        raw = yaml.safe_load(cfg_path.read_text()) or {}
+        # Third-party GAP files are intentionally not distributed.  Create
+        # inert placeholders solely to validate VitriFlow's config and locked
+        # schedule schema; this test does not execute LAMMPS/QUIP.
+        materialized = tmp_path / f"cfg_{cfg_index}"
+        materialized.mkdir()
+        declared_files: list[str] = []
+        for file_index, original in enumerate(raw.get("potential", {}).get("files", [])):
+            placeholder = materialized / f"potential_{file_index}_{Path(original).name}"
+            placeholder.write_text(f"test-placeholder-{file_index}\n")
+            declared_files.append(str(placeholder))
+        raw["potential"]["files"] = declared_files
+        materialized_cfg = materialized / cfg_path.name
+        materialized_cfg.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+        cfg = RunConfig.from_yaml(materialized_cfg)
         assert cfg.engine == "lammps"
         assert cfg.md.stage_continuity == "continuous"
-        raw = yaml.safe_load(cfg_path.read_text()) or {}
         schedule = _schedule_from_raw(raw)
         roles = _validate_schedule(schedule)
         steps = _schedule_steps(schedule, md_use=cfg.md, time_unit_ps=1.0)

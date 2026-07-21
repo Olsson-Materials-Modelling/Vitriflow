@@ -54,3 +54,41 @@ def test_plot_stage_timeseries_writes_file(tmp_path: Path):
     )
     assert out.exists()
     assert out.stat().st_size > 1_000
+
+
+def test_plot_stage_legacy_optional_msd_parse_failure_is_explicitly_omitted(
+    tmp_path: Path,
+) -> None:
+    from vitriflow.plotting import plot_stage_timeseries
+
+    stage = tmp_path / "legacy_stage"
+    stage.mkdir()
+    _write_csv(
+        stage / "thermo.csv",
+        """
+        Step,Temp
+        0,300
+        1,301
+        """,
+    )
+    _write_csv(
+        stage / "msd.csv",
+        """
+        Step,MSD
+        0,0.0
+        1,-0.1
+        2,0.2
+        """,
+    )
+
+    out = tmp_path / "legacy_stage.pdf"
+    plot_stage_timeseries(
+        stage,
+        out,
+        thermo_series=["Temp"],
+        include_msd=True,
+        xaxis="step",
+        dpi=80,
+    )
+    assert out.exists()
+    assert out.stat().st_size > 1_000

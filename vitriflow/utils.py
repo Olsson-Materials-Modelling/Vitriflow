@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import os
 import shlex
+import stat as stat_module
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 
 def _tail_lines(text: str, n: int = 50, *, max_chars: int = 8000) -> str:
@@ -86,12 +87,168 @@ def scale_steps_for_timestep(steps_at_ref_dt: int, dt_ref: float, dt_new: float,
     return max(int(min_steps), s1)
 
 
+def stable_file_identity(
+    path: Path,
+    *,
+    reject_final_symlink: bool = False,
+) -> dict[str, object]:
+    """Hash one stable regular-file inode and verify its path still names it.
+
+    A plain ``stat(); open(); hash()`` sequence can combine metadata from one
+    file with bytes from another if a producer replaces the path concurrently.
+    This helper resolves the configured path once, opens the canonical final
+    component with ``O_NOFOLLOW`` where available, hashes that open inode, and
+    compares device, inode, type, size, mtime and ctime before and after the
+    read.  It then proves that both the canonical name and the original path
+    still resolve to the same inode.  Directory symlink aliases remain usable;
+    callers protecting result artifacts may additionally reject a symlink in
+    the final configured component.
+    """
+
+    configured = Path(path).expanduser()
+    try:
+        if reject_final_symlink and configured.is_symlink():
+            raise RuntimeError(f"Protected file must not be a symbolic link: {configured}")
+        resolved = configured.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"Required file is missing or cannot be resolved: {configured}") from exc
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= int(getattr(os, "O_BINARY"))
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= int(getattr(os, "O_CLOEXEC"))
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= int(getattr(os, "O_NOFOLLOW"))
+
+    fd = os.open(str(resolved), flags)
+    try:
+        before = os.fstat(fd)
+        if not stat_module.S_ISREG(before.st_mode):
+            raise RuntimeError(f"Required path is not a regular file: {configured}")
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+
+    fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, name) != getattr(after, name) for name in fields):
+        raise RuntimeError(f"Required file changed while hashing: {configured}")
+
+    try:
+        named = resolved.stat()
+        resolved_again = configured.resolve(strict=True)
+        original_named = resolved_again.stat()
+    except OSError as exc:
+        raise RuntimeError(f"Required file path changed while hashing: {configured}") from exc
+    if resolved_again != resolved or any(
+        getattr(after, name) != getattr(named, name)
+        or getattr(after, name) != getattr(original_named, name)
+        for name in fields
+    ):
+        raise RuntimeError(f"Required file path was replaced while hashing: {configured}")
+
+    return {
+        "resolved_path": str(resolved),
+        "size_bytes": int(after.st_size),
+        "sha256": digest.hexdigest(),
+        # Process-local stability evidence.  Callers deliberately do not need
+        # to persist these filesystem-specific values in portable manifests.
+        "device": int(after.st_dev),
+        "inode": int(after.st_ino),
+        "mtime_ns": int(after.st_mtime_ns),
+        "ctime_ns": int(after.st_ctime_ns),
+    }
+
+
 def sha256sum(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    return str(stable_file_identity(path)["sha256"])
+
+
+def quarantine_uncommitted_box_directories(
+    production_dir: Path,
+    *,
+    committed_box_ids: Sequence[int],
+    quarantine_root: Path,
+) -> list[Path]:
+    """Atomically move orphan ``box_NNN`` trees out of a resumed ensemble.
+
+    A checkpoint commits only accepted/rejected box identifiers.  A process
+    killed during the next box can leave engine outputs that must not be
+    interpreted as part of that checkpoint or reused by the rerun.  This
+    helper preserves such trees for diagnosis under a non-discoverable
+    quarantine root and returns their new paths.
+    """
+
+    production = Path(production_dir).expanduser()
+    if not production.exists():
+        return []
+    if production.is_symlink() or not production.is_dir():
+        raise RuntimeError(
+            f"Production directory must be a real directory before resume: {production}"
+        )
+    committed = {int(value) for value in committed_box_ids}
+    if any(value < 0 for value in committed):
+        raise ValueError("Committed production box ids must be non-negative")
+
+    production = production.resolve(strict=True)
+    calculation_root = production.parent
+    quarantine = Path(quarantine_root).expanduser()
+    if not quarantine.is_absolute():
+        quarantine = calculation_root / quarantine
+    raw_cursor = quarantine
+    while True:
+        try:
+            if raw_cursor.resolve(strict=False) == calculation_root:
+                break
+        except (OSError, RuntimeError):
+            pass
+        if raw_cursor.is_symlink():
+            raise RuntimeError(
+                "Interrupted-attempt quarantine must not contain symbolic links: "
+                f"{raw_cursor}"
+            )
+        if raw_cursor.parent == raw_cursor:
+            break
+        raw_cursor = raw_cursor.parent
+    quarantine_resolved = quarantine.resolve(strict=False)
+    try:
+        quarantine_resolved.relative_to(calculation_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Interrupted-attempt quarantine must remain inside the calculation root: "
+            f"{quarantine}"
+        ) from exc
+    cursor = calculation_root
+    for part in quarantine_resolved.relative_to(calculation_root).parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise RuntimeError(
+                f"Interrupted-attempt quarantine must not contain symbolic links: {cursor}"
+            )
+    quarantine = quarantine_resolved
+    quarantine.mkdir(parents=True, exist_ok=True)
+    moved: list[Path] = []
+    import re
+
+    for candidate in sorted(production.iterdir(), key=lambda item: item.name):
+        match = re.fullmatch(r"box_(\d+)", candidate.name)
+        if match is None or int(match.group(1)) in committed:
+            continue
+        index = 1
+        while True:
+            destination = quarantine / f"{candidate.name}.interrupted-{index:03d}"
+            if not destination.exists() and not destination.is_symlink():
+                break
+            index += 1
+        os.replace(candidate, destination)
+        moved.append(destination)
+    return moved
 
 
 def run_cmd(

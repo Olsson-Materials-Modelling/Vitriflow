@@ -34,7 +34,7 @@ At `md.timestep: 0.001` ps:
 - 3500 -> 300 K quench: 20 ps = 20000 steps
 - 300 K relaxation/sampling extension: 20 ps = 20000 steps
 
-This is a literature-inspired hard-carbon schedule demonstrator: it follows the spirit of the published temperature/time scheme, but it is not a verbatim reproduction. Nose-Hoover is used intentionally as the default robust LAMMPS thermostat/barostat choice. CSVR/Bussi-style thermostatting can be selected where supported, but it is not the default target of this demonstrator.
+This is a literature-inspired hard-carbon schedule demonstrator: it follows the spirit of the published temperature/time scheme, not a verbatim reproduction. The default thermostat/barostat is Nose-Hoover; CSVR/Bussi is selectable where supported (see below).
 
 The generated ensemble is not capped at ten boxes. Use `autotune.production.min_boxes`, `max_boxes`, and convergence settings to control how far the campaign runs.
 
@@ -60,6 +60,8 @@ LAMMPS thermostat styles: `nose-hoover`, `csvr`, `langevin`, `berendsen`.
 LAMMPS barostat styles for pressure-coupled stages: `nose-hoover`, `berendsen`.
 
 ## Use
+
+Run the commands in this section from the demonstrator directory (`demos/hardcarbon_gap20ugr/`).
 
 Copy the four GAP-20U+gr files into `potentials/`:
 

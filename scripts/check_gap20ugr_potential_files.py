@@ -25,8 +25,11 @@ def main(argv: list[str]) -> int:
     xml_path = Path(argv[1] if len(argv) > 1 else "potentials/Carbon_GAP_20U+gr.xml")
     if xml_path.is_dir():
         xml_path = xml_path / "Carbon_GAP_20U+gr.xml"
+    if xml_path.is_symlink():
+        print(f"ERROR: XML must be a regular non-symlink file: {xml_path}", file=sys.stderr)
+        return 2
     xml_path = xml_path.resolve(strict=False)
-    if not xml_path.exists():
+    if not xml_path.is_file():
         print(f"ERROR: missing XML: {xml_path}", file=sys.stderr)
         return 2
     text = xml_path.read_text(errors="ignore")
@@ -38,13 +41,20 @@ def main(argv: list[str]) -> int:
     except ET.ParseError as exc:
         print(f"ERROR: XML parse failed: {exc}", file=sys.stderr)
         return 4
-    # Extract any sparseX filenames declared in the XML. Prefer XML-declared set, fall back to expected names.
+    # The model is a fixed published artifact.  Accepting arbitrary filenames
+    # declared by a modified XML bypassed the known sidecar checksums.
     declared = sorted(set(re.findall(r'sparseX_filename\s*=\s*["\']([^"\']+)["\']', text)))
-    names = declared if declared else sorted(EXPECTED)
+    names = sorted(EXPECTED)
+    if set(declared) != set(names):
+        print(
+            "ERROR: XML sparseX declarations do not exactly match the published GAP-20U+gr sidecars",
+            file=sys.stderr,
+        )
+        return 5
     ok = True
     for name in names:
         p = xml_path.parent / name
-        if not p.exists():
+        if p.is_symlink() or not p.is_file():
             print(f"ERROR: missing sparseX sidecar: {p}", file=sys.stderr)
             ok = False
             continue

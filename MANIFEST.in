@@ -1,5 +1,37 @@
+include README.md
+include LICENSE
+include CONTRIBUTING.md
+include QUIP_GAP_SETUP.md
+include install_release.sh
+include environment.yml
+include environment_cp2k.yml
+include environment_quip.yml
+include environment_quip_openblas.yml
+include environment_rhel8_mpi.yml
+recursive-include scripts *.sh *.py
+recursive-include bin *
+recursive-include docs *.md
+recursive-include demos *.md *.yaml *.sh *.py .gitkeep
+# Application-validation harness: ships in the sdist for a self-contained source
+# artifact, but is not installed in the wheel (it is not a Python package).
+recursive-include validation *.sh *.py *.yaml *.slurm *.md *.data
+# The sdist is the reproducible source-test artifact.  Setuptools discovers
+# test_*.py by convention but does not reliably include tests/conftest.py;
+# include the complete Python test tree so fixtures and collection semantics
+# are identical to the reviewed checkout.
+recursive-include tests *.py
+include vitriflow/examples/minimal_metal.yaml
+include vitriflow/examples/al_fcc_4x4x4.data
+include vitriflow/examples/si_diamond_cp2k_toy.yaml
+include vitriflow/examples/sio2_bks_zbl_smoke.yaml
+include vitriflow/examples/sio2_bks_packmol_production.yaml
+include vitriflow/examples/sio2_bks_cristobalite_production.yaml
+include vitriflow/examples/sio2_kim_packmol_production.yaml
+include vitriflow/examples/sio2_kim_cristobalite_production.yaml
+include vitriflow/examples/hc_C_GAP20Ugr_hc_custom_demo.yaml
+recursive-include vitriflow/data/cp2k *
+recursive-include potentials *.md
 global-exclude *.py[cod]
 global-exclude __pycache__
 prune .pytest_cache
 prune */__pycache__
-prune tests/__pycache__

@@ -1,12 +1,62 @@
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
+*$py.class
 
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
+# Packaging and build artifacts
 build/
 dist/
 *.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+# Generated sdist metadata (regenerated on every build)
+/PKG-INFO
 
+# Test, type-check, and lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editor and OS
+.vscode/
+.idea/
+*.swp
+*~
 .DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+
+# ---- Vitriflow run outputs (simulation/analysis artifacts, never source) ----
+# Default output roots used by the docs and the validation harness. Add your own
+# `-o` / `--workdir` output directories here as needed.
+/runs/
+/validation-run/
+/vitriflow_application_validation_runs/
+
+# Hard-carbon demonstrator: keep the placeholder directories, ignore their
+# contents. External GAP potential files and generated configs/runs are never
+# committed.
+/demos/hardcarbon_gap20ugr/runs/*
+!/demos/hardcarbon_gap20ugr/runs/.gitkeep
+/demos/hardcarbon_gap20ugr/generated_configs/*
+!/demos/hardcarbon_gap20ugr/generated_configs/.gitkeep
+/demos/hardcarbon_gap20ugr/potentials/*
+!/demos/hardcarbon_gap20ugr/potentials/.gitkeep
+!/demos/hardcarbon_gap20ugr/potentials/README.md
+
+# Top-level user-supplied potentials placeholder: keep the README only.
+/potentials/*
+!/potentials/README.md

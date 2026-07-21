@@ -1,0 +1,335 @@
+# =============================================================================
+# PRODUCTION SiO2 melt-quench (autotune) - BKS + ZBL, packmol amorphous cell
+# vitriflow 0.4.37.0
+# -----------------------------------------------------------------------------
+# GOLD-STANDARD template. Convergence tolerances are vitriflow's vetted rigorous
+# defaults; the gate uses tol = max(abs_tol, rel_tol*|value|), so do NOT loosen
+# them for a publishable ensemble. These models converge in ~500 production
+# boxes; max_boxes leaves headroom and a run that hits it without converging
+# fails closed as not_converged (nonzero exit). Every autotune stage uses 10
+# replicas: incomplete statistics can drive nonsense Tm/rate/highT choices.
+# =============================================================================
+engine: lammps
+potential:
+  kind: lammps
+  user_units: metal
+  interactions:
+  - Si
+  - O
+  commands:
+  - pair_style buck/coul/long 10.0
+  - pair_coeff 1 1 0.0 1.0 0.0
+  - pair_coeff 1 2 18003.7572 0.205205 133.5381
+  - pair_coeff 2 2 1388.7730 0.362319 175.0
+  - pair_modify shift yes
+  - kspace_style pppm 1.0e-4
+  - kspace_modify gewald 0.8
+  core_repulsion:
+    enabled: true
+    style: zbl
+    tabulate: true
+    dt_candidates:
+    - 0.001
+    - 0.0005
+    r_out_factor: 0.55
+    r_out_min: 0.7
+    r_out_max: 1.2
+    r_in_factor: 0.75
+    max_attempts: 4
+    grow_factor: 1.15
+    test_equil_steps: 200
+    test_run_steps: 2000
+    ramp_steps: 200
+    limit_hold_steps: 200
+    table_filename: sio2_bks_core.table
+    table_points: 128000
+    table_points_max: 128000
+    table_verify_points: 50001
+    table_r_min: 0.1
+structure:
+  charges:
+    Si: 2.4
+    O: -1.2
+  generate:
+    method: packmol
+    formula: SiO2
+    n_formula_units: 64
+    packmol_cmd: packmol
+    packing_density_g_cm3: 2.2
+    packing_min_distance_A: 1.6
+    seed: 12345
+md:
+  timestep: 0.001
+  atom_style: charge
+  ensemble: npt
+  temperature: 300.0
+  pressure: 0.0
+  thermo_every: 100
+  dump_every: 500
+  stage_continuity: continuous
+  neighbor_skin: 0.5
+  neighbor_skin_autotune: true
+  neighbor_skin_step: 0.25
+  neighbor_skin_max: 2.0
+  thermostat:
+    style: nose-hoover
+    tdamp: 0.1
+  barostat:
+    style: nose-hoover
+    pdamp: 1.0
+    mode: iso
+random_seed: 20240715
+autotune:
+  preflight:
+    enabled: true
+    ensembles:
+    - npt
+    allow_nvt_fallback: false
+    allow_implicit_dt_fallback: false
+    dt_candidates:
+    - 0.001
+    - 0.0005
+    tdamp_factors:
+    - 50.0
+    - 100.0
+    - 200.0
+    - 500.0
+    pdamp_factors:
+    - 500.0
+    - 1000.0
+    - 2000.0
+    - 5000.0
+    min_pdamp_ps_highT: 1.0
+    T_low: 300.0
+    T_high: 7000.0
+    equil_steps: 5000
+    run_steps: 10000
+    tail_window: 2000
+    temp_rel_tol: 0.05
+    press_abs_tol: 10000.0
+    max_temp_factor: 3.0
+    max_press_abs: 10000000.0
+    max_vol_ratio: 3.0
+    confirm_equil_steps: 5000
+    confirm_run_steps: 10000
+    confirm_topk: 3
+    confirm_temps:
+    - 300.0
+    - 7000.0
+    timeout_sec: 3600.0
+  tm_scan:
+    t_min: 2000.0
+    t_max: 7000.0
+    dT: 500.0
+    ensemble: npt
+    equil_steps: 10000
+    sample_steps: 50000
+    msd_every: 100
+    replicates_per_temp: 10
+    sample_in_nvt: true
+    highT_mode: liquid
+    gr:
+      enabled: true
+      nbins: 160
+      r_max: 6.0
+      frames: 20
+      stride: 1
+      smooth: 5
+      pair:
+      - Si
+      - O
+  highT:
+    margin: 500.0
+    replicates: 10
+    chunk_steps: 25000
+    max_chunks: 8
+    min_total_steps: 50000
+    rms_multiple: 0.1
+    stationarity_tol: 0.5
+    enforce_stationarity: true
+  quench:
+    t_final: 300.0
+    relax_steps: 5000
+    enforce_rate_bounds: false
+    rates_K_per_ps:
+    - 100.0
+    - 50.0
+    - 10.0
+    - 1.0
+    - 0.1
+    replicates_per_rate: 10
+  size:
+    enabled: false
+  metrics:
+    enabled: true
+    type_to_species:
+    - Si
+    - O
+    time_average_frames: 10
+    time_average_stride: 1
+    collect_during_production_stages: true
+    stage_timeseries_frame_stride: 5
+    stage_timeseries_max_frames: 40
+    stage_timeseries_make_plot: true
+    quench_tail_min_frames: 5
+    quench_tail_focus_fraction: 0.8
+    quench_tail_fallback_fraction: 0.4
+    elastic:
+      enabled: false
+    pairs:
+    - pair:
+      - Si
+      - O
+      cutoff: 2.2
+    coordinations:
+    - central: Si
+      neighbor: O
+      cutoff: 2.2
+      expected: 4
+      defect_frac_tol: 0.05
+    - central: O
+      neighbor: Si
+      cutoff: 2.2
+      expected: 2
+      defect_frac_tol: 0.05
+    coordination_sweep:
+      enabled: true
+      dr: 0.02
+      n_below: 2
+      n_above: 2
+      strained_delta: 0.1
+    angles:
+    - triplet:
+      - O
+      - Si
+      - O
+    - triplet:
+      - Si
+      - O
+      - Si
+    rings:
+      enabled: true
+      mode: projected
+      algorithm: primitive
+      nodes:
+      - Si
+      bridge: O
+      bond_pairs:
+      - pair:
+        - Si
+        - O
+        cutoff: 2.2
+      max_cycle_size: 12
+      max_paths_per_edge: 8
+    gr:
+    - pair: null
+      r_max: 6.0
+      nbins: 160
+    - pair:
+      - Si
+      - O
+      r_max: 6.0
+      nbins: 160
+    - pair:
+      - O
+      - O
+      r_max: 6.0
+      nbins: 160
+    - pair:
+      - Si
+      - Si
+      r_max: 6.0
+      nbins: 160
+    sq:
+    - pair: null
+      q_max: 16.0
+      nq: 160
+      r_max: 6.0
+      nbins: 200
+    voids:
+      enabled: true
+      n_samples: 512
+      n_samples_timeseries: 64
+      sampler: sobol
+      seed: 0
+      k_nearest: 12
+      default_radius: 0.0
+      r_max: 4.0
+      cdf_points: 64
+      probe_radii:
+      - 0.5
+      - 1.0
+      - 1.5
+    amorphous:
+      enabled: true
+      enforce_during_rate_scan: false
+      enforce_during_production: true
+      q_max: 16.0
+      nq: 96
+      r_max: 6.0
+      nbins: 160
+      peak_search:
+      - 0.5
+      - 8.0
+      reference:
+        enabled: false
+  production:
+    enabled: true
+    min_boxes: 50
+    batch_boxes: 5
+    max_boxes: 750
+    warmup_start_temperature: 300.0
+    warmup_duration_ps: 50.0
+    dump_trajectory: true
+    dump_every_steps: 500
+    check_convergence: true
+    consecutive_converged_checks: 3
+    bondlen_cdf_points: 64
+    angle_cdf_points: 72
+    store_distributions: true
+    embed_structures: true
+    exclude_coordination_defects: false
+  convergence:
+    mode: both
+    density_rel_tol: 0.01
+    density_abs_tol: 0.001
+    coord_rel_tol: 0.0
+    coord_abs_tol: 0.05
+    bondlen_rel_tol: 0.0
+    bondlen_abs_tol: 0.02
+    angle_rel_tol: 0.0
+    angle_abs_tol: 2.0
+    ring_rel_tol: 0.0
+    ring_abs_tol: 0.05
+    ring_size_rel_tol: 0.0
+    ring_size_abs_tol: 0.3
+    gr_peak_r_rel_tol: 0.0
+    gr_peak_r_abs_tol: 0.02
+    gr_peak_height_rel_tol: 0.05
+    gr_peak_height_abs_tol: 0.2
+    gr_peak_fwhm_rel_tol: 0.05
+    gr_peak_fwhm_abs_tol: 0.02
+    bondlen_cdf_rel_tol: 0.0
+    bondlen_cdf_abs_tol: 0.02
+    angle_cdf_rel_tol: 0.0
+    angle_cdf_abs_tol: 0.02
+    coord_cdf_rel_tol: 0.0
+    coord_cdf_abs_tol: 0.02
+    gr_curve_rel_tol: 0.05
+    gr_curve_abs_tol: 0.05
+    sq_curve_rel_tol: 0.05
+    sq_curve_abs_tol: 0.05
+    void_cdf_rel_tol: 0.0
+    void_cdf_abs_tol: 0.02
+    bounded_ci_method: t
+    familywise: bonferroni
+    stability_split: half
+    stability_distance: wasserstein
+    stability_bootstrap: 200
+    stability_quantile: 0.95
+lammps:
+  lammps_cmd: lmp
+  mpi_cmd: mpirun
+  nprocs: 8
+  timeout_sec: 604800.0
+  kill_grace_sec: 5.0

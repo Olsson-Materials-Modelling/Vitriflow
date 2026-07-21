@@ -2,14 +2,280 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Dict, Literal, Optional, Tuple, Union, List, Sequence
+import re
+from typing import Any, Dict, Literal, Mapping, Optional, Tuple, Union, List, Sequence
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator, AliasChoices
+from pydantic import AliasChoices, BaseModel as PydanticBaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+# ``+`` is part of the published GAP-20U+gr asset basename and is an ordinary
+# non-separator character in both a LAMMPS input token and the supported host
+# filesystems.  Keep this deliberately narrow: whitespace, control characters,
+# quoting/metacharacters and path separators remain outside the allow-list.
+_SAFE_LAMMPS_LOCALIZED_FILENAME = re.compile(r"^[A-Za-z0-9_.+-]+$")
+_LAMMPS_RESERVED_EXTRA_ARGS: frozenset[str] = frozenset(
+    {
+        "-in",
+        "-i",
+        "-log",
+        "-l",
+        "-screen",
+        "-sc",
+        "-partition",
+        "-p",
+        "-plog",
+        "-pscreen",
+        "-restart2data",
+        "-r2data",
+        "-restart2dump",
+        "-r2dump",
+        "-restart2info",
+        "-r2info",
+        "-skiprun",
+        "-sr",
+        "-help",
+        "-h",
+    }
+)
+
+
+def validated_lammps_extra_args(value: Any) -> list[str]:
+    """Validate runtime LAMMPS arguments, including post-model mutations."""
+
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("lammps.extra_args must be a list of argument tokens")
+    values: list[str] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(
+                f"lammps.extra_args[{index}] must be a non-empty string token"
+            )
+        if raw != raw.strip():
+            raise ValueError(
+                f"lammps.extra_args[{index}] must not contain leading or trailing whitespace"
+            )
+        token = raw
+        option = token.lower().split("=", 1)[0]
+        if option in _LAMMPS_RESERVED_EXTRA_ARGS:
+            raise ValueError(
+                "lammps.extra_args must not override runner-owned input, "
+                f"output, or execution-control switch {token!r}"
+            )
+        values.append(token)
+    return values
+
+
+def validated_lammps_command(value: Any) -> Union[str, list[str]]:
+    """Validate the executable and any optional command-list tail."""
+
+    if isinstance(value, list):
+        if not value:
+            raise ValueError("lammps_cmd list must be non-empty")
+        executable = value[0]
+        if (
+            not isinstance(executable, str)
+            or not executable.strip()
+            or executable != executable.strip()
+        ):
+            raise ValueError(
+                "lammps_cmd[0] must be an exact non-empty executable token"
+            )
+        try:
+            tail = validated_lammps_extra_args(value[1:])
+        except ValueError as exc:
+            raise ValueError(
+                "lammps_cmd tokens after the executable must not override "
+                "runner-owned execution controls"
+            ) from exc
+        return [executable, *tail]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("lammps_cmd must be a non-empty string")
+    if value != value.strip():
+        raise ValueError("lammps_cmd must not contain leading or trailing whitespace")
+    return value
+
+
+def validated_lammps_localized_filename(value: Any, *, field_name: str) -> str:
+    """Return a portable basename safe for one shared LAMMPS work directory."""
+
+    raw_name = str(value)
+    name = raw_name.strip()
+    if (
+        not name
+        or raw_name != name
+        or name in {".", ".."}
+        or Path(name).name != name
+        or _SAFE_LAMMPS_LOCALIZED_FILENAME.fullmatch(name) is None
+    ):
+        raise ValueError(
+            f"{field_name} must be one path-safe basename made from letters, "
+            "digits, '_', '-', '+', or '.' (not '.' or '..')"
+        )
+    return name
+
+
+class BaseModel(PydanticBaseModel):
+    """Strict configuration base.
+
+    A misspelled scientific or execution option must never be silently ignored
+    and replaced by a default.  Free-form user metadata remains possible only
+    in fields explicitly typed as mappings.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 # structural metrics melt
 AtomSelector = Union[int, str]
+
+
+_SAFE_CP2K_LOCAL_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def validate_cp2k_extra_args(value: Any) -> list[str]:
+    """Validate optional CP2K arguments without ceding runner ownership.
+
+    ``Cp2kRunner`` always supplies the authoritative input and output files.
+    CP2K accepts later command-line switches that can replace those files or
+    select a non-production utility mode while still returning success.  Keep
+    ordinary numerical/runtime options available, but reject every switch that
+    changes input/output or whether the calculation is actually executed.
+
+    This function is deliberately shared by configuration validation and the
+    runner call boundary: Pydantic models are mutable and ``model_construct``
+    can bypass field validators, so configuration-time validation alone is not
+    a sufficient execution guarantee.
+    """
+
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("cp2k.extra_args must be a list of argument tokens")
+
+    reserved_exact = frozenset(
+        {
+            "-i",
+            "--input-file",
+            "-o",
+            "--output-file",
+            "-b",
+            "--batch",
+            "-c",
+            "--check",
+            "--check-all",
+            "--check-run",
+            "-d",
+            "--dry-run",
+            "-h",
+            "--help",
+            "--html-manual",
+            "--keep-alive",
+            "--memory",
+            "--mpi-mapping",
+            "-r",
+            "--run",
+            "-s",
+            "--shell",
+            "--shell-posix",
+            "-v",
+            "--version",
+            "--xml",
+        }
+    )
+    reserved_assignment_prefixes = (
+        "--input-file=",
+        "--output-file=",
+        "--batch=",
+        "--check=",
+        "--check-all=",
+        "--check-run=",
+        "--dry-run=",
+        "--help=",
+        "--html-manual=",
+        "--keep-alive=",
+        "--memory=",
+        "--mpi-mapping=",
+        "--run=",
+        "--shell=",
+        "--version=",
+        "--xml=",
+    )
+    reserved_short_prefixes = ("-i", "-o", "-b", "-c", "-d", "-h", "-r", "-s", "-v")
+
+    values: list[str] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, str) or not raw or raw != raw.strip():
+            raise ValueError(
+                f"cp2k.extra_args[{index}] must be a non-empty string token "
+                "without leading or trailing whitespace"
+            )
+        token = raw
+        lowered = token.lower()
+        if (
+            lowered in reserved_exact
+            or any(lowered.startswith(prefix) for prefix in reserved_assignment_prefixes)
+            or any(
+                lowered.startswith(prefix) and lowered != prefix
+                for prefix in reserved_short_prefixes
+            )
+        ):
+            raise ValueError(
+                "cp2k.extra_args must not override runner-owned input/output "
+                f"or select a non-production execution mode: {token!r}"
+            )
+        values.append(token)
+    return values
+
+
+def validate_cp2k_command(value: Any) -> Union[str, List[str]]:
+    """Validate the CP2K executable payload, including mutable-model reuse."""
+
+    if isinstance(value, list):
+        if not value:
+            raise ValueError("cp2k_cmd list must be non-empty")
+        try:
+            return validate_cp2k_extra_args(value)
+        except ValueError as exc:
+            raise ValueError(
+                "cp2k_cmd tokens must be exact non-empty command tokens and "
+                "must not preselect CP2K input/output or utility modes"
+            ) from exc
+    raw = str(value)
+    if not raw or raw != raw.strip():
+        raise ValueError(
+            "cp2k_cmd must be a non-empty string without leading or trailing whitespace"
+        )
+    return raw
+
+
+def _validated_atom_selector(value: Any, *, field_name: str) -> AtomSelector:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a species name or an integer atom type, not boolean")
+    if isinstance(value, int):
+        if value < 1:
+            raise ValueError(f"{field_name} integer atom types must be >= 1")
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(f"{field_name} species names must be non-empty")
+        return stripped
+    raise ValueError(f"{field_name} must be a species name or an integer atom type")
+
+
+def _validated_selector_tuple(value: Any, *, size: int, field_name: str) -> tuple[AtomSelector, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"{field_name} must contain exactly {size} atom selectors")
+    items = list(value)
+    if len(items) != size:
+        raise ValueError(f"{field_name} must contain exactly {size} atom selectors")
+    return tuple(
+        _validated_atom_selector(item, field_name=f"{field_name}[{index}]")
+        for index, item in enumerate(items)
+    )
 
 
 class LammpsConfig(BaseModel):
@@ -27,17 +293,22 @@ class LammpsConfig(BaseModel):
     # seconds sigterm sigkill
     kill_grace_sec: float = 5.0
 
+    # These switches control the input stream, output namespaces, execution
+    # mode, or utility mode owned by ``LammpsRunner``.  Allowing them through
+    # ``extra_args`` would place a second occurrence *after* the runner's
+    # canonical ``-in/-log/-screen`` arguments.  LAMMPS can then run a
+    # different script, suppress the current log, skip the run, or enter a
+    # restart-conversion mode while returning success.  Accelerator and
+    # package switches remain available through ``extra_args``.
     @field_validator("lammps_cmd")
     @classmethod
     def _lammps_cmd_valid(cls, v: Union[str, List[str]]) -> Union[str, List[str]]:
-        if isinstance(v, list):
-            vv = [str(x).strip() for x in v if str(x).strip() != ""]
-            if len(vv) == 0:
-                raise ValueError("lammps_cmd list must be non-empty")
-            return vv
-        if str(v).strip() == "":
-            raise ValueError("lammps_cmd must be a non-empty string")
-        return str(v).strip()
+        return validated_lammps_command(v)
+
+    @field_validator("extra_args", mode="before")
+    @classmethod
+    def _extra_args_cannot_override_runner_io(cls, v: Any) -> list[str]:
+        return validated_lammps_extra_args(v)
 
     @field_validator("mpi_cmd")
     @classmethod
@@ -48,12 +319,38 @@ class LammpsConfig(BaseModel):
         s = str(v).strip()
         return s if s != "" else None
 
-    @field_validator("nprocs")
+    @field_validator("nprocs", mode="before")
     @classmethod
-    def _nprocs_positive(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("nprocs must be >= 1")
-        return v
+    def _nprocs_positive(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("nprocs must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("nprocs must be an integer >= 1")
+        return n
+
+    @field_validator("timeout_sec", mode="before")
+    @classmethod
+    def _timeout_valid(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("timeout_sec must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("timeout_sec must be finite and > 0")
+        return x
+
+    @field_validator("kill_grace_sec", mode="before")
+    @classmethod
+    def _kill_grace_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("kill_grace_sec must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x < 0.0:
+            raise ValueError("kill_grace_sec must be finite and >= 0")
+        return x
 
 
 class Cp2kKindConfig(BaseModel):
@@ -144,89 +441,197 @@ class Cp2kConfig(BaseModel):
     @field_validator("cp2k_cmd")
     @classmethod
     def _cp2k_cmd_valid(cls, v: Union[str, List[str]]) -> Union[str, List[str]]:
-        if isinstance(v, list):
-            vv = [str(x).strip() for x in v if str(x).strip() != ""]
-            if len(vv) == 0:
-                raise ValueError("cp2k_cmd list must be non-empty")
-            return vv
-        if str(v).strip() == "":
-            raise ValueError("cp2k_cmd must be a non-empty string")
-        return str(v).strip()
+        return validate_cp2k_command(v)
+
+    @field_validator("extra_args", mode="before")
+    @classmethod
+    def _cp2k_extra_args_cannot_override_runner(cls, v: Any) -> list[str]:
+        return validate_cp2k_extra_args(v)
+
+    @field_validator("data_dir")
+    @classmethod
+    def _data_dir_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        raw = str(v)
+        if not raw or raw != raw.strip():
+            raise ValueError(
+                "cp2k.data_dir must be omitted/null or an exact non-empty directory path"
+            )
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            raise ValueError(
+                "cp2k.data_dir must be absolute after YAML path resolution"
+            )
+        if not path.is_dir():
+            raise ValueError(f"cp2k.data_dir is not a directory: {path}")
+        return str(path.resolve(strict=False))
+
+    @field_validator("basis_set_file_name", "potential_file_name")
+    @classmethod
+    def _cp2k_data_filename_valid(cls, v: str) -> str:
+        raw = str(v)
+        if not raw or raw != raw.strip():
+            raise ValueError(
+                "CP2K data filename must be non-empty without leading or trailing whitespace"
+            )
+        path = Path(raw).expanduser()
+        qualified = path.is_absolute() or "/" in raw or "\\" in raw
+        if qualified:
+            if not path.is_absolute():
+                raise ValueError(
+                    "path-qualified CP2K data filenames must be absolute after YAML path resolution"
+                )
+            if not path.is_file():
+                raise ValueError(f"CP2K data file does not exist: {path}")
+            return str(path.resolve(strict=False))
+        if (
+            raw in {".", ".."}
+            or path.name != raw
+            or _SAFE_CP2K_LOCAL_FILENAME_RE.fullmatch(raw) is None
+        ):
+            raise ValueError(
+                "bare CP2K data filenames must be path-safe basenames made "
+                "from letters, digits, '_', '-' or '.'"
+            )
+        return raw
 
     @field_validator("mpi_cmd")
     @classmethod
     def _mpi_cmd_strip_cp2k(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return None
-        s = str(v).strip()
-        return s if s != "" else None
+        s = str(v)
+        if not s or s != s.strip():
+            raise ValueError(
+                "cp2k.mpi_cmd must be omitted/null or an exact non-empty command token"
+            )
+        return s
 
     @field_validator("exec_prefix")
     @classmethod
     def _exec_prefix_valid(cls, v: Sequence[str]) -> List[str]:
-        vv = [str(x) for x in list(v) if str(x).strip() != ""]
-        return vv
+        values = list(v)
+        if any(
+            not isinstance(token, str)
+            or not token
+            or token != token.strip()
+            for token in values
+        ):
+            raise ValueError(
+                "cp2k.exec_prefix must contain exact non-empty tokens without "
+                "leading or trailing whitespace"
+            )
+        return values
 
-    @field_validator("nprocs")
+    @field_validator("nprocs", mode="before")
     @classmethod
-    def _nprocs_positive_cp2k(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("nprocs must be >= 1")
-        return int(v)
+    def _nprocs_positive_cp2k(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("nprocs must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("nprocs must be an integer >= 1")
+        return n
 
-    @field_validator("omp_num_threads")
+    @field_validator("omp_num_threads", mode="before")
     @classmethod
-    def _omp_threads_valid(cls, v: Optional[int]) -> Optional[int]:
+    def _omp_threads_valid(cls, v: Any) -> Optional[int]:
         if v is None:
             return None
-        if int(v) < 1:
-            raise ValueError("omp_num_threads must be >= 1")
-        return int(v)
+        if isinstance(v, bool):
+            raise ValueError("omp_num_threads must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("omp_num_threads must be an integer >= 1")
+        return n
 
-    @field_validator("cutoff_Ry", "rel_cutoff_Ry")
+    @field_validator("timeout_sec", mode="before")
     @classmethod
-    def _cutoffs_pos(cls, v: float) -> float:
+    def _cp2k_timeout_valid(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("timeout_sec must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("timeout_sec must be finite and > 0")
+        return x
+
+    @field_validator("kill_grace_sec", mode="before")
+    @classmethod
+    def _cp2k_kill_grace_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("kill_grace_sec must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x < 0.0:
+            raise ValueError("kill_grace_sec must be finite and >= 0")
+        return x
+
+    @field_validator("cutoff_Ry", "rel_cutoff_Ry", mode="before")
+    @classmethod
+    def _cutoffs_pos(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("cutoffs must be numeric")
         x = float(v)
         if not (math.isfinite(x) and x > 0.0):
             raise ValueError("cutoffs must be finite and > 0")
         return x
 
-    @field_validator("ngrids")
+    @field_validator("ngrids", mode="before")
     @classmethod
-    def _ngrids_valid(cls, v: int) -> int:
-        if int(v) < 1:
-            raise ValueError("ngrids must be >= 1")
-        return int(v)
+    def _ngrids_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("ngrids must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("ngrids must be an integer >= 1")
+        return n
 
-    @field_validator("eps_scf")
+    @field_validator("eps_scf", mode="before")
     @classmethod
-    def _eps_scf_valid(cls, v: float) -> float:
+    def _eps_scf_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("eps_scf must be numeric")
         x = float(v)
         if not (math.isfinite(x) and x > 0.0):
             raise ValueError("eps_scf must be finite and > 0")
         return x
 
-    @field_validator("max_scf")
+    @field_validator("max_scf", mode="before")
     @classmethod
-    def _max_scf_valid(cls, v: int) -> int:
-        if int(v) < 1:
-            raise ValueError("max_scf must be >= 1")
-        return int(v)
+    def _max_scf_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("max_scf must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("max_scf must be an integer >= 1")
+        return n
 
-    @field_validator("ramp_max_deltaT_K")
+    @field_validator("ramp_max_deltaT_K", mode="before")
     @classmethod
-    def _ramp_deltaT_valid(cls, v: float) -> float:
+    def _ramp_deltaT_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("ramp_max_deltaT_K must be numeric")
         x = float(v)
         if not (math.isfinite(x) and x > 0.0):
             raise ValueError("ramp_max_deltaT_K must be finite and > 0")
         return x
 
-    @field_validator("ramp_max_segments")
+    @field_validator("ramp_max_segments", mode="before")
     @classmethod
-    def _ramp_segments_valid(cls, v: int) -> int:
-        if int(v) < 1:
-            raise ValueError("ramp_max_segments must be >= 1")
-        return int(v)
+    def _ramp_segments_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("ramp_max_segments must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("ramp_max_segments must be an integer >= 1")
+        return n
 
 
 class CoreRepulsionConfig(BaseModel):
@@ -239,7 +644,7 @@ class CoreRepulsionConfig(BaseModel):
     # cut sub style
     style: Literal["zbl", "lj_repulsive"] = "zbl"
 
-    @field_validator("style")
+    @field_validator("style", mode="before")
     @classmethod
     def _normalize_style(cls, v: str) -> str:
         s = str(v).strip().lower()
@@ -299,6 +704,9 @@ class CoreRepulsionConfig(BaseModel):
     table_verify_points: int = 50001
     table_verify_rel_tol: float = 5.0e-5
     table_verify_abs_tol_frac: float = 1.0e-7
+    # Preserve the public field name: true rejects every unaudited or
+    # non-inflection table warning. A force/secant warning proven to arise
+    # solely at an analytic energy inflection is recorded as advisory.
     table_require_warning_free: bool = True
 
     # repulsive increase repulsion
@@ -331,6 +739,13 @@ class CoreRepulsionConfig(BaseModel):
     # preflight active lammps
     u_target_kT: float = 50.0
 
+    @field_validator("table_filename")
+    @classmethod
+    def _table_filename_is_local_basename(cls, v: Any) -> str:
+        return validated_lammps_localized_filename(
+            v, field_name="core_repulsion.table_filename"
+        )
+
     @field_validator(
         "r_out_factor",
         "r_out_min",
@@ -343,21 +758,80 @@ class CoreRepulsionConfig(BaseModel):
         "table_gewald",
         "table_verify_rel_tol",
         "table_verify_abs_tol_frac",
+        mode="before",
     )
     @classmethod
-    def _pos_float(cls, v: float) -> float:
+    def _pos_float(cls, v: Any) -> Optional[float]:
         if v is None:
             return v
-        if float(v) <= 0:
-            raise ValueError("value must be > 0")
-        return float(v)
+        if isinstance(v, bool):
+            raise ValueError("value must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("value must be finite and > 0")
+        return x
 
-    @field_validator("max_attempts", "test_run_steps", "table_points", "table_points_max", "table_verify_points")
+    @field_validator(
+        "max_attempts",
+        "test_run_steps",
+        "ramp_steps",
+        "limit_hold_steps",
+        "table_points",
+        "table_points_max",
+        "table_verify_points",
+        mode="before",
+    )
     @classmethod
-    def _pos_int(cls, v: int) -> int:
-        if int(v) < 1:
-            raise ValueError("value must be >= 1")
-        return int(v)
+    def _pos_int(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("value must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("value must be an integer >= 1")
+        return n
+
+    @field_validator("test_equil_steps", mode="before")
+    @classmethod
+    def _nonnegative_int(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("test_equil_steps must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("test_equil_steps must be an integer >= 0")
+        return n
+
+    @field_validator("dt_candidates", mode="before")
+    @classmethod
+    def _dt_candidates_valid(cls, v: Any) -> Optional[list[float]]:
+        if v is None:
+            return None
+        if isinstance(v, (str, bytes, Mapping)) or not isinstance(v, Sequence):
+            raise ValueError("dt_candidates must be a non-empty sequence of finite values > 0")
+        values: list[float] = []
+        for raw in v:
+            if isinstance(raw, bool):
+                raise ValueError("dt_candidates must contain numeric values")
+            x = float(raw)
+            if not math.isfinite(x) or x <= 0.0:
+                raise ValueError("dt_candidates must contain only finite values > 0")
+            values.append(x)
+        if not values:
+            raise ValueError("dt_candidates must not be empty when provided")
+        return values
+
+    @field_validator("limit_max_disp", "langevin_damp", mode="before")
+    @classmethod
+    def _optional_positive_finite(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("value must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("value must be finite and > 0")
+        return x
 
     @model_validator(mode="after")
     def _validate(self) -> "CoreRepulsionConfig":
@@ -365,19 +839,24 @@ class CoreRepulsionConfig(BaseModel):
             raise ValueError("r_out_max must be >= r_out_min")
         if self.r_in_factor >= 1.0:
             raise ValueError("r_in_factor must be < 1 (inner cutoff must be smaller than outer)")
-        if bool(self.tabulate):
+        # Enabled ZBL autocore is always realized as a replacement table: an
+        # analytic Buckingham+ZBL overlay remains unbounded below.  The legacy
+        # ``tabulate`` flag is therefore not an authority for whether table
+        # controls are consumed and must not be allowed to bypass validation.
+        uses_zbl_table = bool(self.enabled) and str(self.style).strip().lower() == "zbl"
+        if bool(self.tabulate) or uses_zbl_table:
             if str(self.style).strip().lower() != "zbl":
-                raise ValueError("core_repulsion.tabulate currently supports only style='zbl'")
+                raise ValueError("core_repulsion.tabulate supports only style='zbl'")
             if int(self.table_points) < 2000:
-                raise ValueError("core_repulsion.table_points must be >= 2000 when tabulate=true")
+                raise ValueError("core_repulsion.table_points must be >= 2000 when ZBL tabulation is used")
             if int(self.table_points_max) < int(self.table_points):
-                raise ValueError("core_repulsion.table_points_max must be >= core_repulsion.table_points when tabulate=true")
+                raise ValueError("core_repulsion.table_points_max must be >= core_repulsion.table_points when ZBL tabulation is used")
             if int(self.table_verify_points) < 2000:
-                raise ValueError("core_repulsion.table_verify_points must be >= 2000 when tabulate=true")
+                raise ValueError("core_repulsion.table_verify_points must be >= 2000 when ZBL tabulation is used")
             if str(self.table_filename).strip() == "":
-                raise ValueError("core_repulsion.table_filename must be non-empty when tabulate=true")
+                raise ValueError("core_repulsion.table_filename must be non-empty when ZBL tabulation is used")
             if not (math.isfinite(float(self.table_r_min)) and float(self.table_r_min) > 0.0):
-                raise ValueError("core_repulsion.table_r_min must be finite and > 0 when tabulate=true")
+                raise ValueError("core_repulsion.table_r_min must be finite and > 0 when ZBL tabulation is used")
         return self
 
 
@@ -394,6 +873,37 @@ class KimConfig(BaseModel):
 
     # repulsion buckingham potentials
     core_repulsion: CoreRepulsionConfig = Field(default_factory=CoreRepulsionConfig)
+
+    @field_validator("model")
+    @classmethod
+    def _model_nonempty(cls, v: str) -> str:
+        value = str(v).strip()
+        if not value:
+            raise ValueError("kim.model must be non-empty")
+        return value
+
+    @field_validator("user_units")
+    @classmethod
+    def _units_style_supported(cls, v: str) -> str:
+        from .lammps_units import normalize_lammps_units_style
+
+        return normalize_lammps_units_style(v)
+
+    @field_validator("interactions", mode="before")
+    @classmethod
+    def _interactions_nonempty(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            if v == "fixed_types":
+                return v
+            raise ValueError("kim.interactions must be a species list or 'fixed_types'")
+        if not isinstance(v, Sequence) or isinstance(v, (bytes, bytearray)):
+            raise ValueError("kim.interactions must be a species list or 'fixed_types'")
+        if any(not isinstance(item, str) for item in v):
+            raise ValueError("kim.interactions species names must be strings")
+        values = [item.strip() for item in v]
+        if not values or any(not item for item in values):
+            raise ValueError("kim.interactions must contain only non-empty species names")
+        return values
 
     @model_validator(mode="after")
     def _validate_interactions(self) -> "KimConfig":
@@ -412,6 +922,56 @@ class LammpsPotentialConfig(BaseModel):
     files: list[Path] = Field(default_factory=list)
 
     core_repulsion: CoreRepulsionConfig = Field(default_factory=CoreRepulsionConfig)
+
+    @field_validator("user_units")
+    @classmethod
+    def _units_style_supported(cls, v: str) -> str:
+        from .lammps_units import normalize_lammps_units_style
+
+        return normalize_lammps_units_style(v)
+
+    @field_validator("interactions", mode="before")
+    @classmethod
+    def _interaction_species_valid(cls, v: Any) -> list[str]:
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("potential.interactions must be a non-empty species list")
+        if any(not isinstance(item, str) for item in v):
+            raise ValueError("potential.interactions species names must be strings")
+        values = [item.strip() for item in v]
+        if not values or any(not item for item in values):
+            raise ValueError("potential.interactions must contain only non-empty species names")
+        return values
+
+    @field_validator("commands", mode="before")
+    @classmethod
+    def _commands_valid(cls, v: Any) -> list[str]:
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("potential.commands must be a non-empty list")
+        if any(not isinstance(item, str) for item in v):
+            raise ValueError("potential.commands entries must be strings")
+        values = list(v)
+        if not values or any(not item.strip() for item in values):
+            raise ValueError("potential.commands must contain only non-empty commands")
+        return values
+
+    @field_validator("files", mode="before")
+    @classmethod
+    def _files_valid(cls, v: Any) -> list[Path]:
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("potential.files must be a list")
+        paths: list[Path] = []
+        for index, raw in enumerate(v):
+            if raw is None or not str(raw).strip():
+                raise ValueError(f"potential.files entry at index {index} must be a non-empty path")
+            path = Path(str(raw)).expanduser()
+            if not path.is_file():
+                raise ValueError(f"potential.files entry is not a file: {path}")
+            validated_lammps_localized_filename(
+                path.name,
+                field_name=f"potential.files[{index}] basename",
+            )
+            paths.append(path.resolve(strict=False))
+        return paths
 
     @model_validator(mode="after")
     def _validate(self) -> "LammpsPotentialConfig":
@@ -458,6 +1018,56 @@ class MG2SiNPotentialConfig(BaseModel):
     table_filename: str = "mg2_sin.table"
 
     core_repulsion: CoreRepulsionConfig = Field(default_factory=CoreRepulsionConfig)
+
+    @field_validator("user_units")
+    @classmethod
+    def _units_style_supported(cls, v: str) -> str:
+        # Imported lazily to keep configuration model import time small.
+        from .lammps_units import normalize_lammps_units_style
+
+        return normalize_lammps_units_style(v)
+
+    @field_validator(
+        "D0_eV",
+        "alpha_invA",
+        "r0_A",
+        "A_SiSi_eVA",
+        "rho_SiSi_A",
+        "A_NN_eVA",
+        "rho_NN_A",
+        "C6_NN_eVA6",
+        "b6_NN_invA",
+        "x1_A",
+        "x0_A",
+        "r_min_A",
+        mode="before",
+    )
+    @classmethod
+    def _positive_finite_parameter(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("MG2 potential parameters must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("MG2 potential parameters must be finite and > 0")
+        return x
+
+    @field_validator("table_points", mode="before")
+    @classmethod
+    def _table_points_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("MG2 table_points must be an integer >= 1000")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1000:
+            raise ValueError("MG2 table_points must be an integer >= 1000")
+        return n
+
+    @field_validator("table_filename")
+    @classmethod
+    def _table_filename_valid(cls, v: str) -> str:
+        return validated_lammps_localized_filename(
+            v, field_name="MG2 table_filename"
+        )
 
     @model_validator(mode="after")
     def _validate(self) -> "MG2SiNPotentialConfig":
@@ -529,12 +1139,120 @@ class StructureGenerateConfig(BaseModel):
     random_min_distance: float = 1.5
     seed: int = 12345
 
+    @field_validator("formula")
+    @classmethod
+    def _formula_nonempty(cls, v: str) -> str:
+        value = str(v).strip()
+        if not value:
+            raise ValueError("structure.generate.formula must be non-empty for every generation method")
+        return value
+
+    @field_validator("poscar_path", mode="before")
+    @classmethod
+    def _poscar_path_valid(cls, v: Any) -> Optional[Path]:
+        if v is None:
+            return None
+        if not str(v).strip():
+            raise ValueError("structure.generate.poscar_path must be a non-empty file path")
+        return Path(str(v)).expanduser()
+
+    @field_validator("cod_id", mode="before")
+    @classmethod
+    def _cod_id_valid(cls, v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("structure.generate.cod_id must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("structure.generate.cod_id must be an integer >= 1")
+        return n
+
+    @field_validator("repeat", mode="before")
+    @classmethod
+    def _repeat_valid(cls, v: Any) -> Optional[tuple[int, int, int]]:
+        if v is None:
+            return None
+        values = list(v)
+        if len(values) != 3:
+            raise ValueError("repeat must contain three integers >= 1")
+        out: list[int] = []
+        for raw in values:
+            if isinstance(raw, bool):
+                raise ValueError("repeat must contain three integers >= 1")
+            x = float(raw)
+            n = int(x)
+            if not math.isfinite(x) or x != float(n) or n < 1:
+                raise ValueError("repeat must contain three integers >= 1")
+            out.append(n)
+        return (out[0], out[1], out[2])
+
+    @field_validator("n_formula_units", mode="before")
+    @classmethod
+    def _nfu_positive_strict(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("n_formula_units must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("n_formula_units must be an integer >= 1")
+        return n
+
+    @field_validator("min_atoms", mode="before")
+    @classmethod
+    def _min_atoms_valid(cls, v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("min_atoms must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("min_atoms must be an integer >= 1")
+        return n
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _structure_seed_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("structure.generate.seed must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("structure.generate.seed must be an integer >= 0")
+        return n
+
+    @field_validator(
+        "target_density_g_cm3", "packing_density_g_cm3", "packing_min_distance_A",
+        mode="before",
+    )
+    @classmethod
+    def _optional_positive_structure_float(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("structure density/distance values must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("structure density/distance values must be finite and > 0")
+        return x
+
+    @field_validator("random_fallback_density_g_cm3", "random_min_distance", mode="before")
+    @classmethod
+    def _positive_structure_float(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("structure fallback density/distance values must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("structure fallback density/distance values must be finite and > 0")
+        return x
+
     @model_validator(mode="after")
     def _validate(self) -> "StructureGenerateConfig":
         if self.method == "cod":
-            # cod formula search
-            if self.cod_id is None and (self.formula is None or str(self.formula).strip() == ""):
-                raise ValueError("structure.generate.method='cod' requires 'formula' or 'cod_id'")
+            # Both COD search and post-fetch composition validation use formula.
+            pass
         elif self.method == "cif_url":
             if self.cif_url is None or str(self.cif_url).strip() == "":
                 raise ValueError("structure.generate.method='cif_url' requires 'cif_url'")
@@ -559,8 +1277,8 @@ class StructureGenerateConfig(BaseModel):
                 raise ValueError("structure.generate.method='poscar' requires 'poscar_path'")
             if self.formula is None or str(self.formula).strip() == "":
                 raise ValueError("structure.generate.method='poscar' requires 'formula'")
-            if not Path(self.poscar_path).exists():
-                raise FileNotFoundError(f"POSCAR file not found: {self.poscar_path}")
+            if not Path(self.poscar_path).is_file():
+                raise FileNotFoundError(f"POSCAR file not found or not a regular file: {self.poscar_path}")
         else:
             raise ValueError(f"Unsupported structure.generate.method: {self.method}")
 
@@ -591,14 +1309,6 @@ class StructureGenerateConfig(BaseModel):
             raise ValueError("packmol_cmd must be a non-empty string")
         return s
 
-    @field_validator("n_formula_units")
-    @classmethod
-    def _nfu_positive(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("n_formula_units must be >= 1")
-        return v
-
-
 class StructureConfig(BaseModel):
     """Structure config."""
 
@@ -609,13 +1319,42 @@ class StructureConfig(BaseModel):
     # mapping species charge
     charges: Optional[Dict[str, float]] = None
 
+    @field_validator("lammps_data", mode="before")
+    @classmethod
+    def _lammps_data_valid(cls, v: Any) -> Optional[Path]:
+        if v is None:
+            return None
+        if not str(v).strip():
+            raise ValueError("structure.lammps_data must be a non-empty file path")
+        return Path(str(v)).expanduser()
+
+    @field_validator("charges", mode="before")
+    @classmethod
+    def _charges_valid(cls, v: Any) -> Optional[dict[str, float]]:
+        if v is None:
+            return None
+        if not isinstance(v, Mapping) or not v:
+            raise ValueError("structure.charges must be a non-empty mapping")
+        out: dict[str, float] = {}
+        for raw_key, raw_value in v.items():
+            key = str(raw_key).strip()
+            if not key:
+                raise ValueError("structure.charges keys must be non-empty species names")
+            if isinstance(raw_value, bool):
+                raise ValueError(f"structure.charges[{key!r}] must be numeric")
+            value = float(raw_value)
+            if not math.isfinite(value):
+                raise ValueError(f"structure.charges[{key!r}] must be finite")
+            out[key] = value
+        return out
+
     @model_validator(mode="after")
     def _validate(self) -> "StructureConfig":
         if (self.lammps_data is None) == (self.generate is None):
             raise ValueError("structure must define exactly one of 'lammps_data' or 'generate'")
         if self.lammps_data is not None:
-            if not self.lammps_data.exists():
-                raise FileNotFoundError(f"Structure file not found: {self.lammps_data}")
+            if not self.lammps_data.is_file():
+                raise FileNotFoundError(f"Structure file not found or not a regular file: {self.lammps_data}")
         if self.charges is not None and len(self.charges) == 0:
             raise ValueError("structure.charges must be a non-empty mapping if provided")
         return self
@@ -651,9 +1390,11 @@ class ThermostatConfig(BaseModel):
         }
         return aliases.get(s, s)
 
-    @field_validator("tdamp")
+    @field_validator("tdamp", mode="before")
     @classmethod
-    def _tdamp_positive(cls, v: float) -> float:
+    def _tdamp_positive(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("thermostat.tdamp must be numeric")
         v = float(v)
         if not math.isfinite(v) or v <= 0.0:
             raise ValueError("thermostat.tdamp must be finite and > 0")
@@ -678,9 +1419,11 @@ class BarostatConfig(BaseModel):
         }
         return aliases.get(s, s)
 
-    @field_validator("pdamp")
+    @field_validator("pdamp", mode="before")
     @classmethod
-    def _pdamp_positive(cls, v: float) -> float:
+    def _pdamp_positive(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("barostat.pdamp must be numeric")
         v = float(v)
         if not math.isfinite(v) or v <= 0.0:
             raise ValueError("barostat.pdamp must be finite and > 0")
@@ -733,18 +1476,43 @@ class MDConfig(BaseModel):
     # never commands masses
     mass_mode: Literal['auto','kim','data'] = 'auto'
 
-    @field_validator("timestep")
+    @field_validator("timestep", mode="before")
     @classmethod
-    def _dt_positive(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("timestep must be > 0")
-        return v
+    def _dt_positive(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("timestep must be numeric, not boolean")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("timestep must be finite and > 0")
+        return x
 
-
-
-    @field_validator("neighbor_skin", "neighbor_skin_step", "neighbor_skin_max")
+    @field_validator("temperature", mode="before")
     @classmethod
-    def _skin_positive(cls, v: float) -> float:
+    def _temperature_positive(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("temperature must be numeric, not boolean")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("temperature must be finite and > 0")
+        return x
+
+    @field_validator("pressure", mode="before")
+    @classmethod
+    def _pressure_finite(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("pressure must be numeric, not boolean")
+        x = float(v)
+        if not math.isfinite(x):
+            raise ValueError("pressure must be finite")
+        return x
+
+
+
+    @field_validator("neighbor_skin", "neighbor_skin_step", "neighbor_skin_max", mode="before")
+    @classmethod
+    def _skin_positive(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("neighbour skin parameters must be numeric")
         v = float(v)
         if not math.isfinite(v) or v <= 0.0:
             raise ValueError("neighbour skin parameters must be finite and > 0")
@@ -755,12 +1523,16 @@ class MDConfig(BaseModel):
         if float(self.neighbor_skin_max) < float(self.neighbor_skin):
             raise ValueError("neighbor_skin_max must be >= neighbor_skin")
         return self
-    @field_validator("thermo_every", "dump_every")
+    @field_validator("thermo_every", "dump_every", mode="before")
     @classmethod
-    def _positive_int(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("frequency must be >= 1")
-        return v
+    def _positive_int(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("frequency must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("frequency must be an integer >= 1")
+        return n
 
 
 class TmScanConfig(BaseModel):
@@ -818,24 +1590,110 @@ class TmScanConfig(BaseModel):
         w_peak_height: float = 1.0
         w_peak_fwhm: float = 0.5
 
-        @field_validator("nbins", "frames", "stride", "smooth")
+        @field_validator("pair", mode="before")
         @classmethod
-        def _pos_int(cls, v: int) -> int:
-            if v < 1:
-                raise ValueError("value must be >= 1")
-            return v
+        def _pair_valid(cls, v: Any) -> Optional[tuple[AtomSelector, AtomSelector]]:
+            if v is None:
+                return None
+            return _validated_selector_tuple(v, size=2, field_name="tm_scan.gr.pair")  # type: ignore[return-value]
+
+        @field_validator("nbins", "frames", "stride", "smooth", mode="before")
+        @classmethod
+        def _pos_int(cls, v: Any) -> int:
+            if isinstance(v, bool):
+                raise ValueError("value must be an integer >= 1")
+            x = float(v)
+            n = int(x)
+            if not math.isfinite(x) or x != float(n) or n < 1:
+                raise ValueError("value must be an integer >= 1")
+            return n
 
         @field_validator("r_max")
         @classmethod
         def _rmax_pos(cls, v: float) -> float:
-            if v <= 0:
-                raise ValueError("r_max must be > 0")
-            return v
+            x = float(v)
+            if not math.isfinite(x) or x <= 0.0:
+                raise ValueError("r_max must be finite and > 0")
+            return x
+
+        @field_validator("r_ignore_factor", "r_search_factor", mode="before")
+        @classmethod
+        def _search_factor_valid(cls, v: Any) -> float:
+            if isinstance(v, bool):
+                raise ValueError("RDF search factors must be numeric")
+            x = float(v)
+            if not math.isfinite(x) or x <= 0.0:
+                raise ValueError("RDF search factors must be finite and > 0")
+            return x
+
+        @field_validator("w_diffusion", "w_peak_height", "w_peak_fwhm", mode="before")
+        @classmethod
+        def _weight_valid(cls, v: Any) -> float:
+            if isinstance(v, bool):
+                raise ValueError("RDF indicator weights must be numeric")
+            x = float(v)
+            if not math.isfinite(x) or x < 0.0:
+                raise ValueError("RDF indicator weights must be finite and >= 0")
+            return x
+
+        @model_validator(mode="after")
+        def _at_least_one_weight(self) -> "TmScanConfig.GrIndicatorConfig":
+            if max(self.w_diffusion, self.w_peak_height, self.w_peak_fwhm) <= 0.0:
+                raise ValueError("At least one RDF indicator weight must be > 0")
+            return self
 
     gr: GrIndicatorConfig = Field(default_factory=GrIndicatorConfig)
 
+    @field_validator("t_min", "t_max", "dT", mode="before")
+    @classmethod
+    def _temperature_grid_finite(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("temperature scan values must be numeric")
+        x = float(v)
+        if not math.isfinite(x):
+            raise ValueError("temperature scan values must be finite")
+        return x
+
+    @field_validator(
+        "replicates_per_temp", "liquid_top_k",
+        "liquid_min_consecutive", "sample_steps", "msd_every",
+        mode="before",
+    )
+    @classmethod
+    def _tm_positive_integer(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("temperature-scan counts must be integers >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("temperature-scan counts must be integers >= 1")
+        return n
+
+    @field_validator("equil_steps", mode="before")
+    @classmethod
+    def _tm_nonnegative_integer(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("tm_scan.equil_steps must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("tm_scan.equil_steps must be an integer >= 0")
+        return n
+
+    @field_validator("liquid_D_frac", mode="before")
+    @classmethod
+    def _liquid_fraction_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("liquid_D_frac must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or not (0.0 < x <= 1.0):
+            raise ValueError("liquid_D_frac must be finite and in (0,1]")
+        return x
+
     @model_validator(mode="after")
     def _validate(self) -> "TmScanConfig":
+        if self.t_min < 0.0:
+            raise ValueError("t_min must be >= 0")
         if self.t_max <= self.t_min:
             raise ValueError("t_max must be > t_min")
         if self.dT <= 0:
@@ -863,6 +1721,37 @@ class HighTConfig(BaseModel):
     # stationarity diagnostics autotune
     # stationarity metrics json
     enforce_stationarity: bool = False
+
+    @field_validator("replicates", "chunk_steps", "max_chunks", "min_total_steps", mode="before")
+    @classmethod
+    def _high_t_positive_integer(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("highT counts must be integers >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("highT counts must be integers >= 1")
+        return n
+
+    @field_validator("margin", "stationarity_tol", mode="before")
+    @classmethod
+    def _high_t_nonnegative_float(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("highT margin/tolerance values must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x < 0.0:
+            raise ValueError("highT margin/tolerance values must be finite and >= 0")
+        return x
+
+    @field_validator("rms_multiple", mode="before")
+    @classmethod
+    def _high_t_rms_multiple(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("highT.rms_multiple must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("highT.rms_multiple must be finite and > 0")
+        return x
 
     @model_validator(mode="after")
     def _validate(self) -> "HighTConfig":
@@ -898,6 +1787,66 @@ class QuenchConfig(BaseModel):
         default=10,
         validation_alias=AliasChoices("replicates_per_rate", "replicates"),
     )
+
+    @field_validator("t_final", mode="before")
+    @classmethod
+    def _t_final_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("quench.t_final must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x < 0.0:
+            raise ValueError("quench.t_final must be finite and >= 0")
+        return x
+
+    @field_validator("rate_min_K_per_ps", "rate_max_K_per_ps", mode="before")
+    @classmethod
+    def _rate_bound_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("quench rate bounds must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("quench rate bounds must be finite and > 0")
+        return x
+
+    @field_validator("rates_K_per_ps", "rates_K_per_time", mode="before")
+    @classmethod
+    def _rate_list_valid(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, (str, bytes)):
+            raise ValueError("quench rate lists must be sequences of finite values > 0")
+        values = list(v)
+        out: list[float] = []
+        for raw in values:
+            if isinstance(raw, bool):
+                raise ValueError("quench rates must be numeric, not boolean")
+            x = float(raw)
+            if not math.isfinite(x) or x <= 0.0:
+                raise ValueError("quench rates must be finite and > 0")
+            out.append(x)
+        return out
+
+    @field_validator("relax_steps", mode="before")
+    @classmethod
+    def _relax_steps_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("quench.relax_steps must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("quench.relax_steps must be an integer >= 0")
+        return n
+
+    @field_validator("n_rates", "replicates_per_rate", mode="before")
+    @classmethod
+    def _quench_positive_count(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("quench counts must be integers >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("quench counts must be integers >= 1")
+        return n
 
     @model_validator(mode="after")
     def _validate(self) -> "QuenchConfig":
@@ -939,6 +1888,38 @@ class SizeConfig(BaseModel):
     # safety scan autotuning
     # override disable filtering
     max_atoms: int = 1000
+
+    @field_validator("replicas", mode="before")
+    @classmethod
+    def _replicas_valid(cls, v: Any) -> list[tuple[int, int, int]]:
+        if not v:
+            raise ValueError("size.replicas must be non-empty")
+        out: list[tuple[int, int, int]] = []
+        for rep in v:
+            if len(rep) != 3:
+                raise ValueError("size.replicas entries must contain three integers >= 1")
+            parsed: list[int] = []
+            for raw in rep:
+                if isinstance(raw, bool):
+                    raise ValueError("size.replicas entries must contain three integers >= 1")
+                x = float(raw)
+                n = int(x)
+                if not math.isfinite(x) or x != float(n) or n < 1:
+                    raise ValueError("size.replicas entries must contain three integers >= 1")
+                parsed.append(n)
+            out.append((parsed[0], parsed[1], parsed[2]))
+        return out
+
+    @field_validator("replicates_per_size", "max_atoms", mode="before")
+    @classmethod
+    def _size_positive_count(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("size counts must be integers >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("size counts must be integers >= 1")
+        return n
 
 
 class ProductionEnsembleConfig(BaseModel):
@@ -984,6 +1965,20 @@ class ProductionEnsembleConfig(BaseModel):
     # output boxes pairs
     store_distributions: bool = True
 
+    # Optional embedding of full analysed final structures in result JSON.
+    # Defaults to historical embedded behaviour; analysis-only YAMLs may set
+    # this false to rely on manifest hashes and source paths instead.
+    embed_structures: bool = True
+
+    # Analysis-only scalability controls.  Production/run-production keep the
+    # historical serial behaviour unless users opt in.  Standalone
+    # analyze-output YAMLs for large final-structure ensembles may safely set
+    # analysis_workers to the desired core count; heavy graph sidecars are then
+    # streamed per box instead of accumulated in memory.
+    analysis_workers: int = 1
+    analysis_streaming: bool = True
+    analysis_max_in_flight: Optional[int] = None
+
     # coordination handling network
     # box exhibiting coordination
     # ensemble convergence structures
@@ -996,21 +1991,87 @@ class ProductionEnsembleConfig(BaseModel):
     # engine lammps
     dft_opt: "DftOptConfig" = Field(default_factory=lambda: DftOptConfig())
 
-    @field_validator("warmup_start_temperature")
+    @field_validator("analysis_workers", mode="before")
     @classmethod
-    def _warmup_start_temperature_valid(cls, v: float) -> float:
+    def _analysis_workers_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("analysis_workers must be an integer >= 1")
+        x = float(v)
+        iv = int(x)
+        if not math.isfinite(x) or x != float(iv) or iv < 1:
+            raise ValueError("analysis_workers must be an integer >= 1")
+        return iv
+
+    @field_validator("analysis_max_in_flight", mode="before")
+    @classmethod
+    def _analysis_max_in_flight_valid(cls, v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("analysis_max_in_flight must be an integer >= 1 when provided")
+        x = float(v)
+        iv = int(x)
+        if not math.isfinite(x) or x != float(iv) or iv < 1:
+            raise ValueError("analysis_max_in_flight must be an integer >= 1 when provided")
+        return iv
+
+    @field_validator(
+        "min_boxes",
+        "batch_boxes",
+        "consecutive_converged_checks",
+        "dump_every_steps",
+        "bondlen_cdf_points",
+        "angle_cdf_points",
+        mode="before",
+    )
+    @classmethod
+    def _positive_production_integer(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("production count/frequency values must be integers >= 1")
+        x = float(v)
+        iv = int(x)
+        if not math.isfinite(x) or x != float(iv) or iv < 1:
+            raise ValueError("production count/frequency values must be integers >= 1")
+        return iv
+
+    @field_validator("max_boxes", mode="before")
+    @classmethod
+    def _max_boxes_valid(cls, v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("production.max_boxes must be null or an integer >= 1")
+        x = float(v)
+        iv = int(x)
+        if not math.isfinite(x) or x != float(iv) or iv < 1:
+            raise ValueError("production.max_boxes must be null or an integer >= 1")
+        return iv
+
+    @field_validator("warmup_start_temperature", mode="before")
+    @classmethod
+    def _warmup_start_temperature_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("warmup_start_temperature must be numeric")
         v = float(v)
         if not math.isfinite(v) or v <= 0.0:
             raise ValueError("warmup_start_temperature must be finite and > 0")
         return v
 
-    @field_validator("warmup_duration_ps")
+    @field_validator("warmup_duration_ps", mode="before")
     @classmethod
-    def _warmup_duration_ps_valid(cls, v: float) -> float:
+    def _warmup_duration_ps_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("warmup_duration_ps must be numeric")
         v = float(v)
         if not math.isfinite(v) or v <= 0.0:
             raise ValueError("warmup_duration_ps must be finite and > 0")
         return v
+
+    @model_validator(mode="after")
+    def _production_counts_consistent(self) -> "ProductionEnsembleConfig":
+        if self.max_boxes is not None and int(self.max_boxes) < int(self.min_boxes):
+            raise ValueError("production.max_boxes must be >= production.min_boxes")
+        return self
 
 
 class DftOptConfig(BaseModel):
@@ -1033,12 +2094,28 @@ class DftOptConfig(BaseModel):
     # global print level
     print_level: Literal["LOW", "MEDIUM", "HIGH"] = "LOW"
 
-    @field_validator("max_iter", "traj_every")
+    @field_validator("max_iter", "traj_every", mode="before")
     @classmethod
-    def _pos_int(cls, v: int) -> int:
-        if int(v) < 1:
-            raise ValueError("value must be >= 1")
-        return int(v)
+    def _pos_int(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("value must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("value must be an integer >= 1")
+        return n
+
+    @field_validator("external_pressure_bar", mode="before")
+    @classmethod
+    def _external_pressure_finite(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("dft_opt.external_pressure_bar must be numeric")
+        x = float(v)
+        if not math.isfinite(x):
+            raise ValueError("dft_opt.external_pressure_bar must be finite")
+        return x
 
     @model_validator(mode="after")
     def _validate(self) -> "DftOptConfig":
@@ -1050,6 +2127,11 @@ class DftOptConfig(BaseModel):
 
 
 class ConvergenceConfig(BaseModel):
+    # An explicitly entered tolerance must be recognised.  This lets scan
+    # selection ignore calculated diagnostics that have no tolerance while
+    # still rejecting misspelled/unsupported convergence YAML keys.
+    model_config = ConfigDict(extra="forbid")
+
     # production ensemble convergence
     # confidence estimation precision
     # stability distribution nonparametric
@@ -1129,8 +2211,97 @@ class ConvergenceConfig(BaseModel):
     # distance empirical distributions
     stability_split: Literal["half", "last_batch"] = "half"
     stability_distance: Literal["wasserstein", "ks"] = "wasserstein"
+    # Dimensionless maximum empirical-CDF separation used only when
+    # stability_distance='ks'.  Descriptor-unit absolute tolerances cannot be
+    # compared to a Kolmogorov--Smirnov statistic.
+    stability_ks_tol: float = 0.10
     stability_bootstrap: int = 200
     stability_quantile: float = 0.95
+
+    # Every reported CI/stability assessment must be supported by strictly
+    # more than this fraction of the accepted ensemble.  The strict inequality
+    # is intentional: the default 0.5 requires at least six contributors in a
+    # ten-box ensemble, rather than allowing a half-ensemble diagnostic to be
+    # presented as an ensemble-wide result.
+    minimum_evidence_fraction: float = 0.5
+
+    @field_validator(
+        "density_rel_tol", "density_abs_tol",
+        "coord_rel_tol", "coord_abs_tol",
+        "bondlen_rel_tol", "bondlen_abs_tol",
+        "angle_rel_tol", "angle_abs_tol",
+        "ring_rel_tol", "ring_abs_tol",
+        "ring_size_rel_tol", "ring_size_abs_tol",
+        "gr_peak_r_rel_tol", "gr_peak_r_abs_tol",
+        "gr_peak_height_rel_tol", "gr_peak_height_abs_tol",
+        "gr_peak_fwhm_rel_tol", "gr_peak_fwhm_abs_tol",
+        "bondlen_cdf_rel_tol", "bondlen_cdf_abs_tol",
+        "angle_cdf_rel_tol", "angle_cdf_abs_tol",
+        "coord_cdf_rel_tol", "coord_cdf_abs_tol",
+        "gr_curve_rel_tol", "gr_curve_abs_tol",
+        "sq_curve_rel_tol", "sq_curve_abs_tol",
+        "void_cdf_rel_tol", "void_cdf_abs_tol",
+        "stability_ks_tol",
+        "minimum_evidence_fraction",
+        mode="before",
+    )
+    @classmethod
+    def _scientific_tolerance_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("convergence tolerances must be numeric, not boolean")
+        x = float(v)
+        if not math.isfinite(x) or x < 0.0:
+            raise ValueError("convergence tolerances must be finite and >= 0")
+        return x
+
+    @field_validator("stability_ks_tol")
+    @classmethod
+    def _stability_ks_tol_valid(cls, v: float) -> float:
+        x = float(v)
+        if x > 1.0:
+            raise ValueError("convergence.stability_ks_tol must be in [0,1]")
+        return x
+
+    @field_validator("minimum_evidence_fraction")
+    @classmethod
+    def _minimum_evidence_fraction_valid(cls, v: float) -> float:
+        x = float(v)
+        if not (0.0 <= x < 1.0):
+            raise ValueError(
+                "convergence.minimum_evidence_fraction must be in [0,1)"
+            )
+        return x
+
+    @field_validator("zscore", mode="before")
+    @classmethod
+    def _zscore_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("convergence.zscore must be numeric, not boolean")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("convergence.zscore must be finite and > 0")
+        return x
+
+    @field_validator("stability_bootstrap", mode="before")
+    @classmethod
+    def _stability_bootstrap_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("convergence.stability_bootstrap must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("convergence.stability_bootstrap must be an integer >= 0")
+        return n
+
+    @field_validator("stability_quantile", mode="before")
+    @classmethod
+    def _stability_quantile_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("convergence.stability_quantile must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or not (0.0 < x < 1.0):
+            raise ValueError("convergence.stability_quantile must be finite and in (0,1)")
+        return x
 
     @model_validator(mode="after")
     def _validate(self) -> "ConvergenceConfig":
@@ -1144,14 +2315,93 @@ class ConvergenceConfig(BaseModel):
 
 
 class AutoCutoffConfig(BaseModel):
-    """Auto cutoff config."""
+    """Configuration for legacy neighbour-cutoff estimation.
 
+    ``pooled_ensemble`` derives one shared cutoff map from all readable
+    structures (retaining the historical first-successful-box shared fallback
+    when pre-resolution is impossible), ``per_box`` derives an independent map
+    for each structure, and ``disabled`` forbids estimation (all required
+    legacy cutoffs must then be supplied explicitly by the metrics
+    configuration or analysis plan).
+    """
+
+    # Reject unknown/misspelled keys so a typo (e.g. `scoep:` or `r_maxx:`) fails
+    # loudly at config load instead of being silently ignored and falling back to
+    # the default. Matches ConvergenceConfig's strict policy.
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["pooled_ensemble", "per_box", "disabled"] = "pooled_ensemble"
     r_max: float = 8.0
     nbins: int = 400
     smooth: int = 7  # moving average preferred
     peak_search: Tuple[float, float] = (0.5, 4.0)
     min_search: Tuple[float, float] = (0.8, 6.0)
     fallback_factor: float = 1.3
+
+    @field_validator("r_max", "fallback_factor", mode="before")
+    @classmethod
+    def _positive_float_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("auto_cutoff numeric values must not be boolean")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("auto_cutoff numeric values must be finite and > 0")
+        return x
+
+    @field_validator("nbins", "smooth", mode="before")
+    @classmethod
+    def _integer_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("auto_cutoff bin/smoothing values must be integers")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n):
+            raise ValueError("auto_cutoff bin/smoothing values must be integers")
+        return n
+
+    @field_validator("peak_search", "min_search", mode="before")
+    @classmethod
+    def _range_valid(cls, v: Any) -> tuple[float, float]:
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("auto_cutoff search ranges must contain two numeric values")
+        values = list(v)
+        if len(values) != 2 or any(isinstance(item, bool) for item in values):
+            raise ValueError("auto_cutoff search ranges must contain two numeric values")
+        lo, hi = float(values[0]), float(values[1])
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            raise ValueError("auto_cutoff search ranges must be finite")
+        return (lo, hi)
+
+    @model_validator(mode="after")
+    def _validate(self) -> "AutoCutoffConfig":
+        self.r_max = float(self.r_max)
+        if not (math.isfinite(self.r_max) and self.r_max > 0.0):
+            raise ValueError("auto_cutoff.r_max must be finite and > 0")
+        self.nbins = int(self.nbins)
+        if self.nbins < 10:
+            raise ValueError("auto_cutoff.nbins must be >= 10")
+        self.smooth = int(self.smooth)
+        if self.smooth < 1:
+            raise ValueError("auto_cutoff.smooth must be >= 1")
+        if self.smooth % 2 == 0:
+            self.smooth += 1
+        for field_name in ("peak_search", "min_search"):
+            lo_raw, hi_raw = getattr(self, field_name)
+            lo, hi = float(lo_raw), float(hi_raw)
+            if not (
+                math.isfinite(lo)
+                and math.isfinite(hi)
+                and 0.0 <= lo < hi <= self.r_max
+            ):
+                raise ValueError(
+                    f"auto_cutoff.{field_name} must be a finite (min,max) "
+                    f"with 0 <= min < max <= r_max ({self.r_max:g})"
+                )
+            setattr(self, field_name, (lo, hi))
+        self.fallback_factor = float(self.fallback_factor)
+        if not (math.isfinite(self.fallback_factor) and self.fallback_factor > 0.0):
+            raise ValueError("auto_cutoff.fallback_factor must be finite and > 0")
+        return self
 
 
 class GrMetricConfig(BaseModel):
@@ -1161,6 +2411,45 @@ class GrMetricConfig(BaseModel):
     r_max: float = 8.0
     nbins: int = 400
     smooth: int = 7
+
+    @field_validator("pair", mode="before")
+    @classmethod
+    def _pair_valid(cls, v: Any) -> Optional[tuple[AtomSelector, AtomSelector]]:
+        if v is None:
+            return None
+        return _validated_selector_tuple(v, size=2, field_name="gr.pair")  # type: ignore[return-value]
+
+    @field_validator("r_max", mode="before")
+    @classmethod
+    def _gr_rmax_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("gr.r_max must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("gr.r_max must be finite and > 0")
+        return x
+
+    @field_validator("nbins", mode="before")
+    @classmethod
+    def _gr_nbins_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("gr.nbins must be an integer >= 10")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 10:
+            raise ValueError("gr.nbins must be an integer >= 10")
+        return n
+
+    @field_validator("smooth", mode="before")
+    @classmethod
+    def _gr_smooth_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("gr.smooth must be an integer >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("gr.smooth must be an integer >= 1")
+        return n
 
 
 class SqMetricConfig(BaseModel):
@@ -1183,6 +2472,47 @@ class SqMetricConfig(BaseModel):
     peak_search: Tuple[float, float] = (0.5, 3.0)
     smooth: int = 7
 
+    @field_validator("pair", mode="before")
+    @classmethod
+    def _pair_valid(cls, v: Any) -> Optional[tuple[AtomSelector, AtomSelector]]:
+        if v is None:
+            return None
+        return _validated_selector_tuple(v, size=2, field_name="sq.pair")  # type: ignore[return-value]
+
+    @field_validator("q_max", "r_max", mode="before")
+    @classmethod
+    def _positive_float_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("sq q/r limits must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("sq q/r limits must be finite and > 0")
+        return x
+
+    @field_validator("nq", "nbins", "smooth", mode="before")
+    @classmethod
+    def _integer_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("sq grid/smoothing values must be integers")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n):
+            raise ValueError("sq grid/smoothing values must be integers")
+        return n
+
+    @field_validator("peak_search", mode="before")
+    @classmethod
+    def _peak_range_valid(cls, v: Any) -> tuple[float, float]:
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("sq.peak_search must contain two numeric values")
+        values = list(v)
+        if len(values) != 2 or any(isinstance(item, bool) for item in values):
+            raise ValueError("sq.peak_search must contain two numeric values")
+        lo, hi = float(values[0]), float(values[1])
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            raise ValueError("sq.peak_search must contain finite values")
+        return (lo, hi)
+
     @model_validator(mode="after")
     def _validate(self) -> "SqMetricConfig":
         if not (math.isfinite(float(self.q_max)) and float(self.q_max) > 0.0):
@@ -1196,8 +2526,14 @@ class SqMetricConfig(BaseModel):
             raise ValueError("sq.nbins must be >= 50")
         self.nbins = int(self.nbins)
         a, b = self.peak_search
-        if not (math.isfinite(float(a)) and math.isfinite(float(b)) and float(b) > float(a) >= 0.0):
-            raise ValueError("sq.peak_search must be a (min,max) with 0<=min<max")
+        if not (
+            math.isfinite(float(a))
+            and math.isfinite(float(b))
+            and 0.0 <= float(a) < float(b) <= float(self.q_max)
+        ):
+            raise ValueError(
+                "sq.peak_search must be a (min,max) with 0 <= min < max <= q_max"
+            )
         if int(self.smooth) < 1:
             raise ValueError("sq.smooth must be >= 1")
         self.smooth = int(self.smooth)
@@ -1206,9 +2542,187 @@ class SqMetricConfig(BaseModel):
         return self
 
 
+
+
+class GraphRuleConfig(BaseModel):
+    """Explicit graph-induction rule for graph-derived descriptors."""
+
+    name: str = "graph_rule"
+    kind: Literal[
+        "hard_cutoff",
+        "hard_cutoff_sweep",
+        "hard_cutoff_interval",
+        "soft_logistic",
+        "rdf_adaptive",
+        "rdf_adaptive_hard_cutoff",
+        "rdf_adaptive_hard_cutoff_sweep",
+        "rdf_adaptive_hard_cutoff_interval",
+        "rdf_adaptive_soft_logistic",
+    ] = "hard_cutoff"
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    provenance: Any = "config"
+
+    @model_validator(mode="after")
+    def _validate(self) -> "GraphRuleConfig":
+        if str(self.name).strip() == "":
+            raise ValueError("graph_rules.name must be non-empty")
+        params = dict(self.parameters or {})
+
+        def _positive(value: Any, label: str) -> float:
+            if isinstance(value, bool):
+                raise ValueError(f"graph_rules.parameters.{label} must be numeric")
+            x = float(value)
+            if not math.isfinite(x) or x <= 0.0:
+                raise ValueError(
+                    f"graph_rules.parameters.{label} must be finite and > 0"
+                )
+            return x
+
+        adaptive_kind = self.kind == "rdf_adaptive" or self.kind.startswith("rdf_adaptive_")
+        for key in ("cutoff", "r0", "sigma", "r_min", "r_max", "search_radius"):
+            if key in params and params[key] not in (None, ""):
+                if adaptive_kind and key == "search_radius" and str(params[key]).strip().lower() == "auto":
+                    params[key] = "auto"
+                    continue
+                params[key] = _positive(params[key], key)
+        for key in ("points", "n"):
+            if key in params and params[key] is not None:
+                raw = params[key]
+                if isinstance(raw, bool):
+                    raise ValueError(f"graph_rules.parameters.{key} must be an integer >= 2")
+                numeric = float(raw)
+                integer = int(numeric)
+                if not math.isfinite(numeric) or numeric != float(integer) or integer < 2:
+                    raise ValueError(f"graph_rules.parameters.{key} must be an integer >= 2")
+                params[key] = integer
+
+        for key in ("bin_width", "smooth_width"):
+            if key in params and params[key] not in (None, ""):
+                params[key] = _positive(params[key], key)
+
+        if "min_weight" in params and params["min_weight"] not in (None, ""):
+            raw_weight = params["min_weight"]
+            if isinstance(raw_weight, bool):
+                raise ValueError("graph_rules.parameters.min_weight must be numeric")
+            min_weight = float(raw_weight)
+            if not math.isfinite(min_weight) or min_weight < 0.0 or min_weight > 1.0:
+                raise ValueError("graph_rules.parameters.min_weight must be finite and in [0,1]")
+            params["min_weight"] = min_weight
+
+        for key in ("connectivity_fraction", "target_largest_component_fraction"):
+            if key not in params or params[key] in (None, ""):
+                continue
+            raw_fraction = params[key]
+            if isinstance(raw_fraction, str) and raw_fraction.strip().lower() == "auto":
+                params[key] = "auto"
+                continue
+            if isinstance(raw_fraction, bool):
+                raise ValueError(f"graph_rules.parameters.{key} must be numeric or 'auto'")
+            fraction = float(raw_fraction)
+            if not math.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
+                raise ValueError(
+                    f"graph_rules.parameters.{key} must be finite and in (0,1], or 'auto'"
+                )
+            params[key] = fraction
+
+        def _validate_cutoff_collection(value: Any, label: str) -> Any:
+            if isinstance(value, Mapping):
+                if not value:
+                    raise ValueError(
+                        f"graph_rules.parameters.{label} must not be empty"
+                    )
+                return {
+                    str(k): _positive(v, f"{label}.{k}")
+                    for k, v in value.items()
+                }
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                if len(value) == 0:
+                    raise ValueError(
+                        f"graph_rules.parameters.{label} must not be empty"
+                    )
+                out: list[Any] = []
+                for index, item in enumerate(value):
+                    if isinstance(item, Mapping):
+                        row = dict(item)
+                        if "cutoff" not in row:
+                            raise ValueError(
+                                f"graph_rules.parameters.{label}[{index}] requires cutoff"
+                            )
+                        row["cutoff"] = _positive(
+                            row["cutoff"], f"{label}[{index}].cutoff"
+                        )
+                        out.append(row)
+                    else:
+                        out.append(_positive(item, f"{label}[{index}]"))
+                return out
+            raise ValueError(
+                f"graph_rules.parameters.{label} must be a cutoff mapping or sequence"
+            )
+
+        for key in ("cutoffs", "pair_cutoffs", "values", "r_values"):
+            if key in params and params[key] not in (None, ""):
+                params[key] = _validate_cutoff_collection(params[key], key)
+
+        if "r_min" in params and "r_max" in params:
+            if float(params["r_max"]) <= float(params["r_min"]):
+                raise ValueError("graph_rules parameters require r_max > r_min")
+        derive = str(params.get("derive_from", "")).strip().lower()
+        is_rdf_derived = derive in {
+            "rdf",
+            "rdf_minimum",
+            "rdf_first_minimum",
+            "pair_distribution",
+            "pair_distribution_function",
+            "shell_separability",
+        } or self.kind == "rdf_adaptive" or self.kind.startswith("rdf_adaptive_")
+        if self.kind == "hard_cutoff":
+            if "cutoff" not in params and "cutoffs" not in params and "pair_cutoffs" not in params:
+                # Empty hard_cutoff is allowed for legacy injection and for
+                # derive_from=pair_distribution_function rules resolved at
+                # descriptor time.
+                pass
+        elif self.kind == "hard_cutoff_sweep":
+            vals = params.get("cutoffs", params.get("values", params.get("r_values", None)))
+            has_range = "r_min" in params and "r_max" in params
+            if vals in (None, "") and not has_range and not is_rdf_derived:
+                raise ValueError("hard_cutoff_sweep graph rule requires cutoffs/values/r_values, r_min/r_max, or derive_from=pair_distribution_function")
+        elif self.kind == "hard_cutoff_interval":
+            if ("r_min" not in params or "r_max" not in params) and not is_rdf_derived:
+                raise ValueError("hard_cutoff_interval graph rule requires parameters.r_min and parameters.r_max, or derive_from=pair_distribution_function")
+        elif self.kind == "soft_logistic":
+            if not is_rdf_derived:
+                if "r0" not in params and "cutoff" not in params:
+                    raise ValueError("soft_logistic graph rule requires parameters.r0 (or cutoff alias)")
+                if "sigma" not in params:
+                    raise ValueError("soft_logistic graph rule requires parameters.sigma")
+        elif self.kind == "rdf_adaptive" or self.kind.startswith("rdf_adaptive_"):
+            # These rules intentionally do not contain a numeric cutoff. They are
+            # resolved per analysed structure from the pair distribution function.
+            pass
+        self.parameters = params
+        return self
+
+
 class PairMetricConfig(BaseModel):
     pair: Tuple[AtomSelector, AtomSelector]
     cutoff: Optional[float] = None
+
+    @field_validator("pair", mode="before")
+    @classmethod
+    def _pair_valid(cls, v: Any) -> tuple[AtomSelector, AtomSelector]:
+        return _validated_selector_tuple(v, size=2, field_name="pairs.pair")  # type: ignore[return-value]
+
+    @field_validator("cutoff", mode="before")
+    @classmethod
+    def _pair_cutoff_valid(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("pair cutoff must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("pair cutoff must be finite and > 0")
+        return x
 
 
 class CoordinationMetricConfig(BaseModel):
@@ -1223,6 +2737,66 @@ class CoordinationMetricConfig(BaseModel):
     allowed: Optional[list[int]] = None
     # box defective fraction
     defect_frac_tol: float = 0.0
+
+    @field_validator("central", "neighbor", mode="before")
+    @classmethod
+    def _selector_valid(cls, v: Any, info: Any) -> AtomSelector:
+        return _validated_atom_selector(v, field_name=f"coordinations.{info.field_name}")
+
+    @field_validator("expected", mode="before")
+    @classmethod
+    def _expected_valid(cls, v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("coordinations.expected must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("coordinations.expected must be an integer >= 0")
+        return n
+
+    @field_validator("allowed", mode="before")
+    @classmethod
+    def _allowed_valid(cls, v: Any) -> Optional[list[int]]:
+        if v is None:
+            return None
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("coordinations.allowed must be a non-empty list of integers >= 0")
+        values: list[int] = []
+        for raw in v:
+            if isinstance(raw, bool):
+                raise ValueError("coordinations.allowed must contain integers >= 0")
+            x = float(raw)
+            n = int(x)
+            if not math.isfinite(x) or x != float(n) or n < 0:
+                raise ValueError("coordinations.allowed must contain integers >= 0")
+            values.append(n)
+        if not values:
+            raise ValueError("coordinations.allowed must be a non-empty list of integers >= 0")
+        return values
+
+    @field_validator("defect_frac_tol", mode="before")
+    @classmethod
+    def _defect_fraction_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("coordinations.defect_frac_tol must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or not (0.0 <= x <= 1.0):
+            raise ValueError("coordinations.defect_frac_tol must be finite and in [0,1]")
+        return x
+
+    @field_validator("cutoff", mode="before")
+    @classmethod
+    def _coord_cutoff_valid(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("coordination cutoff must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("coordination cutoff must be finite and > 0")
+        return x
 
     @model_validator(mode="after")
     def _validate(self) -> "CoordinationMetricConfig":
@@ -1259,6 +2833,27 @@ class CoordinationSweepConfig(BaseModel):
     n_above: int = 10
     strained_delta: float = 0.10
 
+    @field_validator("n_below", "n_above", mode="before")
+    @classmethod
+    def _nonnegative_integer_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("coordination_sweep counts must be integers >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("coordination_sweep counts must be integers >= 0")
+        return n
+
+    @field_validator("dr", "strained_delta", mode="before")
+    @classmethod
+    def _finite_numeric_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("coordination_sweep numeric controls must not be boolean")
+        x = float(v)
+        if not math.isfinite(x):
+            raise ValueError("coordination_sweep numeric controls must be finite")
+        return x
+
     @model_validator(mode="after")
     def _validate(self) -> "CoordinationSweepConfig":
         if not (math.isfinite(float(self.dr)) and float(self.dr) > 0.0):
@@ -1276,6 +2871,11 @@ class AngleMetricConfig(BaseModel):
     # triplet central atom
     triplet: Tuple[AtomSelector, AtomSelector, AtomSelector]
 
+    @field_validator("triplet", mode="before")
+    @classmethod
+    def _triplet_valid(cls, v: Any) -> tuple[AtomSelector, AtomSelector, AtomSelector]:
+        return _validated_selector_tuple(v, size=3, field_name="angles.triplet")  # type: ignore[return-value]
+
 
 class RingMetricsConfig(BaseModel):
     enabled: bool = False
@@ -1290,6 +2890,35 @@ class RingMetricsConfig(BaseModel):
     max_paths_per_edge: int = 16  # enumeration shortest primitive
     # bond pairs cutoffs
     bond_pairs: list[PairMetricConfig] = Field(default_factory=list)
+
+    @field_validator("nodes", mode="before")
+    @classmethod
+    def _nodes_valid(cls, v: Any) -> list[AtomSelector]:
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("rings.nodes must be a list of atom selectors")
+        return [
+            _validated_atom_selector(item, field_name=f"rings.nodes[{index}]")
+            for index, item in enumerate(v)
+        ]
+
+    @field_validator("bridge", mode="before")
+    @classmethod
+    def _bridge_valid(cls, v: Any) -> Optional[AtomSelector]:
+        if v is None:
+            return None
+        return _validated_atom_selector(v, field_name="rings.bridge")
+
+    @field_validator("max_cycle_size", "max_paths_per_edge", mode="before")
+    @classmethod
+    def _ring_count_valid(cls, v: Any, info: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("ring limits must be integers")
+        x = float(v)
+        n = int(x)
+        minimum = 3 if info.field_name == "max_cycle_size" else 1
+        if not math.isfinite(x) or x != float(n) or n < minimum:
+            raise ValueError(f"rings.{info.field_name} must be an integer >= {minimum}")
+        return n
 
     @model_validator(mode="after")
     def _validate(self) -> "RingMetricsConfig":
@@ -1337,6 +2966,28 @@ class VoidMetricsConfig(BaseModel):
 
     # accessible fraction clearance
     probe_radii: list[float] = Field(default_factory=list)
+
+    @field_validator("n_samples", "n_samples_timeseries", "k_nearest", "cdf_points", mode="before")
+    @classmethod
+    def _void_count_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("void sampling counts must be integers")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n):
+            raise ValueError("void sampling counts must be integers")
+        return n
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _void_seed_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("voids.seed must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("voids.seed must be an integer >= 0")
+        return n
 
     @model_validator(mode="after")
     def _validate(self) -> "VoidMetricsConfig":
@@ -1477,8 +3128,14 @@ class AmorphousMetricsConfig(BaseModel):
         if self.smooth % 2 == 0:
             self.smooth += 1
         a, b = self.peak_search
-        if not (math.isfinite(float(a)) and math.isfinite(float(b)) and 0.0 <= float(a) < float(b)):
-            raise ValueError("amorphous.peak_search must satisfy 0 <= min < max")
+        if not (
+            math.isfinite(float(a))
+            and math.isfinite(float(b))
+            and 0.0 <= float(a) < float(b) <= float(self.q_max)
+        ):
+            raise ValueError(
+                "amorphous.peak_search must satisfy 0 <= min < max <= q_max"
+            )
         if not (math.isfinite(float(self.peak_prominence_min)) and float(self.peak_prominence_min) >= 0.0):
             raise ValueError("amorphous.peak_prominence_min must be >= 0")
         if not (math.isfinite(float(self.peak_height_min)) and float(self.peak_height_min) >= 0.0):
@@ -1538,6 +3195,41 @@ class ElasticScreenConfig(BaseModel):
     isotropy_warn_threshold: float = 0.15
     coupling_warn_threshold: float = 0.10
     hotspot_warn_multiple_of_median: float = 5.0
+
+    @field_validator(
+        "stage_timeseries_frame_stride",
+        "stage_timeseries_max_frames",
+        "quench_tail_min_frames",
+        mode="before",
+    )
+    @classmethod
+    def _positive_integer_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("elastic sampling counts must be integers >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("elastic sampling counts must be integers >= 1")
+        return n
+
+    @field_validator(
+        "born_delta",
+        "quench_tail_focus_fraction",
+        "quench_tail_fallback_fraction",
+        "diffusion_freeze_threshold_A2_per_ps",
+        "isotropy_warn_threshold",
+        "coupling_warn_threshold",
+        "hotspot_warn_multiple_of_median",
+        mode="before",
+    )
+    @classmethod
+    def _finite_numeric_valid(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("elastic numeric controls must not be boolean")
+        x = float(v)
+        if not math.isfinite(x):
+            raise ValueError("elastic numeric controls must be finite")
+        return x
 
     @model_validator(mode="after")
     def _validate(self) -> "ElasticScreenConfig":
@@ -1603,6 +3295,14 @@ class StructureMetricsConfig(BaseModel):
     # kim interactions
     type_to_species: Optional[list[str]] = None
 
+    # Optional material profile.  Core analysis must not hard-code material
+    # chemistry; profile-dependent descriptors report not_applicable when the
+    # required assumptions are absent.
+    material_profile: Dict[str, Any] = Field(default_factory=dict)
+
+    # graph induction rules for graph-derived descriptors
+    graph_rules: list[GraphRuleConfig] = Field(default_factory=list)
+
     # metrics
     pairs: list[PairMetricConfig] = Field(default_factory=list)
     coordinations: list[CoordinationMetricConfig] = Field(default_factory=list)
@@ -1617,18 +3317,47 @@ class StructureMetricsConfig(BaseModel):
 
     auto_cutoff: AutoCutoffConfig = Field(default_factory=AutoCutoffConfig)
 
+    @field_validator("type_to_species", mode="before")
+    @classmethod
+    def _type_to_species_valid(cls, v: Any) -> Optional[list[str]]:
+        if v is None:
+            return None
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes, bytearray)):
+            raise ValueError("metrics.type_to_species must be a non-empty species list")
+        if any(not isinstance(item, str) for item in v):
+            raise ValueError("metrics.type_to_species entries must be strings")
+        values = [item.strip() for item in v]
+        if not values or any(not item for item in values):
+            raise ValueError("metrics.type_to_species must contain only non-empty species names")
+        return values
+
     @field_validator(
         "time_average_frames",
         "time_average_stride",
         "stage_timeseries_frame_stride",
         "stage_timeseries_max_frames",
         "quench_tail_min_frames",
+        mode="before",
     )
     @classmethod
-    def _pos_int(cls, v: int) -> int:
-        if v < 1:
-            raise ValueError("value must be >= 1")
-        return v
+    def _pos_int(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("metrics sampling counts must be integers >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("metrics sampling counts must be integers >= 1")
+        return n
+
+    @field_validator("quench_tail_focus_fraction", "quench_tail_fallback_fraction", mode="before")
+    @classmethod
+    def _tail_fraction_finite(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("metrics quench-tail fractions must be numeric")
+        x = float(v)
+        if not math.isfinite(x):
+            raise ValueError("metrics quench-tail fractions must be finite")
+        return x
 
 
     @model_validator(mode="after")
@@ -1722,6 +3451,87 @@ class PreflightConfig(BaseModel):
     max_press_abs: float = 1.0e7
     max_vol_ratio: float = 3.0
 
+    @field_validator("equil_steps", "confirm_equil_steps", mode="before")
+    @classmethod
+    def _preflight_nonnegative_count(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("preflight equilibration counts must be integers >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("preflight equilibration counts must be integers >= 0")
+        return n
+
+    @field_validator("run_steps", "tail_window", "confirm_run_steps", "confirm_topk", mode="before")
+    @classmethod
+    def _preflight_positive_count(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("preflight counts must be integers >= 1")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 1:
+            raise ValueError("preflight counts must be integers >= 1")
+        return n
+
+    @field_validator("T_low", "T_high", mode="before")
+    @classmethod
+    def _preflight_optional_temperature(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("preflight temperatures must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("preflight temperatures must be finite and > 0")
+        return x
+
+    @field_validator("confirm_temps", mode="before")
+    @classmethod
+    def _preflight_confirm_temperatures(cls, v: Any) -> Optional[list[float]]:
+        if v is None:
+            return None
+        values: list[float] = []
+        for raw in list(v):
+            if isinstance(raw, bool):
+                raise ValueError("preflight.confirm_temps must contain numeric temperatures")
+            x = float(raw)
+            if not math.isfinite(x) or x <= 0.0:
+                raise ValueError("preflight.confirm_temps must contain finite values > 0")
+            values.append(x)
+        if not values:
+            raise ValueError("preflight.confirm_temps must be non-empty when provided")
+        return values
+
+    @field_validator("min_pdamp_ps_highT", "timeout_sec", mode="before")
+    @classmethod
+    def _preflight_positive_float(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("preflight duration values must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x <= 0.0:
+            raise ValueError("preflight duration values must be finite and > 0")
+        return x
+
+    @field_validator("temp_rel_tol", "press_abs_tol", mode="before")
+    @classmethod
+    def _preflight_nonnegative_float(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("preflight tolerances must be numeric")
+        x = float(v)
+        if not math.isfinite(x) or x < 0.0:
+            raise ValueError("preflight tolerances must be finite and >= 0")
+        return x
+
+    @field_validator("max_temp_factor", "max_press_abs", "max_vol_ratio", mode="before")
+    @classmethod
+    def _preflight_safety_finite(cls, v: Any) -> float:
+        if isinstance(v, bool):
+            raise ValueError("preflight safety limits must be numeric")
+        x = float(v)
+        if not math.isfinite(x):
+            raise ValueError("preflight safety limits must be finite")
+        return x
+
     @field_validator("equil_steps")
     @classmethod
     def _equil_nonneg(cls, v: int) -> int:
@@ -1764,22 +3574,26 @@ class PreflightConfig(BaseModel):
             raise ValueError("confirm_topk must be >= 1")
         return int(v)
 
-    @field_validator("tdamp_factors", "pdamp_factors")
+    @field_validator("tdamp_factors", "pdamp_factors", mode="before")
     @classmethod
     def _factors_valid(cls, v: list[float]) -> list[float]:
         if v is None or len(v) == 0:
             raise ValueError("scan factor list must be non-empty")
         vv = [float(x) for x in v]
-        if any(x <= 0 for x in vv):
-            raise ValueError("scan factors must be > 0")
+        if any((not math.isfinite(x)) or x <= 0.0 for x in vv):
+            raise ValueError("scan factors must be finite and > 0")
         return vv
 
-    @field_validator("dt_candidates")
+    @field_validator("dt_candidates", mode="before")
     @classmethod
-    def _dt_candidates_valid(cls, v: Optional[list[float]]) -> Optional[list[float]]:
+    def _dt_candidates_valid(cls, v: Any) -> Optional[list[float]]:
         if v is None:
             return None
-        vv = [float(x) for x in v]
+        vv: list[float] = []
+        for raw in list(v):
+            if isinstance(raw, bool):
+                raise ValueError("dt_candidates must contain numeric values")
+            vv.append(float(raw))
         if len(vv) == 0:
             return None
         if any((not math.isfinite(x)) or x <= 0.0 for x in vv):
@@ -1830,10 +3644,32 @@ class RunConfig(BaseModel):
     md: MDConfig = Field(default_factory=MDConfig)
     autotune: AutoTuneConfig = Field(default_factory=AutoTuneConfig)
 
+    # Separate run-custom extension blocks. Their complete, alias-aware schema
+    # is validated by workflows.custom_schedule before execution; declaring
+    # them here keeps the strict top-level model from discarding a supported
+    # feature while all other unknown top-level keys remain forbidden.
+    custom_schedule: Optional[Dict[str, Any]] = None
+    hardcarbon_schedule: Optional[Dict[str, Any]] = None
+
     random_seed: int = 12345
+
+    @field_validator("random_seed", mode="before")
+    @classmethod
+    def _random_seed_valid(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("random_seed must be an integer >= 0")
+        x = float(v)
+        n = int(x)
+        if not math.isfinite(x) or x != float(n) or n < 0:
+            raise ValueError("random_seed must be an integer >= 0")
+        return n
 
     @model_validator(mode="after")
     def _validate_engine_requirements(self) -> "RunConfig":
+        if self.custom_schedule is not None and self.hardcarbon_schedule is not None:
+            raise ValueError(
+                "Specify only one of custom_schedule or hardcarbon_schedule; neither block is silently ignored"
+            )
         eng = str(self.engine).strip().lower()
         if eng == "lammps":
             if self.kim is None:
@@ -1882,17 +3718,10 @@ class RunConfig(BaseModel):
                     "autotune.production.dft_opt.enabled=true requires autotune.production.check_convergence=true"
                 )
 
-            # density convergence lammps
-            # mismatches restrict refinement
-            # lammps density convertible
-            if eng == "lammps" and self.kim is not None:
-                u = str(getattr(self.kim, "user_units", "")).strip().lower()
-                if u and u not in ("metal", "real", "si", "cgs"):
-                    raise ValueError(
-                        "autotune.production.dft_opt is only supported for LAMMPS units styles in "
-                        "{metal, real, si, cgs} (density-unit compatibility with CP2K). "
-                        f"Got user_units={u!r}."
-                    )
+            # Every accepted LAMMPS potential style is dimensional and has an
+            # exact native<->canonical mapping.  DFT refinement operates on
+            # canonical ASE/CP2K quantities, so no narrower unit whitelist is
+            # scientifically necessary here.
         return self
 
     @classmethod
@@ -1900,12 +3729,6 @@ class RunConfig(BaseModel):
         data = yaml.safe_load(path.read_text())
 
         base = path.parent
-
-        # Errors expected during pre-validation rewrites: malformed nesting,
-        # bad path strings, filesystem failures. Any other exception bubbles up
-        # so genuine bugs are not silenced. The previous bare `except Exception`
-        # masked unrelated failures and made debugging YAML parsing intractable.
-        _PATH_REWRITE_EXC = (AttributeError, TypeError, ValueError, OSError)
 
         def _strip_overlap(base_dir: Path, rel: Path) -> Path:
             bparts = base_dir.parts
@@ -1918,48 +3741,69 @@ class RunConfig(BaseModel):
             return rel
 
         def _resolve_with_overlap(raw_path: str) -> str:
-            p = Path(raw_path)
+            p = Path(raw_path).expanduser()
             if p.is_absolute():
                 return str(p.resolve(strict=False))
             p2 = _strip_overlap(base, p)
-            candidates: list[Path] = []
-            candidates.append((base / p2))
+            candidates = [base / p2]
             if p2 != p:
-                candidates.append((base / p))
-            for parent in base.parents:
-                candidates.append(parent / p2)
-                if p2 != p:
-                    candidates.append(parent / p)
-            candidates.append(Path.cwd() / p2)
-            if p2 != p:
-                candidates.append(Path.cwd() / p)
-            for c in candidates:
-                if c.exists():
-                    return str(c.resolve(strict=False))
-            return str((base / p2).resolve(strict=False))
+                candidates.append(base / p)
+            resolved: list[Path] = []
+            for candidate in candidates:
+                normal = candidate.resolve(strict=False)
+                if normal not in resolved:
+                    resolved.append(normal)
+            existing = [candidate for candidate in resolved if candidate.exists()]
+            if len(existing) > 1:
+                raise ValueError(
+                    f"Ambiguous YAML-relative path {raw_path!r}; candidates exist at "
+                    + ", ".join(str(candidate) for candidate in existing)
+                )
+            if existing:
+                return str(existing[0])
+            # Missing paths retain one deterministic YAML-relative spelling so
+            # the owning field validator/execution preflight can report them.
+            # Never search ancestor directories or process CWD: doing so can
+            # silently bind an unrelated same-name scientific input.
+            return str(resolved[0])
 
-        try:
-            s = data.get("structure", {})
-            if isinstance(s, dict) and "lammps_data" in s and s["lammps_data"] is not None:
-                s["lammps_data"] = _resolve_with_overlap(str(s["lammps_data"]))
-        except _PATH_REWRITE_EXC:
-            pass
+        s = data.get("structure", {}) if isinstance(data, dict) else {}
+        if isinstance(s, dict) and "lammps_data" in s and s["lammps_data"] is not None:
+            if not str(s["lammps_data"]).strip():
+                raise ValueError("structure.lammps_data must be a non-empty file path")
+            s["lammps_data"] = _resolve_with_overlap(str(s["lammps_data"]))
 
-        try:
-            s = data.get("structure", {})
-            g = s.get("generate", {}) if isinstance(s, dict) else {}
-            if isinstance(g, dict) and g.get("poscar_path", None) is not None:
-                g["poscar_path"] = _resolve_with_overlap(str(g.get("poscar_path")))
-        except _PATH_REWRITE_EXC:
-            pass
+        g = s.get("generate", {}) if isinstance(s, dict) else {}
+        if isinstance(g, dict) and g.get("poscar_path", None) is not None:
+            if not str(g.get("poscar_path")).strip():
+                raise ValueError("structure.generate.poscar_path must be a non-empty file path")
+            g["poscar_path"] = _resolve_with_overlap(str(g.get("poscar_path")))
 
-        # potential.files: reject null entries up front (BEFORE the path
-        # rewriting try/except below). YAML constructs like `files: [null]`,
+        # CP2K path-bearing inputs use the same YAML-relative resolution as
+        # structures and potential files. Bare BASIS/POTENTIAL filenames are
+        # deliberately left unchanged so CP2K_DATA_DIR/package lookup remains
+        # available; path-qualified names become absolute and unambiguous.
+        cp2k = data.get("cp2k", {}) if isinstance(data, dict) else {}
+        if isinstance(cp2k, dict):
+            if cp2k.get("data_dir", None) is not None:
+                if not str(cp2k.get("data_dir")).strip():
+                    raise ValueError("cp2k.data_dir must be omitted/null or a non-empty directory path")
+                else:
+                    cp2k["data_dir"] = _resolve_with_overlap(str(cp2k.get("data_dir")))
+            for field_name in ("basis_set_file_name", "potential_file_name"):
+                raw_value = cp2k.get(field_name, None)
+                if raw_value is None:
+                    continue
+                raw_text = str(raw_value)
+                raw_path = Path(raw_text).expanduser()
+                if not raw_path.is_absolute() and ("/" in raw_text or "\\" in raw_text):
+                    cp2k[field_name] = _resolve_with_overlap(raw_text)
+
+        # potential.files: reject null entries before path rewriting. YAML
+        # constructs like `files: [null]`,
         # `files: [~]`, or a stray trailing `-` parse as None and used to be
         # silently dropped here, leaving the user with a config that did not
         # match their YAML. Raise instead so the typo is fixed at the source.
-        # This raise must escape the broad `except _PATH_REWRITE_EXC` swallow
-        # below; that's why the check sits OUTSIDE the try block.
         if isinstance(data, dict):
             _pot_key = "potential" if "potential" in data else ("kim" if "kim" in data else None)
             if _pot_key is not None:
@@ -1979,20 +3823,21 @@ class RunConfig(BaseModel):
         # potential.files now uses the same overlap-stripping heuristic as
         # structure.lammps_data and structure.generate.poscar_path so YAML-relative
         # potential file lists behave consistently across fields.
-        try:
-            key = "potential" if isinstance(data, dict) and "potential" in data else "kim"
-            pot = data.get(key, {}) if isinstance(data, dict) else {}
-            if isinstance(pot, dict) and pot.get("files", None) is not None:
-                files = pot.get("files")
-                if isinstance(files, (list, tuple)):
-                    out_files: list[str] = []
-                    for rawf in files:
-                        # None entries were rejected upfront; reaching this
-                        # branch with a None would be a programming error.
-                        out_files.append(_resolve_with_overlap(str(rawf)))
-                    pot["files"] = out_files
-        except _PATH_REWRITE_EXC:
-            pass
+        key = "potential" if isinstance(data, dict) and "potential" in data else "kim"
+        pot = data.get(key, {}) if isinstance(data, dict) else {}
+        if isinstance(pot, dict) and pot.get("files", None) is not None:
+            files = pot.get("files")
+            if isinstance(files, (list, tuple)):
+                out_files: list[str] = []
+                for index, rawf in enumerate(files):
+                    # None entries were rejected above; reaching this branch
+                    # with one would be a programming error.
+                    if not str(rawf).strip():
+                        raise ValueError(
+                            f"{key}.files entry at index {index} must be a non-empty path"
+                        )
+                    out_files.append(_resolve_with_overlap(str(rawf)))
+                pot["files"] = out_files
 
         return cls.model_validate(data)
 
@@ -2010,4 +3855,3 @@ class RunConfig(BaseModel):
                     "kim.core_repulsion.enabled requires kim.interactions to be a non-empty list (species ordering)"
                 )
         return self
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Optional, Sequence
@@ -7,10 +8,47 @@ from typing import Optional, Sequence
 import numpy as np
 
 from ..analysis.dump import DumpFrame
+from ..lammps_units import (
+    charge_to_elementary_factor,
+    length_from_angstrom_factor,
+    length_to_angstrom_factor,
+    mass_to_amu_factor,
+)
 
 
 _RE_ATOMS = re.compile(r"^\s*(\d+)\s+atoms\s*$", re.IGNORECASE)
 _RE_TYPES = re.compile(r"^\s*(\d+)\s+atom\s+types\s*$", re.IGNORECASE)
+
+# Section names that can legally follow ``Masses`` or ``Atoms``.  Recognising
+# them explicitly is important: coefficient rows are numeric and must never be
+# mistaken for masses or atoms by this deliberately small reader.
+_SECTION_HEADS = {
+    "masses",
+    "atoms",
+    "velocities",
+    "ellipsoids",
+    "lines",
+    "triangles",
+    "bodies",
+    "bonds",
+    "angles",
+    "dihedrals",
+    "impropers",
+    "pair coeffs",
+    "pairij coeffs",
+    "bond coeffs",
+    "angle coeffs",
+    "dihedral coeffs",
+    "improper coeffs",
+    "bondbond coeffs",
+    "bondangle coeffs",
+    "middlebondtorsion coeffs",
+    "endbondtorsion coeffs",
+    "angletorsion coeffs",
+    "angleangletorsion coeffs",
+    "bondbond13 coeffs",
+    "angleangle coeffs",
+}
 
 
 def read_lammps_data_minimal(
@@ -18,8 +56,9 @@ def read_lammps_data_minimal(
     *,
     atom_style: str = "atomic",
     specorder: Optional[Sequence[str]] = None,
+    units_style: str = "metal",
 ):
-    """Lammps data minimal."""
+    """Read native LAMMPS data into canonical ASE units (A, u, e)."""
 
     from ase import Atoms
 
@@ -35,6 +74,24 @@ def read_lammps_data_minimal(
 
     def _strip(ln: str) -> str:
         return ln.split("#", 1)[0].strip()
+
+    def _section_name(ln: str) -> Optional[str]:
+        key = " ".join(ln.lower().split())
+        return key if key in _SECTION_HEADS else None
+
+    def _integer_field(token: str, *, field: str, line_number: int) -> int:
+        try:
+            value = float(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {field} at {path}:{line_number}: {token!r}"
+            ) from exc
+        if not np.isfinite(value) or not value.is_integer():
+            raise ValueError(
+                f"Invalid {field} at {path}:{line_number}: expected an integer, "
+                f"got {token!r}"
+            )
+        return int(value)
 
     # header scan
     for raw in lines[:400]:
@@ -64,8 +121,15 @@ def read_lammps_data_minimal(
         raise ValueError(f"Failed to parse '<N> atoms' from {path}")
     if n_types is None:
         raise ValueError(f"Failed to parse '<N> atom types' from {path}")
+    if n_atoms < 1 or n_types < 1:
+        raise ValueError(f"LAMMPS data header in {path} must declare positive atom/type counts")
     if xhi is None or yhi is None or zhi is None:
         raise ValueError(f"Failed to parse box bounds (xlo/xhi etc.) from {path}")
+    bounds_and_tilts = np.asarray(
+        [xlo, xhi, ylo, yhi, zlo, zhi, xy, xz, yz], dtype=float
+    )
+    if not np.all(np.isfinite(bounds_and_tilts)):
+        raise ValueError(f"LAMMPS box bounds and tilt factors in {path} must be finite")
 
     lx = float(xhi - xlo)
     ly = float(yhi - ylo)
@@ -82,6 +146,11 @@ def read_lammps_data_minimal(
         ],
         dtype=float,
     )
+    cell_scale = float(np.max(np.abs(cell)))
+    det = float(np.linalg.det(cell))
+    det_tol = 128.0 * np.finfo(float).eps * max(cell_scale**3, np.finfo(float).tiny)
+    if not np.all(np.isfinite(cell)) or not math.isfinite(det) or abs(det) <= det_tol:
+        raise ValueError(f"LAMMPS cell in {path} must be finite and nonsingular")
 
     # sections
     masses_by_type: dict[int, float] = {}
@@ -100,28 +169,43 @@ def read_lammps_data_minimal(
         elif head == "atoms":
             idx_atoms = i
             if "#" in raw:
-                try:
-                    atoms_style_in_file = raw.split("#", 1)[1].strip().split()[0].lower()
-                except Exception:
-                    atoms_style_in_file = None
+                style_comment = raw.split("#", 1)[1].strip().split()
+                atoms_style_in_file = style_comment[0].lower() if style_comment else None
 
     if idx_masses is not None:
-        for raw in lines[idx_masses + 1 :]:
+        for line_number, raw in enumerate(lines[idx_masses + 1 :], start=idx_masses + 2):
             ln = _strip(raw)
             if not ln:
                 continue
-            head = ln.split()[0].lower()
-            if head in {"atoms", "velocities", "bonds", "angles", "dihedrals", "impropers"}:
+            if _section_name(ln) is not None:
                 break
             toks = ln.split()
-            if len(toks) >= 2:
-                try:
-                    t = int(float(toks[0]))
-                    m = float(toks[1])
-                    if t >= 1:
-                        masses_by_type[int(t)] = float(m)
-                except Exception:
-                    pass
+            if len(toks) < 2:
+                raise ValueError(
+                    f"Malformed mass row at {path}:{line_number}: expected type and mass"
+                )
+            t = _integer_field(toks[0], field="mass atom type", line_number=line_number)
+            if not 1 <= t <= n_types:
+                raise ValueError(
+                    f"Mass atom type out of range at {path}:{line_number}: "
+                    f"{t} not in [1, {n_types}]"
+                )
+            try:
+                mass = float(toks[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid mass at {path}:{line_number}: {toks[1]!r}"
+                ) from exc
+            if not np.isfinite(mass) or mass <= 0.0:
+                raise ValueError(
+                    f"Mass must be finite and positive at {path}:{line_number}; "
+                    f"got {toks[1]!r} for atom type {t}"
+                )
+            if t in masses_by_type:
+                raise ValueError(
+                    f"Duplicate mass entry for atom type {t} at {path}:{line_number}"
+                )
+            masses_by_type[t] = mass
 
     if idx_atoms is None:
         raise ValueError(f"Failed to find 'Atoms' section in {path}")
@@ -135,37 +219,64 @@ def read_lammps_data_minimal(
     pos: list[list[float]] = []
     charges: list[float] = []
 
-    for raw in lines[idx_atoms + 1 :]:
+    for line_number, raw in enumerate(lines[idx_atoms + 1 :], start=idx_atoms + 2):
         ln = _strip(raw)
         if not ln:
             continue
-        head = ln.split()[0].lower()
-        if head in {"velocities", "bonds", "angles", "dihedrals", "impropers", "masses"}:
+        if _section_name(ln) is not None:
             break
         toks = ln.split()
         if style == "charge":
             if len(toks) < 6:
-                continue
-            i0 = int(float(toks[0]))
-            t0 = int(float(toks[1]))
-            q0 = float(toks[2])
-            x, y, z = float(toks[3]), float(toks[4]), float(toks[5])
+                raise ValueError(
+                    f"Malformed charge atom row at {path}:{line_number}: expected "
+                    "id, type, charge, x, y, z"
+                )
+            i0 = _integer_field(toks[0], field="atom id", line_number=line_number)
+            t0 = _integer_field(toks[1], field="atom type", line_number=line_number)
+            try:
+                q0 = float(toks[2])
+                x, y, z = float(toks[3]), float(toks[4]), float(toks[5])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid numeric charge atom row at {path}:{line_number}"
+                ) from exc
+            if not np.isfinite(q0):
+                raise ValueError(
+                    f"Charge must be finite at {path}:{line_number}; got {toks[2]!r}"
+                )
             ids.append(i0)
             types.append(t0)
             charges.append(q0)
             pos.append([x - xlo, y - ylo, z - zlo])
         else:
             if len(toks) < 5:
-                continue
-            i0 = int(float(toks[0]))
-            t0 = int(float(toks[1]))
-            x, y, z = float(toks[2]), float(toks[3]), float(toks[4])
+                raise ValueError(
+                    f"Malformed atomic atom row at {path}:{line_number}: expected "
+                    "id, type, x, y, z"
+                )
+            i0 = _integer_field(toks[0], field="atom id", line_number=line_number)
+            t0 = _integer_field(toks[1], field="atom type", line_number=line_number)
+            try:
+                x, y, z = float(toks[2]), float(toks[3]), float(toks[4])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid numeric atomic atom row at {path}:{line_number}"
+                ) from exc
             ids.append(i0)
             types.append(t0)
             pos.append([x - xlo, y - ylo, z - zlo])
 
-    if len(ids) == 0:
-        raise ValueError(f"Failed to parse any atoms from {path}")
+    if len(ids) != n_atoms:
+        raise ValueError(
+            f"Atom-count mismatch in {path}: header declares {n_atoms}, parsed {len(ids)}"
+        )
+    if len(set(ids)) != len(ids) or any(atom_id <= 0 for atom_id in ids):
+        raise ValueError(f"Atom IDs in {path} must be unique positive integers")
+    if any(t < 1 or t > n_types for t in types):
+        raise ValueError(f"Atom types in {path} must lie in [1, {n_types}]")
+    if not np.all(np.isfinite(np.asarray(pos, dtype=float))):
+        raise ValueError(f"Atom positions in {path} must be finite")
 
     order = np.argsort(np.asarray(ids, dtype=int))
     types_arr = np.asarray(types, dtype=int)[order]
@@ -179,22 +290,40 @@ def read_lammps_data_minimal(
     else:
         symbols = [f"X{int(t)}" for t in types_arr.tolist()]
 
-    atoms = Atoms(symbols=symbols, positions=pos_arr, cell=cell, pbc=True)
+    length_factor = float(length_to_angstrom_factor(units_style))
+    atoms = Atoms(
+        symbols=symbols,
+        positions=pos_arr * length_factor,
+        cell=cell * length_factor,
+        pbc=True,
+    )
 
-    # assign atom masses
-    try:
-        if masses_by_type:
-            m = [float(masses_by_type.get(int(t), atoms[i].mass)) for i, t in enumerate(types_arr.tolist())]
-            atoms.set_masses(m)
-    except Exception:
-        pass
+    # Assign explicitly provided native masses.  Once a Masses section exists,
+    # every atom type used by this structure must be covered; falling back to
+    # periodic-table defaults would silently change isotopes or custom masses.
+    if idx_masses is not None:
+        used_types = set(int(t) for t in types_arr.tolist())
+        missing = sorted(used_types.difference(masses_by_type))
+        if missing:
+            raise ValueError(
+                f"Masses section in {path} does not cover used atom types {missing}"
+            )
+        mass_factor = float(mass_to_amu_factor(units_style))
+        converted_masses = np.asarray(
+            [masses_by_type[int(t)] * mass_factor for t in types_arr.tolist()],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(converted_masses)) or np.any(converted_masses <= 0.0):
+            raise ValueError(f"Converted masses from {path} must be finite and positive")
+        atoms.set_masses(converted_masses)
 
     if style == "charge":
-        try:
-            q = np.asarray(charges, dtype=float)[order]
-            atoms.set_initial_charges(q)
-        except Exception:
-            pass
+        q = np.asarray(charges, dtype=float)[order] * float(
+            charge_to_elementary_factor(units_style)
+        )
+        if q.size != n_atoms or not np.all(np.isfinite(q)):
+            raise ValueError(f"Converted charges from {path} must be complete and finite")
+        atoms.set_initial_charges(q)
 
     return atoms
 
@@ -207,17 +336,43 @@ def write_dumpframe_lammps_data(
     atom_style: str = "atomic",
     masses_by_type: Optional[dict[int, float]] = None,
     charges_by_id: Optional[dict[int, float]] = None,
+    canonical_to_lammps_units_style: Optional[str] = None,
 ) -> None:
-    """Dumpframe lammps data."""
+    """Write a raw LAMMPS continuation/data frame.
+
+    ``DumpFrame`` objects used by analysis are canonical (Angstrom).  Pass
+    ``canonical_to_lammps_units_style`` at that boundary to convert geometry
+    back to the native units consumed by ``read_data``.  Leave it unset only
+    for frames deliberately parsed with ``units_style=None``.
+    """
 
     if not isinstance(frame, DumpFrame):
         raise TypeError("frame must be a DumpFrame")
 
-    ids = np.asarray(frame.ids, dtype=int).reshape(-1)
-    types = np.asarray(frame.types, dtype=int).reshape(-1)
+    try:
+        ids_numeric = np.asarray(frame.ids, dtype=float).reshape(-1)
+        types_numeric = np.asarray(frame.types, dtype=float).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("DumpFrame ids and types must be numeric integers") from exc
+    if not np.all(np.isfinite(ids_numeric)) or not np.all(ids_numeric == np.floor(ids_numeric)):
+        raise ValueError("DumpFrame ids must be finite integers")
+    if not np.all(np.isfinite(types_numeric)) or not np.all(
+        types_numeric == np.floor(types_numeric)
+    ):
+        raise ValueError("DumpFrame types must be finite integers")
+    ids = ids_numeric.astype(int)
+    types = types_numeric.astype(int)
     pos = np.asarray(frame.positions, dtype=float)
     if pos.shape != (ids.size, 3) or types.size != ids.size:
         raise ValueError("Inconsistent DumpFrame array sizes")
+    if ids.size == 0:
+        raise ValueError("DumpFrame must contain at least one atom")
+    if np.any(ids <= 0) or np.unique(ids).size != ids.size:
+        raise ValueError("DumpFrame ids must be unique positive integers")
+    if np.any(types <= 0):
+        raise ValueError("DumpFrame types must be positive integers")
+    if not np.all(np.isfinite(pos)):
+        raise ValueError("DumpFrame positions must be finite")
 
     order = np.argsort(ids)
     ids = ids[order]
@@ -229,10 +384,28 @@ def write_dumpframe_lammps_data(
         raise ValueError("frame.cell must be 3x3")
     if not np.all(np.isfinite(cell)):
         raise ValueError("frame.cell must be finite")
-    if abs(float(np.linalg.det(cell))) < 1.0e-12:
+    cell_scale = float(np.max(np.abs(cell)))
+    det = float(np.linalg.det(cell))
+    det_tol = 128.0 * np.finfo(float).eps * max(cell_scale**3, np.finfo(float).tiny)
+    if not math.isfinite(det) or abs(det) <= det_tol:
         raise ValueError("Invalid or degenerate cell for LAMMPS data output")
 
     origin = np.asarray(frame.origin, dtype=float).reshape(3)
+    if not np.all(np.isfinite(origin)):
+        raise ValueError("frame.origin must be finite")
+    if canonical_to_lammps_units_style is not None:
+        length_scale = float(length_from_angstrom_factor(canonical_to_lammps_units_style))
+        if not math.isfinite(length_scale) or length_scale <= 0.0:
+            raise ValueError("canonical-to-LAMMPS length scale must be finite and > 0")
+        pos = pos * length_scale
+        cell = cell * length_scale
+        origin = origin * length_scale
+    if not (
+        np.all(np.isfinite(pos))
+        and np.all(np.isfinite(cell))
+        and np.all(np.isfinite(origin))
+    ):
+        raise ValueError("Converted DumpFrame geometry must be finite")
     pos0 = pos - origin[None, :]
 
     # cell lammps representation
@@ -260,9 +433,30 @@ def write_dumpframe_lammps_data(
 
     n_atoms = int(ids.size)
     n_types = int(np.max(types)) if n_atoms > 0 else 0
-    masses = dict(masses_by_type or {})
+    masses: dict[int, float] = {}
+    for raw_type, raw_mass in dict(masses_by_type or {}).items():
+        try:
+            type_float = float(raw_type)
+            mass = float(raw_mass)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("masses_by_type must map integer types to numeric masses") from exc
+        if not math.isfinite(type_float) or not type_float.is_integer() or type_float <= 0:
+            raise ValueError(f"Invalid mass atom type: {raw_type!r}")
+        atom_type = int(type_float)
+        if atom_type > n_types:
+            raise ValueError(
+                f"Mass atom type {atom_type} exceeds maximum frame type {n_types}"
+            )
+        if not math.isfinite(mass) or mass <= 0.0:
+            raise ValueError(
+                f"Mass for atom type {atom_type} must be finite and positive"
+            )
+        masses[atom_type] = mass
 
-    use_charge = str(atom_style).strip().lower() == "charge"
+    normalized_atom_style = str(atom_style).strip().lower()
+    if normalized_atom_style not in {"atomic", "charge"}:
+        raise ValueError("atom_style must be 'atomic' or 'charge'")
+    use_charge = normalized_atom_style == "charge"
     if use_charge:
         qmap = dict(charges_by_id or {})
         missing = [int(i) for i in ids.tolist() if int(i) not in qmap]
@@ -270,6 +464,16 @@ def write_dumpframe_lammps_data(
             raise ValueError(
                 "write_dumpframe_lammps_data requires charges for all atoms when atom_style='charge'; "
                 f"missing ids include {missing[:5]}"
+            )
+        invalid_charges = [
+            int(i)
+            for i in ids.tolist()
+            if not math.isfinite(float(qmap[int(i)]))
+        ]
+        if invalid_charges:
+            raise ValueError(
+                "write_dumpframe_lammps_data requires finite charges; invalid ids "
+                f"include {invalid_charges[:5]}"
             )
     else:
         qmap = {}

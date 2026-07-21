@@ -42,7 +42,7 @@ def test_production_plan_roundtrip_relative_paths(tmp_path: Path):
         cutoffs_rate={(1, 1): 3.0},
         cutoffs_size={(1, 1): 3.1},
         preferred_cutoffs={(1, 1): 3.1},
-        quench_steps=100,
+        quench_steps=90000,
         relax_steps=200,
         msd_every=100,
         seed_base=13586,

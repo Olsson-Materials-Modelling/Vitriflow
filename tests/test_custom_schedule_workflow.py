@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+pytestmark = pytest.mark.usefixtures("mock_engine_build_identities")
+
 
 def _generic_hc_raw() -> dict:
     return {
@@ -73,6 +75,35 @@ def test_custom_schedule_rejects_fractional_step_override():
         _schedule_from_raw(raw)
 
 
+@pytest.mark.parametrize(
+    "unsafe_name",
+    [".", "..", "../escape", "sub/stage", " melt", "melt "],
+)
+def test_custom_schedule_rejects_stage_names_that_escape_box_directory(
+    unsafe_name: str,
+):
+    from vitriflow.workflows.custom_schedule import _schedule_from_raw
+
+    raw = _generic_hc_raw()
+    raw["custom_schedule"]["stages"][0]["name"] = unsafe_name
+    with pytest.raises(ValueError, match="not path-safe"):
+        _schedule_from_raw(raw)
+
+
+def test_custom_schedule_rejects_unknown_fields_and_duplicate_aliases():
+    from vitriflow.workflows.custom_schedule import _schedule_from_raw
+
+    raw = _generic_hc_raw()
+    raw["custom_schedule"]["stages"][0]["dump_evry_steps"] = 10
+    with pytest.raises(ValueError, match=r"unknown field.*dump_evry_steps"):
+        _schedule_from_raw(raw)
+
+    raw = _generic_hc_raw()
+    raw["custom_schedule"]["stages"][0]["duration_ps"] = 10
+    with pytest.raises(ValueError, match=r"multiple aliases.*time_ps.*duration_ps"):
+        _schedule_from_raw(raw)
+
+
 def test_custom_schedule_cli_subcommands_are_registered(capsys):
     import vitriflow.cli as cli
 
@@ -84,18 +115,33 @@ def test_custom_schedule_cli_subcommands_are_registered(capsys):
         assert "--config" in out and "--outdir" in out
 
 
-def test_custom_schedule_demo_config_parse_and_locked_schedule():
+def test_custom_schedule_demo_config_parse_and_locked_schedule(tmp_path: Path):
     from vitriflow.config import RunConfig
     from vitriflow.workflows import custom_schedule as cs
 
-    cfg_path = Path(__file__).resolve().parents[1] / "vitriflow" / "examples" / "hc_C_GAP20Ugr_hc_custom_demo.yaml"
-    assert cfg_path.exists()
+    packaged_cfg = Path(__file__).resolve().parents[1] / "vitriflow" / "examples" / "hc_C_GAP20Ugr_hc_custom_demo.yaml"
+    assert packaged_cfg.exists()
+    with pytest.raises(ValueError, match=r"potential\.files entry is not a file"):
+        RunConfig.from_yaml(packaged_cfg)
+
+    # The demonstrator deliberately does not bundle the third-party GAP
+    # potential.  Materialise placeholder declared files only for parser and
+    # schedule-lock testing; this is not an engine execution test.
+    raw = yaml.safe_load(packaged_cfg.read_text()) or {}
+    potential_files: list[str] = []
+    for index, original in enumerate(raw["potential"]["files"]):
+        placeholder = tmp_path / f"potential_{index}_{Path(original).name}"
+        placeholder.write_text(f"test-placeholder-{index}\n")
+        potential_files.append(str(placeholder))
+    raw["potential"]["files"] = potential_files
+    cfg_path = tmp_path / "demo.yaml"
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+
     cfg = RunConfig.from_yaml(cfg_path)
     assert cfg.engine == "lammps"
     assert cfg.md.ensemble == "nvt"
     assert cfg.md.stage_continuity == "continuous"
 
-    raw = yaml.safe_load(cfg_path.read_text()) or {}
     schedule = cs._schedule_from_raw(raw)
     roles = cs._validate_schedule(schedule)
     steps = cs._schedule_steps(schedule, md_use=cfg.md, time_unit_ps=1.0)
@@ -122,7 +168,7 @@ def test_unstructured_restart_is_not_sent_to_generic_ase_reader(tmp_path: Path):
 
     restart = tmp_path / "calc-1.restart"
     restart.write_text("final restart\n")
-    with pytest.raises(ValueError, match="automatic frame loading"):
+    with pytest.raises(ValueError, match="strict final restart could not be parsed"):
         read_last_frames_auto(restart, 1, type_to_species=["Al"])
 
 
@@ -154,6 +200,31 @@ def test_custom_schedule_guard_rejects_dft_refinement_path():
     )
     metrics = SimpleNamespace(elastic=SimpleNamespace(enabled=False))
     with pytest.raises(ValueError, match=r"dft_opt\.enabled=true"):
+        _guard_custom_schedule_supported_equivalence_paths(
+            config=cfg,
+            metrics_cfg=metrics,
+            runner=object(),
+            force_isotropic=False,
+        )
+
+
+def test_custom_schedule_guard_rejects_silently_ignored_autocore():
+    from types import SimpleNamespace
+
+    from vitriflow.workflows.custom_schedule import (
+        _guard_custom_schedule_supported_equivalence_paths,
+    )
+
+    cfg = SimpleNamespace(
+        kim=SimpleNamespace(
+            core_repulsion=SimpleNamespace(enabled=True),
+        ),
+        autotune=SimpleNamespace(
+            production=SimpleNamespace(dft_opt=SimpleNamespace(enabled=False))
+        ),
+    )
+    metrics = SimpleNamespace(elastic=SimpleNamespace(enabled=False))
+    with pytest.raises(ValueError, match="does not silently realize autocore"):
         _guard_custom_schedule_supported_equivalence_paths(
             config=cfg,
             metrics_cfg=metrics,
@@ -234,6 +305,40 @@ def test_custom_schedule_runner_scope_is_lammps_continuous_only():
     with pytest.raises(ValueError, match="stage_continuity: continuous"):
         _guard_custom_schedule_runner_scope(cfg)
 
+
+def test_custom_schedule_resume_admission_is_fail_closed(tmp_path: Path):
+    from vitriflow.workflows.custom_schedule import (
+        _resolve_custom_schedule_resume_mode,
+    )
+
+    outdir = tmp_path / "custom"
+    outdir.mkdir()
+    result = outdir / "run_results.json"
+    assert not _resolve_custom_schedule_resume_mode(
+        outdir=outdir,
+        results_path=result,
+        resume=None,
+    )
+
+    orphan = outdir / "production" / "box_000" / "melt"
+    orphan.mkdir(parents=True)
+    (orphan / "partial.out").write_text("partial")
+    with pytest.raises(RuntimeError, match="non-empty output directory"):
+        _resolve_custom_schedule_resume_mode(
+            outdir=outdir,
+            results_path=result,
+            resume=None,
+        )
+    assert (orphan / "partial.out").read_text() == "partial"
+
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    with pytest.raises(RuntimeError, match="--resume was requested"):
+        _resolve_custom_schedule_resume_mode(
+            outdir=missing,
+            results_path=missing / "run_results.json",
+            resume=True,
+        )
 
 def test_custom_schedule_final_status_reports_max_box_nonconvergence():
     from vitriflow.workflows.custom_schedule import _final_status
@@ -411,3 +516,315 @@ def test_custom_schedule_resume_requires_existing_fingerprint(tmp_path: Path):
     fp = _fingerprint_from_config_path(cfg_path)
     with pytest.raises(RuntimeError, match="no custom-schedule provenance fingerprint"):
         _validate_resume_fingerprint_or_raise({"status": "running"}, fp, outdir=tmp_path)
+
+
+def _run_resumed_graph_finalization(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    graph_rules,
+    writer,
+    check_convergence: bool = False,
+    required_streak: int = 1,
+    store_distributions: bool = True,
+    converged_now: bool = False,
+    convergence_streak: int = 0,
+    last_evaluated: bool = False,
+    convergence_report: dict | None = None,
+):
+    import json
+
+    from vitriflow.config import RunConfig
+    from vitriflow.workflows.custom_schedule import run_custom_schedule
+    from vitriflow.workflows import metrics_policy, production_common, progress
+    import vitriflow.analysis.motif_summary as motif_summary
+    import vitriflow.structuregen as structuregen
+
+    cfg_path = _write_fingerprint_demo_config(tmp_path)
+    raw = yaml.safe_load(cfg_path.read_text())
+    raw["autotune"]["metrics"]["graph_rules"] = list(graph_rules)
+    raw["autotune"]["production"]["check_convergence"] = bool(check_convergence)
+    raw["autotune"]["production"]["consecutive_converged_checks"] = int(
+        required_streak
+    )
+    raw["autotune"]["production"]["store_distributions"] = bool(
+        store_distributions
+    )
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    config = RunConfig.from_yaml(cfg_path)
+    fingerprint = _fingerprint_from_config_path(cfg_path)
+
+    outdir = tmp_path / "run"
+    outdir.mkdir()
+    source = outdir / "production" / "box_000" / "relax.data"
+    source.parent.mkdir(parents=True)
+    source.write_text("box-0\n")
+    snapshot = source.parent / "structure_snapshot.json"
+    manifest_path = source.parent / "structure_manifest.json"
+    snapshot.write_text(json.dumps({"schema": "vitriflow.structure_snapshot.v1", "n_atoms": 1}))
+    manifest = {"structure_hash": "structure-0"}
+    manifest_path.write_text(
+        json.dumps({"schema": "vitriflow.structure_manifest.v2", "structures": [manifest]})
+    )
+    previous = {
+        "status": "running",
+        "execution_status": "running",
+        "resume_fingerprint": fingerprint,
+        "production": {
+            "enabled": True,
+            "status": "running",
+            "execution_status": "running",
+            "converged": False,
+            "converged_md": bool(converged_now),
+            "check_convergence": bool(check_convergence),
+            "resumable": True,
+            "convergence_streak": int(convergence_streak),
+            "required_convergence_streak": int(required_streak),
+            "last_convergence_evaluated_n_boxes_total": (1 if last_evaluated else None),
+            "last_convergence_evaluated_n_boxes_accepted": (1 if last_evaluated else None),
+            "min_boxes": 1,
+            "max_boxes": 1,
+            "batch_boxes": 1,
+            "n_boxes": 1,
+            "n_boxes_accepted": 1,
+            "n_boxes_rejected": 0,
+            "n_boxes_total": 1,
+            "boxes": [{
+                "box": 0,
+                "density": 2.35,
+                "metrics": {},
+                "distributions": {},
+                "paths": {
+                    "relax_data": "production/box_000/relax.data",
+                    "structure_snapshot": "production/box_000/structure_snapshot.json",
+                    "structure_manifest": "production/box_000/structure_manifest.json",
+                },
+                "structure_manifest": manifest,
+            }],
+            "rejected_boxes": [],
+            "cutoffs": [{"pair": [1, 1], "cutoff": 1.85}],
+            "convergence": dict(convergence_report or {}),
+        },
+    }
+    from vitriflow.workflows.autotune import _attach_production_state_integrity
+
+    previous["production"] = _attach_production_state_integrity(
+        previous["production"], outdir=outdir
+    )
+    (outdir / "run_results.json").write_text(json.dumps(previous))
+
+    def _prepare(_config, target):
+        target = Path(target)
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / "initial.data"
+        path.write_text("# fixture\n")
+        return path
+
+    monkeypatch.setattr(structuregen, "prepare_initial_structure", _prepare)
+    monkeypatch.setattr(
+        metrics_policy,
+        "resolve_effective_metrics_config",
+        lambda metrics, **kwargs: (metrics, {}, {}),
+    )
+    monkeypatch.setattr(
+        production_common,
+        "plan_production_stage_diagnostics",
+        lambda **kwargs: {
+            "dump_traj": False,
+            "dump_every": 1,
+            "need_stage_dump": {"melt": False, "quench": False, "relax": False},
+            "quench_dump_every": 1,
+            "quench_window_steps_range": None,
+        },
+    )
+    monkeypatch.setattr(
+        production_common,
+        "resolve_production_relax_dump_settings",
+        lambda **kwargs: {
+            "write_dump": False,
+            "dump_every": None,
+            "tail_dump_frames": None,
+            "tail_dump_stride": None,
+            "mode": "none",
+        },
+    )
+    monkeypatch.setattr(production_common, "write_graph_analysis_outputs", writer)
+    monkeypatch.setattr(motif_summary, "summarize_production_crystal_motifs", lambda *args, **kwargs: {})
+
+    written_states: list[dict] = []
+    real_write = progress.atomic_write_json
+
+    def _record_write(path, payload):
+        if Path(path).name == "run_results.json":
+            written_states.append(json.loads(json.dumps(payload)))
+        return real_write(path, payload)
+
+    monkeypatch.setattr(progress, "atomic_write_json", _record_write)
+    result = run_custom_schedule(config, outdir, config_path=cfg_path, resume=True)
+    return result, written_states
+
+
+def test_custom_schedule_default_never_calls_graph_writer(monkeypatch, tmp_path: Path):
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("graph writer called without explicit graph_rules")
+
+    result, states = _run_resumed_graph_finalization(
+        monkeypatch,
+        tmp_path,
+        graph_rules=[],
+        writer=_unexpected,
+    )
+
+    assert states and all(state["graph_outputs"] == {} for state in states)
+    assert all(state["production"]["graph_outputs"] == {} for state in states)
+    assert result["graph_outputs"] == {}
+    assert result["status"] == "ok"
+    assert result["production"]["converged"] is None
+    assert result["production"]["converged_md"] is None
+    assert result["production"]["convergence_status"] == "fixed_count_unassessed"
+    assert result["production"]["convergence_inference_status"] == (
+        "fixed_n_terminal_posthoc_not_sequentially_valid"
+    )
+    assert result["production"]["achieved_convergence_degree"]["n_boxes"] == 1
+    assert result["production"]["posthoc_convergence_criterion_met"] is False
+    report = result["production"]["convergence"]
+    assert report["status"] == "fixed_n_terminal_posthoc_assessed"
+    assert report["sampling_design"] == "fixed_n"
+    assert report["used_for_stopping"] is False
+    assert report["stopping_status"] == "fixed_count_unassessed"
+    assert report["posthoc_failed_items"] == [
+        {
+            "section": "ci",
+            "name": "scalar:density",
+            "reason": "tolerance_not_met",
+        },
+        {
+            "section": "stability",
+            "name": "stability",
+            "reason": "active_section_unassessed",
+        },
+    ]
+
+
+def test_custom_schedule_explicit_graph_rules_finalize_once_after_checkpoints(monkeypatch, tmp_path: Path):
+    calls: list[dict] = []
+
+    def _writer(*args, **kwargs):
+        calls.append(dict(kwargs))
+        (Path(args[0]) / "graph_rules.json").write_text("{}\n")
+        return {"graph_rules": "graph_rules.json"}
+
+    result, states = _run_resumed_graph_finalization(
+        monkeypatch,
+        tmp_path,
+        graph_rules=[{"name": "requested", "kind": "hard_cutoff", "parameters": {"cutoff": 1.85}}],
+        writer=_writer,
+    )
+
+    assert len(calls) == 1
+    assert len(states) >= 2
+    assert all(state["graph_outputs"] == {} for state in states[:-1])
+    assert all(state["production"]["graph_outputs"] == {} for state in states[:-1])
+    assert states[-1]["graph_outputs"] == {"graph_rules": "graph_rules.json"}
+    assert result["graph_outputs"] == {"graph_rules": "graph_rules.json"}
+
+
+def test_custom_schedule_rejects_potential_mutated_during_resume_finalization(
+    monkeypatch,
+    tmp_path: Path,
+):
+    potential = tmp_path / "potentials" / "gap_test.xml"
+
+    def _mutating_writer(*_args, **_kwargs):
+        potential.write_text('<GAP label="MUTATED_DURING_EXECUTION"></GAP>\n')
+        return {}
+
+    with pytest.raises(
+        RuntimeError,
+        match="scientific input bytes changed during execution",
+    ):
+        _run_resumed_graph_finalization(
+            monkeypatch,
+            tmp_path,
+            graph_rules=[
+                {
+                    "name": "mutation-trigger",
+                    "kind": "hard_cutoff",
+                    "parameters": {"cutoff": 1.85},
+                }
+            ],
+            writer=_mutating_writer,
+        )
+
+
+def test_custom_resume_preserves_exact_streak_and_full_running_state(
+    monkeypatch, tmp_path: Path
+):
+    from vitriflow.workflows import production_common
+
+    monkeypatch.setattr(
+        production_common,
+        "check_production_convergence",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged custom ensemble must not be re-evaluated")
+        ),
+    )
+    result, states = _run_resumed_graph_finalization(
+        monkeypatch,
+        tmp_path,
+        graph_rules=[],
+        writer=lambda *args, **kwargs: {},
+        check_convergence=True,
+        required_streak=2,
+        store_distributions=False,
+        converged_now=True,
+        convergence_streak=1,
+        last_evaluated=True,
+    )
+
+    assert result["status"] == "not_converged"
+    assert result["production"]["convergence_streak"] == 1
+    assert result["production"]["resumable"] is False
+    assert "distributions" not in result["production"]["boxes"][0]
+    assert len(states) >= 2
+    assert all(
+        "distributions" in state["production"]["boxes"][0]
+        for state in states[:-1]
+    )
+
+
+def test_custom_terminal_state_surfaces_inference_qualified_degree(
+    monkeypatch, tmp_path: Path
+):
+    convergence_report = {
+        "inference_contract": {"sequentially_valid": False},
+        "achieved_convergence_degree": {
+            "n_boxes": 1,
+            "overall_active": {"worst_tolerance_utilization_ratio": 0.25},
+        },
+        "convergence_degree": {
+            "overall": {"n_checked": 2, "n_passed": 2, "pass_fraction": 1.0}
+        },
+    }
+    result, _states = _run_resumed_graph_finalization(
+        monkeypatch,
+        tmp_path,
+        graph_rules=[],
+        writer=lambda *args, **kwargs: {},
+        check_convergence=True,
+        required_streak=1,
+        converged_now=True,
+        convergence_streak=1,
+        last_evaluated=True,
+        convergence_report=convergence_report,
+    )
+
+    production = result["production"]
+    assert production["convergence_status"] == "converged"
+    assert production["convergence_inference_status"] == (
+        "criterion_met_repeated_looks_not_sequentially_valid"
+    )
+    assert production["achieved_convergence_degree"] == convergence_report[
+        "achieved_convergence_degree"
+    ]
+    assert production["convergence_criterion_coverage"]["overall"]["n_checked"] == 2

@@ -48,7 +48,8 @@ def test_plot_scan_metric_all_stages(tmp_path: Path):
             "skipped": False,
             "rates": [
                 {
-                    "rate_K_per_time": 1.0,
+                    "rate": 1.0,
+                    "rate_K_per_ps": 1.0,
                     "density_mean": 2.25,
                     "density_stderr": 0.01,
                     "metrics_mean": {"coord": 4.0},
@@ -59,7 +60,8 @@ def test_plot_scan_metric_all_stages(tmp_path: Path):
                     ],
                 },
                 {
-                    "rate_K_per_time": 10.0,
+                    "rate": 10.0,
+                    "rate_K_per_ps": 10.0,
                     "density_mean": 2.30,
                     "density_stderr": 0.02,
                     "metrics_mean": {"coord": 3.8},

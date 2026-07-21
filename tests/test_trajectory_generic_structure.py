@@ -20,6 +20,9 @@ class _FakeAtoms:
     def get_cell(self):
         return np.diag([5.0, 5.0, 5.0])
 
+    def get_pbc(self):
+        return np.asarray([True, False, True], dtype=bool)
+
     def get_volume(self):
         return 125.0
 
@@ -52,3 +55,4 @@ def test_read_last_frames_auto_reads_generic_structure_via_ase(monkeypatch, tmp_
     assert fr.n_atoms == 2
     assert np.allclose(fr.cell, np.diag([5.0, 5.0, 5.0]))
     assert fr.types.tolist() == [1, 1]
+    assert fr.pbc == (True, False, True)
