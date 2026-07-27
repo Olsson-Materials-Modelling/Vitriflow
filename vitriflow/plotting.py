@@ -947,16 +947,12 @@ def _familywise_error_annotation(
     except Exception:
         m_tests = 0
     if np.isfinite(alpha_family) and 0.0 < alpha_family < 1.0:
-        family_confidence = 1.0 - float(alpha_family)
-        fwer = (
-            f"FWER alpha={alpha_family:.3g} "
-            f"(family confidence={family_confidence:.3f})"
-        )
+        fwer = f"FWER α={alpha_family:.3g}"
     else:
-        fwer = "FWER alpha=not declared"
+        fwer = "FWER α=—"
     return (
-        f"{fwer}  M={m_tests}  alpha_test={float(alpha_per_test):.2e}  "
-        f"bounded_CI={bounded_ci_method}"
+        f"{fwer}; M={m_tests}; per-test α={float(alpha_per_test):.2e}; "
+        f"CI={bounded_ci_method}"
     )
 
 
@@ -2460,6 +2456,7 @@ def _plot_analysis_results_without_convergence(
         schema = str(data.get("schema", "unknown"))
         filtering = data.get("filtering", {}) if isinstance(data.get("filtering", {}), Mapping) else {}
         convergence_display = _production_convergence_display(prod, conv)
+        convergence_state = str(convergence_display["state"]).replace("_", " ")
         lines = [
             title or f"VitriFlow analysis summary: {Path(json_path).name}",
             "",
@@ -2471,8 +2468,7 @@ def _plot_analysis_results_without_convergence(
             f"filtering semantics: {filtering.get('semantics', 'not declared')}",
             f"embedded structures: {data.get('embed_structures', 'not declared')}",
             "",
-            "Descriptor-set convergence is advisory for analysis-only inputs.",
-            f"convergence assessment: {convergence_display['label']}",
+            f"convergence: {convergence_state} (analysis-only)",
         ]
         if groups:
             lines.append("")
@@ -2483,9 +2479,6 @@ def _plot_analysis_results_without_convergence(
                 passed = g.get("passed", None)
                 status_g = g.get("status", "not_evaluated")
                 lines.append(f"  {name}: status={status_g}, passed={passed}, n_items={len(items)}")
-        if conv.get("reason"):
-            lines.append("")
-            lines.append(f"convergence note: {conv.get('reason')}")
         ax.text(0.02, 0.98, "\n".join(str(x) for x in lines), va="top", ha="left", family="monospace", fontsize=9)
         fig.subplots_adjust(left=0.08, right=0.98, bottom=0.08, top=0.92)
         return fig
@@ -3483,7 +3476,7 @@ def plot_production_results(
         ax.set_xlabel("number of boxes")
         ax.set_ylabel("max(ratio / tolerance)")
         ax.set_yscale("log")
-        ax.set_title("Retrospective production convergence diagnostic")
+        ax.set_title("Convergence")
         ax.legend(frameon=False)
         # alpha_family is the familywise *error probability*, not confidence.
         txt = _familywise_error_annotation(
@@ -3492,12 +3485,6 @@ def plot_production_results(
             bounded_ci_method=bounded_ci_method,
         )
         ax.text(0.02, 0.02, txt, transform=ax.transAxes, va="bottom", ha="left")
-        crossing = (
-            f"retrospective first threshold crossing: n={int(n_conv)}"
-            if n_conv is not None
-            else "retrospective first threshold crossing: none"
-        )
-        ax.text(0.02, 0.98, crossing, transform=ax.transAxes, va="top", ha="left")
         return fig
 
     # distribution plot helpers
@@ -3550,15 +3537,10 @@ def plot_production_results(
     n_acc = int(prod.get("n_boxes_accepted", prod.get("n_boxes", N)))
     n_rej = int(prod.get("n_boxes_rejected", 0))
     n_tot = int(prod.get("n_boxes_total", n_acc + n_rej))
-    convergence_display = _production_convergence_display(prod, conv)
-    convergence_label = str(convergence_display["label"])
     if n_rej > 0:
-        base2 = (
-            f"{base} | accepted={n_acc}/{n_tot} | rejected={n_rej} | "
-            f"{convergence_label}"
-        )
+        base2 = f"{base} | accepted={n_acc}/{n_tot} | rejected={n_rej}"
     else:
-        base2 = f"{base} | n={n_acc} | {convergence_label}"
+        base2 = f"{base} | n={n_acc}"
     pages[0][1].suptitle(base2)
 
     # density page
@@ -4614,6 +4596,13 @@ def _plot_production_comparison_results_impl(
         if not raw_boxes:
             raise RuntimeError(f"No production boxes found in {path}")
         boxes = _normalise_production_plot_boxes(raw_boxes)
+        conv = dict(prod.get("convergence", {}) or {})
+        effective_spec = conv.get("convergence_spec_effective", None)
+        spec = (
+            dict(effective_spec)
+            if isinstance(effective_spec, Mapping) and bool(effective_spec)
+            else dict(prod.get("convergence_spec", {}) or {})
+        )
         datasets.append(
             {
                 "label": label,
@@ -4621,8 +4610,8 @@ def _plot_production_comparison_results_impl(
                 "data": data,
                 "prod": prod,
                 "boxes": boxes,
-                "conv": dict(prod.get("convergence", {}) or {}),
-                "spec": dict(prod.get("convergence_spec", {}) or {}),
+                "conv": conv,
+                "spec": spec,
                 "units_style": str((data.get("units", {}) or {}).get("lammps_units", "") or "").strip().lower(),
                 "canonical_units": _uses_canonical_report_units(data),
             }
@@ -5097,6 +5086,13 @@ def _plot_production_comparison_results_impl(
 
     pages: list[tuple[str, Any]] = []
 
+    def _add_page(name: str, fig: Any) -> None:
+        pages.append((str(name), fig))
+        # Retain the Figure object for later saving without retaining every
+        # page in pyplot's global registry.  Large comparisons otherwise emit
+        # the open-figure warning before _save_plot_pages can close the pages.
+        plt.close(fig)
+
     primary_units = next((str(ds["units_style"]) for ds in datasets if str(ds["units_style"])), "")
     all_canonical = all(bool(ds.get("canonical_units", False)) for ds in datasets)
     dist_unit = _distance_unit_label(primary_units, canonical=all_canonical)
@@ -5377,6 +5373,28 @@ def _plot_production_comparison_results_impl(
         xlabel: str,
         ylabel: str,
     ) -> Any:
+        from .workflows.production_common import _is_explicit_zero_incidence_curve
+
+        axis_key, value_key = {
+            "bondlen": ("x", "cdf"),
+            "angle": ("x", "cdf"),
+            "coord": ("x", "cdf"),
+            "void": ("x", "cdf"),
+            "gr": ("r", "g"),
+            "sq": ("q", "s"),
+        }[str(kind)]
+
+        def _all_boxes_have_zero_incidence(ds: Mapping[str, Any]) -> bool:
+            boxes = list(ds.get("boxes", []) or [])
+            return bool(boxes) and all(
+                _is_explicit_zero_incidence_curve(
+                    _dist_entry(box, kind, name),
+                    value_key,
+                    grid_key=axis_key,
+                )
+                for box in boxes
+            )
+
         fig, ax = plt.subplots(figsize=(6.5, 4.0))
         n_available = 0
         for ds in datasets:
@@ -5397,6 +5415,18 @@ def _plot_production_comparison_results_impl(
             else:
                 x, mu, half = _curve_summary(ds, kind, name)
             if x.size == 0 or mu.size == 0:
+                if _all_boxes_have_zero_incidence(ds):
+                    ax.plot(
+                        [],
+                        [],
+                        linestyle="None",
+                        marker="x",
+                        label=(
+                            f"{ds['label']}: unavailable "
+                            "(measured zero incidence)"
+                        ),
+                    )
+                    continue
                 raise ValueError(
                     f"Comparison distribution {name!r} ({kind}) is declared for "
                     f"dataset {ds['label']!r} but has no usable finite payload"
@@ -5428,46 +5458,46 @@ def _plot_production_comparison_results_impl(
     fig, ax = plt.subplots(figsize=(6.5, 4.0))
     for ds in datasets:
         n_grid, trend_all, n_conv = _compute_trend(ds)
-        assessment = _production_convergence_display(ds["prod"], ds["conv"])
         lab = str(ds["label"])
         if n_grid.size == 0 or trend_all.size == 0:
             ax.plot(
                 [],
                 [],
-                label=f"{lab} — {assessment['label']}; retrospective trend unavailable",
+                linestyle="None",
+                marker="x",
+                label=f"{lab}: unavailable",
             )
             continue
-        crossing = (
-            f"retrospective threshold n={int(n_conv)}"
-            if n_conv is not None
-            else "no retrospective threshold crossing"
-        )
-        lab_plot = f"{lab} — {assessment['label']}; {crossing}"
-        ax.plot(n_grid, trend_all, label=lab_plot)
+        (trend_line,) = ax.plot(n_grid, trend_all, label=lab)
         if n_conv is not None:
-            ax.axvline(int(n_conv), linestyle=":", linewidth=1.0, alpha=0.35)
+            ax.axvline(
+                int(n_conv),
+                linestyle=":",
+                linewidth=1.0,
+                alpha=0.35,
+                color=trend_line.get_color(),
+            )
     ax.axhline(1.0, linewidth=1.0, color=OKABE_ITO["black"])
     ax.set_xlabel("number of boxes")
     ax.set_ylabel("max(ratio / tolerance)")
     ax.set_yscale("log")
-    ax.set_title("Retrospective production convergence diagnostic")
+    ax.set_title("Convergence comparison")
     ax.legend()
-    ax.text(
-        0.02,
-        0.02,
-        "Threshold crossings are diagnostics, not ensemble stopping decisions.",
-        transform=ax.transAxes,
-        va="bottom",
-        ha="left",
-    )
     fig.suptitle(str(title) if title is not None else "vitriflow production comparison")
-    pages.append(("convergence_comparison", fig))
+    _add_page("convergence_comparison", fig)
 
     # Density page mirrors plot-production's density histogram, with overlaid datasets.
-    pages.append(("density", _overlay_histogram_page("density", page_title="Density across boxes", xlabel=density_ylabel)))
+    _add_page(
+        "density",
+        _overlay_histogram_page(
+            "density",
+            page_title="Density across boxes",
+            xlabel=density_ylabel,
+        ),
+    )
 
     if comparison_ring_keys:
-        pages.append(("rings", _ring_fraction_page()))
+        _add_page("rings", _ring_fraction_page())
 
     has_comparison_ring_mean = bool(
         datasets
@@ -5478,18 +5508,23 @@ def _plot_production_comparison_results_impl(
         )
     )
     if has_comparison_ring_mean:
-        pages.append(("ring_mean", _overlay_histogram_page("ring_mean_size", page_title="Mean ring size across boxes", xlabel="mean ring size")))
+        _add_page(
+            "ring_mean",
+            _overlay_histogram_page(
+                "ring_mean_size",
+                page_title="Mean ring size across boxes",
+                xlabel="mean ring size",
+            ),
+        )
 
     for key in comparison_metric_keys:
-        pages.append(
-            (
-                f"scalar_{key}",
-                _overlay_histogram_page(
-                    str(key),
-                    page_title=_clean_name(str(key)),
-                    xlabel=_clean_name(str(key)),
-                ),
-            )
+        _add_page(
+            f"scalar_{key}",
+            _overlay_histogram_page(
+                str(key),
+                page_title=_clean_name(str(key)),
+                xlabel=_clean_name(str(key)),
+            ),
         )
 
     sweep_by_dataset = [
@@ -5541,20 +5576,74 @@ def _plot_production_comparison_results_impl(
             (str(title) + " | " if title else "")
             + f"Coordination cutoff sensitivity: {_clean_name(name)}"
         )
-        pages.append((f"coordination_sweep_{name}", fig))
+        _add_page(f"coordination_sweep_{name}", fig)
 
     for name in comparison_bond_names:
-        pages.append((name, _curve_overlay_page("bondlen", str(name), spec_key="bondlen_names", xlabel=f"r [{dist_unit}]", ylabel="probability density")))
+        _add_page(
+            name,
+            _curve_overlay_page(
+                "bondlen",
+                str(name),
+                spec_key="bondlen_names",
+                xlabel=f"r [{dist_unit}]",
+                ylabel="probability density",
+            ),
+        )
     for name in comparison_angle_names:
-        pages.append((name, _curve_overlay_page("angle", str(name), spec_key="angle_names", xlabel="θ [deg]", ylabel="probability density")))
+        _add_page(
+            name,
+            _curve_overlay_page(
+                "angle",
+                str(name),
+                spec_key="angle_names",
+                xlabel="θ [deg]",
+                ylabel="probability density",
+            ),
+        )
     for name in comparison_coord_names:
-        pages.append((name, _curve_overlay_page("coord", str(name), spec_key="coord_names", xlabel="k", ylabel="probability mass")))
+        _add_page(
+            name,
+            _curve_overlay_page(
+                "coord",
+                str(name),
+                spec_key="coord_names",
+                xlabel="k",
+                ylabel="probability mass",
+            ),
+        )
     for name in comparison_void_names:
-        pages.append((name, _curve_overlay_page("void", str(name), spec_key="void_names", xlabel=f"clearance r [{dist_unit}]", ylabel="probability density")))
+        _add_page(
+            name,
+            _curve_overlay_page(
+                "void",
+                str(name),
+                spec_key="void_names",
+                xlabel=f"clearance r [{dist_unit}]",
+                ylabel="probability density",
+            ),
+        )
     for name in comparison_gr_labels:
-        pages.append((name, _curve_overlay_page("gr", str(name), spec_key="gr_labels", xlabel=f"r [{dist_unit}]", ylabel="g(r)")))
+        _add_page(
+            name,
+            _curve_overlay_page(
+                "gr",
+                str(name),
+                spec_key="gr_labels",
+                xlabel=f"r [{dist_unit}]",
+                ylabel="g(r)",
+            ),
+        )
     for name in comparison_sq_labels:
-        pages.append((name, _curve_overlay_page("sq", str(name), spec_key="sq_labels", xlabel=f"q [1/{dist_unit}]", ylabel="S(q)")))
+        _add_page(
+            name,
+            _curve_overlay_page(
+                "sq",
+                str(name),
+                spec_key="sq_labels",
+                xlabel=f"q [1/{dist_unit}]",
+                ylabel="S(q)",
+            ),
+        )
 
     if max_pages is not None and int(max_pages) > 0:
         keep = 1 + int(max_pages)
