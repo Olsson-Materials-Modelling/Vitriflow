@@ -271,7 +271,7 @@ For publications, cite the Vitriflow release/version plus the upstream engines, 
 
 ### Vitriflow
 
-"Vitriflow: calibrated amorphous structure ensembles from melt-quench simulations," arXiv:2607.01407 (2026), doi: [10.48550/arXiv.2607.01407](https://doi.org/10.48550/arXiv.2607.01407).
+"Vitriflow: calibrated amorphous structure ensembles from melt-quench simulations," Computational Materials Science 2026 275 115098, doi: [10.1016/j.commatsci.2026.115098](https://doi.org/10.1016/j.commatsci.2026.115098).
 
 ### Model building and simulation
 
