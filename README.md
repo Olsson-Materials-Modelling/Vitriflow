@@ -269,7 +269,8 @@ The hard-carbon demonstrator is in `demos/hardcarbon_gap20ugr/`. The GAP XML and
 
 For publications, cite the Vitriflow release/version plus the upstream engines, potentials, datasets, and analysis methods used in the specific workflow. The list below is intended as a practical starting point, not an exhaustive bibliography.
 
-### Vitriflow
+### Citing Vitriflow
+If you use Vitriflow in your work, please cite: 
 
 "Vitriflow: calibrated amorphous structure ensembles from melt-quench simulations," Computational Materials Science 2026 275 115098, doi: [10.1016/j.commatsci.2026.115098](https://doi.org/10.1016/j.commatsci.2026.115098).
 
